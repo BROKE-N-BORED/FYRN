@@ -13,16 +13,18 @@ from PySide6.QtCore import QPoint, QBuffer, QIODevice, QRect, QTimer, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (QApplication, QLabel, QLineEdit,
-                               QMessageBox, QPushButton, QWidget)
+                               QMessageBox, QPushButton, QSystemTrayIcon,
+                               QTextEdit, QWidget)
 
 from helpers import ModalWatcher, file_bytes, make_fake_gguf
-from helpers import start_range_server
+from helpers import start_range_server, write_gguf_file
 from fyrn.core import HEADROOM_BYTES, fit_status, read_ram_bytes
 from fyrn.gui import (DARK_STYLESHEET, FIRST_PULL_SUGGESTION,
-                            FIT_BADGES, HOW_TO_USE_SECTIONS, HowToUseWindow,
-                            MainWindow, ModelCard, PressDipButton, PullWindow,
-                            PullWorker, SettingsWindow, SingleInstance,
-                            SkeletonCard, TURN_DIVIDER, get_models_folder,
+                            FIT_BADGES, HOW_TO_USE_SECTIONS, ChatInput,
+                            HowToUseWindow, MainWindow, ModelCard,
+                            PressDipButton, PullWindow, PullWorker,
+                            SettingsWindow, SingleInstance, SkeletonCard,
+                            TURN_DIVIDER, get_models_folder,
                             get_reduce_motion, reduced_motion,
                             set_models_folder, set_reduce_motion)
 from fyrn.pull import parse_model_input
@@ -89,6 +91,9 @@ def visible_texts(window):
             texts.append(widget.text())
         elif isinstance(widget, QLineEdit):
             texts.append(widget.text())
+            texts.append(widget.placeholderText())
+        elif isinstance(widget, QTextEdit):
+            texts.append(widget.toPlainText())
             texts.append(widget.placeholderText())
     for action in window.findChildren(
             getattr(__import__("PySide6.QtGui", fromlist=["QAction"]),
@@ -706,6 +711,40 @@ class EmptyStateTests(GuiTestCase):
         self.windows.append(window.pull_window)
 
 
+class StatusTimeoutTests(GuiTestCase):
+    def test_transient_message_falls_back_to_default(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        window._show_status("Reply done.", timeout_ms=50)
+        self.assertEqual(window.statusBar().currentMessage(),
+                         "Reply done.")
+        QTest.qWait(200)
+        self.assertEqual(window.statusBar().currentMessage(),
+                         "Pick a model and press Load, or pull one "
+                         "from the Models menu.")
+
+    def test_persistent_message_is_not_clobbered(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        window._show_status("Reply done.", timeout_ms=50)
+        window._show_status_persistent("Loading alpha.gguf...")
+        QTest.qWait(200)
+        self.assertEqual(window.statusBar().currentMessage(),
+                         "Loading alpha.gguf...")
+
+    def test_fallback_is_empty_state_line_when_folder_empty(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        self.assertTrue(window._empty_state.isVisible())
+        window._show_status("Something happened.", timeout_ms=50)
+        QTest.qWait(200)
+        self.assertEqual(window.statusBar().currentMessage(),
+                         "No models yet. Pull one or import one to "
+                         "get started.")
+
+
 class SelectionTests(GuiTestCase):
     def test_refresh_keeps_selection(self):
         make_fake_gguf(self.models / "alpha.gguf", 2048)
@@ -1006,18 +1045,30 @@ class LabelBandTests(GuiTestCase):
         image = card.grab().toImage()
         self.assertEqual(image.pixel(point), QColor("#1c2836").rgb())
 
-    def test_empty_state_and_skeleton_labels_transparent(self):
+    def test_empty_state_labels_transparent(self):
         window = self.make_window()
         self.wait_scan(window)
         self.assertIn(
             "QFrame#empty_state QLabel { "
             "background-color: transparent; }",
             window._empty_state.styleSheet())
+
+
+class SkeletonTests(GuiTestCase):
+    def test_skeleton_is_shape_blocks_not_text(self):
+        # A skeleton is a shape, not a label: grey bars where the
+        # name, size, and badge will land, and no text at all.
         skeleton = SkeletonCard()
-        self.assertIn(
-            "SkeletonCard QLabel { background-color: transparent; }",
-            skeleton.styleSheet())
-        skeleton.deleteLater()
+        try:
+            texts = [label.text()
+                     for label in skeleton.findChildren(QLabel)]
+            self.assertEqual(texts, [])
+            self.assertEqual(len(skeleton.bars), 3)
+            for bar in skeleton.bars:
+                self.assertEqual(bar.objectName(), "skeleton_bar")
+            self.assertIn("#2a3644", skeleton.styleSheet())
+        finally:
+            skeleton.deleteLater()
 
 
 class KeyboardTests(GuiTestCase):
@@ -1211,12 +1262,16 @@ class PullWindowTests(GuiTestCase):
         self.assertEqual(pulled, [str(self.models / "model.gguf")])
 
     def test_pull_bad_input_shows_plain_error(self):
+        # A bad input is a quiet inline error, not a modal: the
+        # user is looking at the field (L3).
         pull = self.make_pull_window()
         pull.input.setText("just some words here")
         pull.pull_button.click()
         QTest.qWait(300)
         self.assertIsNone(pull.worker)
-        self.assertTrue(self.watcher.seen)
+        self.assertEqual(self.watcher.seen, [])
+        self.assertIn("could not understand",
+                      pull.status_label.text())
 
     def test_pull_already_there(self):
         make_fake_gguf(self.models / "model.gguf", 1024)
@@ -1227,7 +1282,19 @@ class PullWindowTests(GuiTestCase):
         pull.pull_button.click()
         QTest.qWait(300)
         self.assertIsNone(pull.worker)
-        self.assertTrue(any("already in your models folder" in text
+        self.assertEqual(self.watcher.seen, [])
+        self.assertIn("already in your models folder",
+                      pull.status_label.text())
+
+    def test_download_failure_shows_modal_and_status(self):
+        # The one pull error that keeps the modal: a download
+        # fails while the user may be elsewhere (L3).
+        pull = self.make_pull_window()
+        pull._on_failed(
+            "The download failed (server said HTTP 404).")
+        QTest.qWait(300)
+        self.assertIn("HTTP 404", pull.status_label.text())
+        self.assertTrue(any("HTTP 404" in text
                             for _title, text in self.watcher.seen))
 
     def test_pull_resumes_partial(self):
@@ -1448,12 +1515,242 @@ class SubWindowGeometryTests(GuiTestCase):
         self.assertEqual(second.geometry(), QRect(50, 60, 700, 400))
 
 
+class ChatInputTests(GuiTestCase):
+    def test_enter_sends(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.load_first_model(window)
+        window.tabs.setCurrentIndex(1)
+        window.activateWindow()
+        window.raise_()
+        window.chat_input.setFocus()
+        QTest.qWait(100)
+        window.chat_input.setPlainText("hi there")
+        QTest.keyClick(window.chat_input, Qt.Key.Key_Return)
+        self.wait_chat(window)
+        self.assertIn("You: hi there",
+                      window.transcript.toPlainText())
+
+    def test_shift_enter_inserts_newline_without_sending(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.load_first_model(window)
+        window.tabs.setCurrentIndex(1)
+        window.activateWindow()
+        window.raise_()
+        window.chat_input.setFocus()
+        QTest.qWait(100)
+        window.chat_input.setPlainText("line one")
+        cursor = window.chat_input.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        window.chat_input.setTextCursor(cursor)
+        QTest.keyClick(window.chat_input, Qt.Key.Key_Return,
+                       Qt.KeyboardModifier.ShiftModifier)
+        QTest.qWait(100)
+        self.assertEqual(window.chat_input.toPlainText(),
+                         "line one\n")
+        self.assertIsNone(window.chat_worker)
+        self.assertNotIn("You:",
+                         window.transcript.toPlainText())
+
+    def test_input_grows_with_lines(self):
+        window = self.make_window()
+        window.tabs.setCurrentIndex(1)
+        QTest.qWait(100)
+        one_line = window.chat_input.height()
+        window.chat_input.setPlainText("one\ntwo\nthree\nfour")
+        QTest.qWait(100)
+        self.assertGreater(window.chat_input.height(), one_line)
+        self.assertLessEqual(window.chat_input.height(),
+                             ChatInput.MAX_HEIGHT)
+
+    def test_input_is_multiline_widget(self):
+        window = self.make_window()
+        self.assertIsInstance(window.chat_input, QTextEdit)
+        self.assertEqual(window.chat_input.placeholderText(),
+                         "Type a message")
+
+
+class ClearChatTests(GuiTestCase):
+    def test_clear_empties_transcript(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.load_first_model(window)
+        window.chat_input.setText("hi there")
+        window.send_message()
+        self.wait_chat(window)
+        self.assertIn("You: hi there",
+                      window.transcript.toPlainText())
+        window.clear_button.click()
+        QTest.qWait(50)
+        self.assertEqual(window.transcript.toPlainText(), "")
+        # Nothing is saved, so clearing asks nothing: no dialog.
+        self.assertEqual(self.watcher.seen, [])
+
+    def test_clear_on_empty_transcript_is_a_noop(self):
+        window = self.make_window()
+        window.clear_button.click()
+        QTest.qWait(50)
+        self.assertEqual(window.transcript.toPlainText(), "")
+        self.assertEqual(self.watcher.seen, [])
+
+
+class WindowHeightTests(GuiTestCase):
+    def test_pull_window_hugs_its_content(self):
+        # L10: the v0.1 Pull window carried ~100 px of dead space
+        # below the status line; the v0.1.1 suggestion content
+        # filled it. Pin the tightness: the status line ends
+        # within a layout margin of the window bottom.
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        QTest.qWait(200)
+        bottom = pull.status_label.geometry().bottom()
+        self.assertLess(pull.height() - bottom, 30)
+
+    def test_settings_window_hugs_its_content(self):
+        # L10: the v0.1 Settings window carried a ~100 px empty
+        # band above the buttons; the v0.1.1 Reduce motion switch
+        # filled it. Pin the tightness: the buttons end within a
+        # layout margin of the window bottom, and the stretch
+        # between the last help line and the buttons is small.
+        settings = SettingsWindow(self.models)
+        self.windows.append(settings)
+        settings.show()
+        QTest.qWait(200)
+        bottom = settings.save_button.geometry().bottom()
+        self.assertLess(settings.height() - bottom, 30)
+        helps = [label for label in settings.findChildren(QLabel)
+                 if label.text().startswith("Less movement")]
+        self.assertEqual(len(helps), 1)
+        gap = (settings.save_button.geometry().top()
+               - helps[0].geometry().bottom())
+        self.assertLess(gap, 30)
+
+
+class DescriptionTests(GuiTestCase):
+    def test_card_shows_description_from_gguf_header(self):
+        write_gguf_file(
+            self.models / "alpha.gguf",
+            {"general.description": "A small model for testing."})
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "alpha.gguf")]
+        labels = [label for label in card.findChildren(QLabel)
+                  if label.objectName() == "model_description"]
+        self.assertEqual(len(labels), 1)
+        self.assertEqual(labels[0].text(),
+                         "A small model for testing.")
+        self.assertIn("About: A small model for testing.",
+                      card.toolTip())
+
+    def test_card_without_description_shows_none(self):
+        # A file with no description gets no description line:
+        # descriptions are read from the file, never invented.
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "alpha.gguf")]
+        labels = [label for label in card.findChildren(QLabel)
+                  if label.objectName() == "model_description"]
+        self.assertEqual(labels, [])
+        self.assertNotIn("About:", card.toolTip())
+
+    def test_long_description_is_clipped(self):
+        long_text = "A very chatty model. " * 20  # 420 chars
+        write_gguf_file(
+            self.models / "alpha.gguf",
+            {"general.description": long_text})
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "alpha.gguf")]
+        labels = [label for label in card.findChildren(QLabel)
+                  if label.objectName() == "model_description"]
+        self.assertEqual(len(labels), 1)
+        self.assertTrue(labels[0].text().endswith("..."))
+        self.assertLessEqual(len(labels[0].text()), 140)
+
+
+class TrayTests(GuiTestCase):
+    def test_no_tray_when_unavailable(self):
+        # Offscreen has no system tray: the window simply has no
+        # tray icon, and nothing crashes or complains (L6).
+        self.assertFalse(QSystemTrayIcon.isSystemTrayAvailable())
+        window = self.make_window()
+        self.assertIsNone(window.tray)
+
+    def test_tray_tooltip_names_loaded_model_and_ram(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        tip = window._tray_tooltip()
+        self.assertIn("no model loaded", tip)
+        self.assertIn("RAM:", tip)
+        self.load_first_model(window)
+        tip = window._tray_tooltip()
+        self.assertIn("alpha.gguf", tip)
+        self.assertIn("RAM:", tip)
+
+    def test_tray_created_when_available(self):
+        # With a tray available, the window gets one with the
+        # tooltip set. Offscreen has none, so availability is
+        # faked for this test only.
+        with mock.patch.object(
+                QSystemTrayIcon, "isSystemTrayAvailable",
+                return_value=True):
+            window = self.make_window()
+        self.assertIsNotNone(window.tray)
+        self.assertIn("Fyrn:", window.tray.toolTip())
+        self.assertIsNotNone(window.tray.contextMenu())
+
+    def test_refresh_stats_updates_tray_tooltip(self):
+        # The 2-second stats refresh keeps the tray tooltip
+        # current. The tray is a stand-in here: offscreen has
+        # none, so it records the tooltip instead.
+        window = self.make_window()
+        tooltips = []
+
+        class FakeTray:
+            def setToolTip(self, text):
+                tooltips.append(text)
+
+            def hide(self):
+                pass  # closeEvent hides the tray on the way out
+
+        window.tray = FakeTray()
+        window._refresh_stats()
+        self.assertEqual(len(tooltips), 1)
+        self.assertIn("Fyrn:", tooltips[0])
+
+    def test_tray_activation_raises_window(self):
+        window = self.make_window()
+        with mock.patch.object(window, "bring_to_front") as raise_:
+            window._on_tray_activated(
+                QSystemTrayIcon.ActivationReason.Trigger)
+        self.assertTrue(raise_.called)
+
+
 class HowToUseTests(GuiTestCase):
+    def test_first_steps_is_first(self):
+        # A new user must not have to guess which section to read
+        # first: the start-here path is first in the list.
+        howto = HowToUseWindow()
+        self.windows.append(howto)
+        howto.show()
+        self.assertEqual(howto.section_list.item(0).text(),
+                         "First steps")
+        howto.section_list.setCurrentRow(0)
+        QTest.qWait(50)
+        body = howto.text_view.toPlainText()
+        self.assertIn("Get a model", body)
+        self.assertIn("Load it", body)
+        self.assertIn("Chat", body)
+
     def test_all_sections_present_and_readable(self):
         howto = HowToUseWindow()
         self.windows.append(howto)
         howto.show()
-        self.assertEqual(howto.section_list.count(), 6)
+        self.assertEqual(howto.section_list.count(),
+                         len(HOW_TO_USE_SECTIONS))
         titles = [howto.section_list.item(i).text()
                   for i in range(howto.section_list.count())]
         self.assertEqual(titles, list(HOW_TO_USE_SECTIONS))

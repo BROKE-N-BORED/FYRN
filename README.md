@@ -31,8 +31,9 @@ stops — it never runs apt itself.
 ## Use
 
 - **Models tab:** every `.gguf` file in your models folder, with its
-  size and a fit badge (Fits, Tight, Too big). Click a model to pick
-  it, press Load (or double-click a model to load it straight
+  size and a fit badge (Fits, Tight, Too big). A model with a
+  description in its file shows it on its tile. Click a model to
+  pick it, press Load (or double-click a model to load it straight
   away). Only one model runs at a time; loading a second one
   unloads the first. Press Unload when you are done to give the
   RAM back. Remove deletes a model from the folder (it asks first).
@@ -48,9 +49,13 @@ stops — it never runs apt itself.
 - **Settings** (File menu): the models folder — pick any folder you
   like — and a Reduce motion switch. Everything else (threads,
   context size) is set by the program itself to fit this PC.
-- **Chat tab:** load a model, type a message, press Send. The reply
-  streams in. Live numbers show RAM used and free, speed in tokens
-  per second, time to first token, and load time.
+- **Chat tab:** load a model, type a message (Enter sends, Shift+Enter
+  starts a new line), press Send. The reply streams in. Clear
+  empties the transcript. Live numbers show RAM used and free,
+  speed in tokens per second, time to first token, and load time.
+- **Tray icon:** when your desktop has a system tray, Fyrn shows
+  the loaded model and free RAM there; click it to bring Fyrn
+  forward.
 - **How to Use** (Help menu): every feature explained in plain words.
 - **Debug report** (File menu): writes a report file with the log
   and the PC details, with any secrets removed. Send that file when

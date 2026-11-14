@@ -26,8 +26,8 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QListWidget, QListWidgetItem, QMainWindow,
                                QMenu, QMessageBox, QProgressBar,
                                QPushButton, QScrollArea, QSizePolicy,
-                               QSpacerItem, QTabWidget, QTextEdit,
-                               QToolTip, QVBoxLayout, QWidget)
+                               QSpacerItem, QSystemTrayIcon, QTabWidget,
+                               QTextEdit, QToolTip, QVBoxLayout, QWidget)
 
 from . import __version__
 from . import core
@@ -219,6 +219,18 @@ def reduced_motion():
     return get_reduce_motion()
 
 HOW_TO_USE_SECTIONS = {
+    "First steps": (
+        "New here? Start here.\n\n"
+        "1. Get a model. Open the Models menu and pull one, or "
+        "import a .gguf file you already have. The Pull window "
+        "suggests a small first model that fits this PC.\n\n"
+        "2. Load it. Pick the model on the Models tab and press "
+        "Load. Only one model runs at a time.\n\n"
+        "3. Chat. Open the Chat tab, type a message, and press "
+        "Send.\n\n"
+        "That is the whole flow. The other sections below explain "
+        "each part in more detail."
+    ),
     "Models": (
         "Models are the brains this program runs. They live in your "
         "models folder as .gguf files.\n\n"
@@ -268,7 +280,9 @@ HOW_TO_USE_SECTIONS = {
     "Chatting": (
         "Load a model first, then open the Chat tab.\n\n"
         "Type a message and press Send (or Enter). The reply streams "
-        "in as the model writes it. Press Stop to cut a reply short.\n\n"
+        "in as the model writes it. Press Stop to cut a reply short. "
+        "Shift+Enter starts a new line without sending. Clear "
+        "empties the transcript.\n\n"
         "If no model is loaded, Send stays greyed out. Load a model "
         "from the Models tab first."
     ),
@@ -277,7 +291,10 @@ HOW_TO_USE_SECTIONS = {
         "used and free, speed in tokens per second, time to first "
         "token, and how long the model took to load.\n\n"
         "These are measurements to watch. They are not controls: the "
-        "program adjusts itself behind the scenes."
+        "program adjusts itself behind the scenes.\n\n"
+        "The tray icon, when your desktop has one, shows the loaded "
+        "model and free RAM at a glance. Click it to bring Fyrn "
+        "forward."
     ),
     "If something goes wrong": (
         "A model that will not fit gives a plain message and is not "
@@ -734,13 +751,19 @@ class PullWindow(QDialog):
         try:
             target = parse_model_input(self.input.text())
         except ValueError as exc:
-            QMessageBox.warning(self, "Pull a model", str(exc))
+            # One pattern for pull errors (L3): the user is looking
+            # at the field, so a bad input is a quiet inline error
+            # in the status line, not a modal. The field keeps
+            # focus so the fix is one edit away.
+            self.status_label.setText(str(exc))
+            self.input.setFocus()
             return
         dest = ensure_models_folder(self.models_folder) / target.filename
         if dest.exists():
-            QMessageBox.information(
-                self, "Pull a model",
-                "%s is already in your models folder." % target.filename)
+            # Same pattern: an outcome, not an interruption.
+            self.status_label.setText(
+                "%s is already in your models folder."
+                % target.filename)
             return
         if self.log is not None:
             self.log.action("pull started: %s" % target.filename)
@@ -802,6 +825,9 @@ class PullWindow(QDialog):
         anim.start()
 
     def _on_failed(self, message):
+        # A download fails while the user may be elsewhere, so this
+        # is the one pull error that keeps the modal: status line
+        # for the trace, modal for the attention (L3).
         self.progress_bar.setRange(0, 100)
         self.status_label.setText(message)
         self._set_busy(False)
@@ -1014,9 +1040,14 @@ FIT_BADGES = {
 
 class ModelCard(QFrame):
     """One model as a bento tile: name big, size below, fit badge
-    front and center. Click to select, double-click to load.
-    Keyboard works too: Tab moves between cards, Space picks the
-    focused card, Enter loads it."""
+    front and center, and the description from the file's own
+    GGUF header when it has one (never invented). Click to
+    select, double-click to load. Keyboard works too: Tab moves
+    between cards, Space picks the focused card, Enter loads it."""
+
+    # A description longer than this is clipped with an ellipsis:
+    # a card is a glance, not a page.
+    DESCRIPTION_MAX = 140
 
     clicked = Signal(str)         # path
     double_clicked = Signal(str)  # path
@@ -1045,14 +1076,25 @@ class ModelCard(QFrame):
         # loading a model never needs the mouse.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFrameShape(QFrame.Shape.StyledPanel)
+        # The description, from the file's own header: clipped to
+        # a glance, and absent entirely when the file has none.
+        self.description = (model.get("description") or "").strip()
+        if len(self.description) > self.DESCRIPTION_MAX:
+            self.description = (self.description[:137] + "...")
         # Content height, not a fixed box: a card holds three lines
         # (name, size, badge), so ~100 px is enough; the old
-        # 110-150 px box left each card ~60% empty inside.
+        # 110-150 px box left each card ~60% empty inside. A card
+        # with a description gets room for it.
         self.setMinimumHeight(120 if hero else 96)
         # Cap the height: the grid's expanding spacer takes the
         # leftover space, but without a cap the tiles still grow
         # past their content (250 px tall with 2 models).
-        self.setMaximumHeight(170 if hero else 120)
+        if hero:
+            self.setMaximumHeight(170)
+        elif self.description:
+            self.setMaximumHeight(150)
+        else:
+            self.setMaximumHeight(120)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
@@ -1067,6 +1109,14 @@ class ModelCard(QFrame):
         size = QLabel(format_size(model["size"]))
         size.setStyleSheet("font-size: 11pt; color: #999999;")
         layout.addWidget(size)
+
+        if self.description:
+            desc_label = QLabel(self.description)
+            desc_label.setObjectName("model_description")
+            desc_label.setWordWrap(True)
+            desc_label.setStyleSheet(
+                "font-size: 11pt; color: #999999;")
+            layout.addWidget(desc_label)
 
         badge_text, badge_color = FIT_BADGES[status]
         badge_row = QHBoxLayout()
@@ -1118,6 +1168,11 @@ class ModelCard(QFrame):
         and the fit reason, in plain words."""
         lines = ["Full path: %s" % model["path"],
                  "Size: %s" % format_size(model["size"])]
+        description = (model.get("description") or "").strip()
+        if description:
+            if len(description) > ModelCard.DESCRIPTION_MAX:
+                description = description[:137] + "..."
+            lines.append("About: %s" % description)
         needed = model["size"] + HEADROOM_BYTES
         if free_bytes is None:
             lines.append("Needs %s of RAM, free RAM unknown"
@@ -1270,7 +1325,17 @@ class ModelCard(QFrame):
 
 
 class SkeletonCard(QFrame):
-    """Placeholder tile shown while the model list loads."""
+    """Placeholder tile shown while the model list loads.
+
+    Grey shape blocks where the content will land: a name bar, a
+    size bar, a badge bar. No text: a skeleton is a shape, not a
+    label, and three tiles reading "Loading models..." read as
+    three labels (L1).
+    """
+
+    # (width, height) of each grey bar, in the shape of a card's
+    # name, size, and fit badge.
+    BAR_SIZES = ((160, 16), (70, 12), (60, 20))
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1282,13 +1347,59 @@ class SkeletonCard(QFrame):
         self.setStyleSheet(
             "SkeletonCard { border: 1px solid #444444; "
             "border-radius: 12px; background-color: #1a2531; } "
-            "SkeletonCard QLabel { background-color: transparent; }")
+            "QFrame#skeleton_bar { background-color: #2a3644; "
+            "border: none; border-radius: 4px; }")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
-        label = QLabel("Loading models...")
-        label.setStyleSheet("font-size: 12pt; color: #777777;")
-        layout.addWidget(label)
+        layout.setSpacing(8)
+        self.bars = []
+        for width, height in self.BAR_SIZES:
+            bar = QFrame()
+            bar.setObjectName("skeleton_bar")
+            bar.setFixedSize(width, height)
+            layout.addWidget(bar)
+            self.bars.append(bar)
         layout.addStretch(1)
+
+
+class ChatInput(QTextEdit):
+    """The chat prompt box: multi-line, Enter sends, Shift+Enter
+    is a newline (L4). Grows from one line to four as the message
+    grows, then scrolls. No formatting: plain text only."""
+
+    send_requested = Signal()
+
+    MIN_HEIGHT = 34
+    MAX_HEIGHT = 110
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setPlaceholderText("Type a message")
+        self.setAcceptRichText(False)
+        self.setMaximumHeight(self.MAX_HEIGHT)
+        self.setMinimumHeight(self.MIN_HEIGHT)
+        self.textChanged.connect(self._fit_height)
+        self._fit_height()
+
+    def text(self):
+        """The message, as plain text (QTextEdit has no text())."""
+        return self.toPlainText()
+
+    def _fit_height(self):
+        doc_height = int(self.document().size().height())
+        height = doc_height + 14  # frame and padding
+        self.setFixedHeight(max(self.MIN_HEIGHT,
+                                min(self.MAX_HEIGHT, height)))
+
+    def keyPressEvent(self, event):  # noqa: N802 - Qt naming
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                # Shift+Enter: a newline, the default behaviour.
+                super().keyPressEvent(event)
+            else:
+                self.send_requested.emit()
+            return
+        super().keyPressEvent(event)
 
 
 # ---------------------------------------------------------------- main
@@ -1297,6 +1408,11 @@ class SkeletonCard(QFrame):
 # line, never an em-dash — U33), so long replies do not run
 # together into one wall of text.
 TURN_DIVIDER = "-" * 24
+
+# How long a transient status-bar message stays before it falls
+# back to the neutral line (5 s: long enough to read, short
+# enough that stale news never lingers on an unrelated screen).
+STATUS_TIMEOUT_MS = 5000
 
 
 class MainWindow(QMainWindow):
@@ -1328,6 +1444,7 @@ class MainWindow(QMainWindow):
         self.pull_window = None
         self.settings_window = None
         self.howto_window = None
+        self.tray = None
         self.load_time_s = None
         self._reply_in_progress = False
 
@@ -1360,6 +1477,12 @@ class MainWindow(QMainWindow):
         self.busy_dot.setStyleSheet("color: #f2c14e;")
         self.busy_dot.setVisible(False)
         self.statusBar().addPermanentWidget(self.busy_dot)
+        # Transient status messages fall back to the neutral line
+        # after a timeout (L2); the timer is single-shot and is
+        # restarted by each transient message.
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self._on_status_timeout)
         self.statusBar().showMessage(
             "Pick a model and press Load, or pull one from the "
             "Models menu.")
@@ -1372,6 +1495,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_model_list()
         self._refresh_stats()
+        self._setup_tray()
 
     # ------------------------------------------------------------ menus
 
@@ -1535,12 +1659,12 @@ class MainWindow(QMainWindow):
         if show:
             if (not self.controller.is_loaded
                     and self.load_worker is None):
-                self.statusBar().showMessage(
+                self._show_status_persistent(
                     "No models yet. Pull one or import one to "
                     "get started.")
                 self._empty_status = True
         elif self._empty_status:
-            self.statusBar().showMessage(
+            self._show_status_persistent(
                 "Pick a model and press Load, or pull one from the "
                 "Models menu.")
             self._empty_status = False
@@ -1563,20 +1687,55 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.stats_label)
 
         row = QHBoxLayout()
-        self.chat_input = QLineEdit()
-        self.chat_input.setPlaceholderText("Type a message")
-        self.chat_input.returnPressed.connect(self.send_message)
+        self.chat_input = ChatInput()
+        self.chat_input.send_requested.connect(self.send_message)
         self.send_button = PressDipButton("Send")
         self.send_button.clicked.connect(self.send_message)
         self.stop_button = QPushButton("Stop")
         self.stop_button.clicked.connect(self._stop_reply)
         self.stop_button.setEnabled(False)
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.clicked.connect(self._clear_chat)
         row.addWidget(self.chat_input)
         row.addWidget(self.send_button)
         row.addWidget(self.stop_button)
+        row.addWidget(self.clear_button)
         layout.addLayout(row)
 
         self.tabs.addTab(tab, "Chat")
+
+    # ------------------------------------------------------------ status
+
+    def _default_status_message(self):
+        """The neutral status line for the current state: the
+        empty-folder line when there is nothing to pick, the
+        pick-a-model line otherwise."""
+        if self._empty_state.isVisible():
+            return ("No models yet. Pull one or import one to "
+                    "get started.")
+        return ("Pick a model and press Load, or pull one from the "
+                "Models menu.")
+
+    def _show_status(self, message, timeout_ms=STATUS_TIMEOUT_MS):
+        """Show a transient status message (a reply done, a model
+        loaded, a folder changed). After the timeout it falls back
+        to the neutral line, so stale news never lingers on an
+        unrelated screen (L2)."""
+        self.statusBar().showMessage(message)
+        self._status_timer.stop()
+        self._status_timer.setInterval(timeout_ms)
+        self._status_timer.start()
+
+    def _show_status_persistent(self, message):
+        """Show a status message that stays until something
+        replaces it: a load in progress, a stop in progress, the
+        empty state. Stops any pending transient timeout, so it
+        cannot clobber a live state."""
+        self._status_timer.stop()
+        self.statusBar().showMessage(message)
+
+    def _on_status_timeout(self):
+        self.statusBar().showMessage(self._default_status_message())
 
     # ------------------------------------------------------------ models
 
@@ -1720,7 +1879,7 @@ class MainWindow(QMainWindow):
         # A pending confirmation (remove/import) goes last, so the
         # scan's own status update never swallows it.
         if self._status_after_scan is not None:
-            self.statusBar().showMessage(self._status_after_scan)
+            self._show_status(self._status_after_scan)
             self._status_after_scan = None
         self._update_buttons()
         if self._scan_dirty:
@@ -1760,7 +1919,7 @@ class MainWindow(QMainWindow):
             return
         path = self._selected_model_path()
         if path is None:
-            self.statusBar().showMessage(
+            self._show_status(
                 "Pick a model from the list first.")
             return
         try:
@@ -1784,7 +1943,7 @@ class MainWindow(QMainWindow):
         self.log.action("load started: %s" % path.name)
         self.load_progress.setValue(0)
         self._set_busy(True)
-        self.statusBar().showMessage("Loading %s..." % path.name)
+        self._show_status_persistent("Loading %s..." % path.name)
         self.load_worker = LoadWorker(self.controller, path)
         self.load_worker.progress.connect(self._on_load_progress)
         self.load_worker.finished.connect(self._on_load_finished)
@@ -1800,7 +1959,7 @@ class MainWindow(QMainWindow):
         else:
             self.load_progress.setRange(0, 100)
             self.load_progress.setValue(pct)
-        self.statusBar().showMessage(message)
+        self._show_status_persistent(message)
 
     def _on_load_finished(self, result):
         self._drop_load_worker()
@@ -1815,10 +1974,10 @@ class MainWindow(QMainWindow):
         self._refresh_model_list()
         name = self.controller.current_name or "model"
         if warning:
-            self.statusBar().showMessage(
+            self._show_status(
                 "%s loaded, but RAM is tight." % name)
         else:
-            self.statusBar().showMessage("%s loaded." % name)
+            self._show_status("%s loaded." % name)
         self.log.action("load finished: %s" % name)
         # The empty transcript no longer says "Load a model first":
         # a model IS loaded now, so the hint switches to the true one.
@@ -1829,7 +1988,7 @@ class MainWindow(QMainWindow):
         self._drop_load_worker()
         self._set_busy(False)
         self._update_buttons()
-        self.statusBar().showMessage(message)
+        self._show_status(message)
         self.log.error("load failed: %s", message)
         if message != "Load cancelled.":
             QMessageBox.warning(self, "Load model", message)
@@ -1853,7 +2012,7 @@ class MainWindow(QMainWindow):
     def _cancel_load(self):
         if self.load_worker is not None:
             self.load_worker.cancel()
-            self.statusBar().showMessage("Stopping the load...")
+            self._show_status_persistent("Stopping the load...")
 
     def unload_model(self):
         if not self.controller.is_loaded:
@@ -1865,7 +2024,7 @@ class MainWindow(QMainWindow):
         self._update_buttons()
         # Rebuild the cards so the hero tile and Loaded pill go away.
         self._refresh_model_list()
-        self.statusBar().showMessage("%s unloaded." % name)
+        self._show_status("%s unloaded." % name)
         self.log.action("unload: %s" % name)
         # Back to the true hint: nothing is loaded, so chat needs a
         # model first.
@@ -1879,7 +2038,7 @@ class MainWindow(QMainWindow):
     def remove_selected_model(self):
         path = self._selected_model_path()
         if path is None:
-            self.statusBar().showMessage(
+            self._show_status(
                 "Pick a model from the list first.")
             return
         self._remove_model(path)
@@ -1890,7 +2049,7 @@ class MainWindow(QMainWindow):
         out from under the engine."""
         path = Path(path)
         if not path.is_file():
-            self.statusBar().showMessage("That model file is gone.")
+            self._show_status("That model file is gone.")
             self._refresh_model_list()
             return
         loaded = (self.controller.is_loaded
@@ -1945,7 +2104,7 @@ class MainWindow(QMainWindow):
         if self.chat_worker is not None:
             return
         if not self.controller.is_loaded:
-            self.statusBar().showMessage(
+            self._show_status(
                 "Load a model from the Models tab first.")
             return
         text = self.chat_input.text().strip()
@@ -1991,12 +2150,12 @@ class MainWindow(QMainWindow):
         self._update_buttons()
         if stats.get("stopped"):
             self._end_turn("(Reply stopped.)")
-            self.statusBar().showMessage("Reply stopped.")
+            self._show_status("Reply stopped.")
             return
         self._end_turn()
         self._last_stats = stats
         self._refresh_stats()
-        self.statusBar().showMessage("Reply done.")
+        self._show_status("Reply done.")
 
     def _on_chat_failed(self, message):
         self._drop_chat_worker()
@@ -2005,13 +2164,18 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self._update_buttons()
         self._end_turn("(%s)" % message)
-        self.statusBar().showMessage(message)
+        self._show_status(message)
         self.log.error("chat failed: %s", message)
 
     def _stop_reply(self):
         if self.chat_worker is not None:
             self.chat_worker.cancel()
-            self.statusBar().showMessage("Stopping the reply...")
+            self._show_status_persistent("Stopping the reply...")
+
+    def _clear_chat(self):
+        """Clear the transcript. Nothing is saved, so nothing is
+        lost: no confirm is needed (L5)."""
+        self.transcript.clear()
 
     def _refresh_stats(self):
         total, free = read_ram_bytes()
@@ -2046,6 +2210,53 @@ class MainWindow(QMainWindow):
         else:
             parts.append("No model loaded.")
         self.stats_label.setText("  |  ".join(parts))
+        # The tray tooltip keeps the same facts current.
+        if self.tray is not None:
+            self.tray.setToolTip(self._tray_tooltip())
+
+    # ------------------------------------------------------------ tray
+
+    def _setup_tray(self):
+        """The system tray icon: the loaded model and RAM at a
+        glance, one click to raise the window (L6). One fact, one
+        action, not a mini-app. When no tray is available (a
+        desktop without one, or a headless run) there is simply
+        no tray: no crash, no error."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        tray = QSystemTrayIcon(self)
+        if ICON_PATH.is_file():
+            tray.setIcon(QIcon(str(ICON_PATH)))
+        tray.setToolTip(self._tray_tooltip())
+        menu = QMenu(self)
+        show_action = menu.addAction("Show Fyrn")
+        show_action.triggered.connect(self.bring_to_front)
+        quit_action = menu.addAction("Quit")
+        quit_action.triggered.connect(self.close)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+        self.tray = tray
+
+    def _tray_tooltip(self):
+        """The tray tooltip: the loaded model and free RAM in one
+        line."""
+        _total, free = read_ram_bytes()
+        if free is not None:
+            ram = "RAM: %s free" % format_size(free)
+        else:
+            ram = "RAM: unknown"
+        if self.controller.is_loaded:
+            name = self.controller.current_name or "model"
+            if len(name) > 40:
+                name = name[:37] + "..."
+            return "Fyrn: %s | %s" % (name, ram)
+        return "Fyrn: no model loaded | %s" % ram
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.bring_to_front()
 
     # ------------------------------------------------------------ windows
 
@@ -2093,7 +2304,7 @@ class MainWindow(QMainWindow):
         self.log.set_setting("models_folder", str(self.models_folder))
         self.log.action("models folder changed: %s" % folder)
         self._refresh_model_list()
-        self.statusBar().showMessage(
+        self._show_status(
             "Models folder is now %s." % folder)
 
     def show_how_to_use(self):
@@ -2135,6 +2346,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):  # noqa: N802 - Qt naming
         save_window_geometry(get_settings(), "window", self)
+        if self.tray is not None:
+            self.tray.hide()
         if self._scan_worker is not None:
             self._scan_worker.wait(5000)
         if self.load_worker is not None:

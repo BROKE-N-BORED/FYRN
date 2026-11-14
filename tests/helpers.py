@@ -6,8 +6,10 @@ Nothing here touches the network or a real model.
 
 import os
 import re
+import struct
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
@@ -29,6 +31,47 @@ def make_fake_gguf(path, size):
 def file_bytes(path):
     with open(path, "rb") as fh:
         return fh.read()
+
+
+def write_gguf_file(path, metadata, version=3):
+    """Write a minimal valid GGUF file with the given string
+    metadata (dict key -> str), plus one uint32 entry
+    (general.file_type) and one string array, so parser tests
+    have a real file to read. No tensors."""
+    out = bytearray()
+    out += b"GGUF"
+    out += struct.pack("<I", version)
+    entries = list(metadata.items())
+    kv_count = len(entries) + 2  # + uint32 entry + array entry
+    if version == 3:
+        out += struct.pack("<Q", 0)  # tensor count
+        out += struct.pack("<Q", kv_count)
+    else:
+        out += struct.pack("<I", 0)
+        out += struct.pack("<I", kv_count)
+
+    def put_string(text):
+        blob = text.encode("utf-8")
+        out.extend(struct.pack("<Q", len(blob)))
+        out.extend(blob)
+
+    for key, value in entries:
+        put_string(key)
+        out.extend(struct.pack("<I", 8))  # STRING
+        put_string(value)
+    # One non-string entry: general.file_type, uint32.
+    put_string("general.file_type")
+    out.extend(struct.pack("<I", 4))  # UINT32
+    out.extend(struct.pack("<I", 0))
+    # One array entry: two strings, skipped by the parser.
+    put_string("general.tags")
+    out.extend(struct.pack("<I", 9))  # ARRAY
+    out.extend(struct.pack("<I", 8))  # of STRING
+    out.extend(struct.pack("<Q", 2))
+    put_string("test")
+    put_string("gguf")
+    Path(path).write_bytes(bytes(out))
+    return path
 
 
 class RangeRequestHandler(BaseHTTPRequestHandler):

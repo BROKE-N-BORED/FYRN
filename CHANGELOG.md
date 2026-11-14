@@ -1,5 +1,41 @@
 # Changelog
 
+## Fyrn v0.2 (2026-11-13)
+
+The v0.1 UI audit, finished: the 10 low findings, highest first.
+
+- How to Use opens with a "First steps" section: get a model, load
+  it, chat. A start-here path for readers.
+- Status-bar messages time out after 5 seconds and fall back to
+  the neutral line, so stale news never lingers on an unrelated
+  screen. Live states (loading, stopping) stay until they end.
+- Pull errors follow one pattern: a bad input or an already-there
+  model is a quiet inline error in the status line, no modal. Only
+  a download failure keeps the modal, because it happens while you
+  may be elsewhere.
+- Skeleton tiles are grey shape blocks (name bar, size bar, badge
+  bar) instead of three tiles reading "Loading models...".
+- The chat input is multi-line: Enter sends, Shift+Enter starts a
+  new line. It grows from one line to four as the message grows.
+- A Clear button empties the chat transcript. Nothing is saved, so
+  nothing is lost and no confirm is needed.
+- Pull and Settings windows hug their content: the dead space the
+  audit saw was already filled by the v0.1.1 additions (the first-
+  model suggestion, the Reduce motion switch), verified and pinned
+  by tests here.
+- Model cards show the description from the file's own GGUF header
+  (general.description), clipped to a glance, and in the hover
+  detail. A file with no description shows none: descriptions are
+  read from the file, never invented.
+- Tray icon (when the desktop has one): the loaded model and free
+  RAM at a glance, one click to bring Fyrn forward. No tray, no
+  icon, no complaint.
+- Not built: per-model profiles (L7). They earn their place only
+  when a real per-model setting exists to remember, and there is
+  still none: Reduce motion is global, and threads and context are
+  set by the program itself. No setting was invented to justify
+  them.
+
 ## Fyrn v0.1.1 (2026-11-13)
 
 The v0.1 UI audit, built: the 12 medium findings, highest first.

@@ -6,13 +6,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from helpers import make_fake_gguf, write_gguf_file
 from fyrn.core import (HEADROOM_BYTES, ModelController,
                              ModelNotFoundError, ModelTooBigError,
                              default_models_folder, ensure_home,
                              ensure_models_folder, fit_status,
                              format_size, get_home, import_gguf,
-                             ram_check, read_ram_bytes, remove_gguf,
-                             scan_models)
+                             ram_check, read_gguf_metadata,
+                             read_ram_bytes, remove_gguf, scan_models)
 from fyrn.runner import FakeRunner
 
 GB = 1024 ** 3
@@ -164,6 +165,64 @@ class ScanModelsTests(unittest.TestCase):
         self._write("UPPER.GGUF")
         models, _skipped = scan_models(self.folder)
         self.assertEqual([m["name"] for m in models], ["UPPER.GGUF"])
+
+
+class GgufMetadataTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_v3_header_parses_strings(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf",
+            {"general.name": "Tiny Test",
+             "general.description": "A small test model."})
+        metadata = read_gguf_metadata(path)
+        self.assertEqual(metadata.get("general.name"), "Tiny Test")
+        self.assertEqual(metadata.get("general.description"),
+                         "A small test model.")
+        # Non-string entries are skipped, not returned.
+        self.assertNotIn("general.file_type", metadata)
+        self.assertNotIn("general.tags", metadata)
+
+    def test_v2_header_parses(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf",
+            {"general.description": "Old format, still readable."},
+            version=2)
+        self.assertEqual(read_gguf_metadata(path).get(
+            "general.description"), "Old format, still readable.")
+
+    def test_garbage_file_returns_empty(self):
+        path = make_fake_gguf(self.folder / "fake.gguf", 2048)
+        self.assertEqual(read_gguf_metadata(path), {})
+
+    def test_truncated_header_returns_empty(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf",
+            {"general.description": "Cut short."})
+        data = path.read_bytes()
+        cut = self.folder / "cut.gguf"
+        cut.write_bytes(data[:20])  # magic + version + part of counts
+        self.assertEqual(read_gguf_metadata(cut), {})
+
+    def test_missing_file_returns_empty(self):
+        self.assertEqual(
+            read_gguf_metadata(self.folder / "nope.gguf"), {})
+
+    def test_scan_includes_description(self):
+        write_gguf_file(
+            self.folder / "described.gguf",
+            {"general.description": "Does test things."})
+        make_fake_gguf(self.folder / "plain.gguf", 1024)
+        models, _skipped = scan_models(self.folder)
+        by_name = {m["name"]: m for m in models}
+        self.assertEqual(by_name["described.gguf"]["description"],
+                         "Does test things.")
+        self.assertEqual(by_name["plain.gguf"]["description"], "")
 
 
 class ImportTests(unittest.TestCase):

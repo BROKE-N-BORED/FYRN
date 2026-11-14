@@ -6,10 +6,11 @@ a window. All user-facing messages are plain words, no em-dashes.
 
 import os
 import shutil
+import struct
 from pathlib import Path
 
 APP_NAME = "Fyrn"
-VERSION = "0.1.1"
+VERSION = "0.2"
 
 # Working headroom a loaded model needs on top of its file size:
 # the prompt context and working memory. 512 MB covers a 4096-token
@@ -156,12 +157,120 @@ def ram_check(file_size_bytes, free_bytes):
 
 # ---------------------------------------------------------------- models
 
+# GGUF header reading: only the first 256 KB are read, so a
+# multi-GB model costs one small read. The metadata lives at the
+# very start of the file, so 256 KB is generous.
+_GGUF_MAGIC = b"GGUF"
+_GGUF_MAX_HEADER_BYTES = 256 * 1024
+_GGUF_MAX_KV = 10000
+_GGUF_MAX_STRING = 1024 * 1024
+_GGUF_MAX_ARRAY = 100000
+
+# Fixed-size GGUF value types: type id -> (struct code, size).
+# 8 is STRING, 9 is ARRAY; both are handled separately.
+_GGUF_FIXED = {
+    0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2),
+    4: ("<I", 4), 5: ("<i", 4), 6: ("<f", 4), 7: ("<?", 1),
+    10: ("<Q", 8), 11: ("<q", 8), 12: ("<d", 8),
+}
+
+
+class _GgufReader:
+    """A cursor over GGUF header bytes. Any short read raises
+    ValueError, so a truncated or corrupt file stops the parse
+    instead of crashing it."""
+
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def read(self, size):
+        if size < 0 or self.pos + size > len(self.data):
+            raise ValueError("short read")
+        chunk = self.data[self.pos:self.pos + size]
+        self.pos += size
+        return chunk
+
+    def u32(self):
+        return struct.unpack("<I", self.read(4))[0]
+
+    def u64(self):
+        return struct.unpack("<Q", self.read(8))[0]
+
+    def string(self):
+        length = self.u64()
+        if length > _GGUF_MAX_STRING:
+            raise ValueError("string too long")
+        return self.read(length).decode("utf-8")
+
+    def value(self, value_type):
+        if value_type == 8:  # STRING
+            return self.string()
+        if value_type == 9:  # ARRAY: skip the elements
+            elem_type = self.u32()
+            count = self.u64()
+            if count > _GGUF_MAX_ARRAY:
+                raise ValueError("array too long")
+            for _ in range(count):
+                self.value(elem_type)
+            return None
+        fixed = _GGUF_FIXED.get(value_type)
+        if fixed is None:
+            raise ValueError("unknown value type %d" % value_type)
+        code, size = fixed
+        return struct.unpack(code, self.read(size))[0]
+
+
+def read_gguf_metadata(path):
+    """Read the string metadata from a GGUF file's header.
+
+    Returns a dict of key -> value for string-valued entries
+    (general.name, general.description, ...). Anything that is
+    not a readable GGUF file, or a header that cannot be parsed,
+    returns {} or a partial dict: a bad file never raises.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(_GGUF_MAX_HEADER_BYTES)
+    except OSError:
+        return {}
+    if len(head) < 8 or head[:4] != _GGUF_MAGIC:
+        return {}
+    reader = _GgufReader(head)
+    reader.pos = 4
+    try:
+        version = reader.u32()
+        if version == 3:
+            reader.u64()  # tensor count
+            kv_count = reader.u64()
+        elif version == 2:
+            reader.read(4)  # tensor count
+            kv_count = reader.u32()
+        else:
+            return {}
+    except ValueError:
+        return {}
+    if kv_count > _GGUF_MAX_KV:
+        return {}
+    metadata = {}
+    try:
+        for _ in range(kv_count):
+            key = reader.string()
+            value_type = reader.u32()
+            value = reader.value(value_type)
+            if isinstance(value, str):
+                metadata[key] = value
+    except (ValueError, struct.error, UnicodeDecodeError):
+        pass  # partial metadata is still real metadata
+    return metadata
+
 
 def scan_models(folder):
     """List the .gguf models in a folder.
 
     Returns (models, skipped). models is a list of dicts with name,
-    path, and size, sorted by name. skipped is a list of
+    path, size, and description (from the file's GGUF header, ""
+    when the file has none), sorted by name. skipped is a list of
     (name, reason) for .gguf entries that could not be read, so
     nothing is silently dropped (U32). In-progress pulls (*.part)
     are not models yet and are not listed.
@@ -182,8 +291,13 @@ def scan_models(folder):
         except OSError as exc:
             skipped.append((entry.name, "could not be read (%s)" % exc))
             continue
+        # The description comes from the file's own GGUF header
+        # (general.description), never invented: a file without
+        # one simply has no description (L9).
+        description = read_gguf_metadata(entry).get(
+            "general.description", "")
         models.append({"name": entry.name, "path": entry,
-                       "size": size})
+                       "size": size, "description": description})
     return models, skipped
 
 
