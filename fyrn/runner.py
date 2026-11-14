@@ -65,7 +65,15 @@ class Runner:
         return os.path.basename(str(self.model_path))
 
     def load(self, path, progress_cb=None, cancel_event=None):
-        """Load a model file. Returns {"load_time_s": float}."""
+        """Load a model file. Returns {"load_time_s": float}.
+
+        progress_cb(pct, msg) reports real progress only: pct is
+        0-100 when the runner can measure its own progress, or -1
+        when it cannot (the real backend loads in one long opaque
+        step, so it reports -1 with honest stage text instead of a
+        percent that measures nothing). The UI shows -1 as an
+        indeterminate bar.
+        """
         raise NotImplementedError
 
     def unload(self):
@@ -171,8 +179,21 @@ class LlamaRunner(Runner):
                 "install.sh again with a network connection, then "
                 "try loading the model again.")
         started = time.monotonic()
+        # The backend gives no progress while it loads: one long
+        # opaque step. Report -1 (indeterminate) with honest stage
+        # text and the real file size, never a percent that
+        # measures nothing. (An earlier version reported 10 here
+        # and 100 at the end, so the bar sat at 10% for the whole
+        # load and then jumped.)
         if progress_cb is not None:
-            progress_cb(10, "Loading %s" % os.path.basename(str(path)))
+            from .core import format_size
+            try:
+                size_text = format_size(
+                    os.path.getsize(str(path)))
+            except OSError:
+                size_text = "unknown size"
+            progress_cb(-1, "Loading %s (%s) into RAM..."
+                        % (os.path.basename(str(path)), size_text))
         if cancel_event is not None and cancel_event.is_set():
             raise LoadCancelled("Load cancelled.")
         threads = auto_threads()

@@ -11,7 +11,8 @@ from fyrn.core import (HEADROOM_BYTES, ModelController,
                              default_models_folder, ensure_home,
                              ensure_models_folder, fit_status,
                              format_size, get_home, import_gguf,
-                             ram_check, read_ram_bytes, scan_models)
+                             ram_check, read_ram_bytes, remove_gguf,
+                             scan_models)
 from fyrn.runner import FakeRunner
 
 GB = 1024 ** 3
@@ -214,6 +215,34 @@ class ImportTests(unittest.TestCase):
         import_gguf(src, self.folder)
         with self.assertRaises(ValueError):
             import_gguf(src, self.folder)
+
+
+class RemoveTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_remove_deletes_file(self):
+        path = self.folder / "alpha.gguf"
+        path.write_bytes(b"x" * 100)
+        remove_gguf(path)
+        self.assertFalse(path.exists())
+
+    def test_remove_missing_file_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            remove_gguf(self.folder / "gone.gguf")
+        self.assertIn("already gone", str(ctx.exception))
+
+    def test_remove_non_gguf_raises(self):
+        path = self.folder / "notes.txt"
+        path.write_bytes(b"x")
+        with self.assertRaises(ValueError) as ctx:
+            remove_gguf(path)
+        self.assertIn("not a .gguf", str(ctx.exception))
+        self.assertTrue(path.exists())
 
 
 class ControllerTests(unittest.TestCase):

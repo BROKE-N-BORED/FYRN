@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 
 APP_NAME = "Fyrn"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # Working headroom a loaded model needs on top of its file size:
 # the prompt context and working memory. 512 MB covers a 4096-token
@@ -216,6 +216,24 @@ def import_gguf(source, folder):
     except OSError as exc:
         raise ValueError("The file could not be copied (%s)." % exc)
     return dest
+
+
+def remove_gguf(path):
+    """Delete a .gguf model file from the models folder.
+
+    Raises ValueError with a plain-words message when the file is
+    gone, is not a .gguf file, or cannot be deleted.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError("That model file is already gone.")
+    if path.suffix.lower() != ".gguf":
+        raise ValueError("That is not a .gguf model file.")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise ValueError(
+            "The file could not be removed (%s)." % exc)
 
 
 # ---------------------------------------------------------------- loading

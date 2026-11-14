@@ -2,9 +2,14 @@
 runner with known timing, and the real runner's failure paths."""
 
 import importlib.util
+import sys
+import tempfile
 import threading
 import time
+import types
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from fyrn.runner import (FakeRunner, GenerationCancelled,
                                LoadCancelled, LlamaRunner, RunnerError,
@@ -134,6 +139,41 @@ class LlamaRunnerTests(unittest.TestCase):
         runner = LlamaRunner()
         with self.assertRaises(RunnerError):
             runner.generate("hello")
+
+    def test_load_reports_no_fake_percent(self):
+        # The real backend loads in one opaque step, so it must
+        # never report a mid-load percent: -1 (indeterminate) with
+        # honest stage text, then 100 when it is really loaded.
+        # (An earlier version reported 10, so the bar sat at 10%
+        # for the whole load and then jumped to 100%.)
+        class FakeLlama:
+            def __init__(self, model_path, n_threads, n_ctx,
+                         verbose):
+                time.sleep(0.05)  # a load takes a moment
+
+        module = types.ModuleType("llama_cpp")
+        module.Llama = FakeLlama
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "small.gguf"
+            path.write_bytes(b"x" * 2048)
+            seen = []
+            runner = LlamaRunner()
+            with mock.patch.dict(sys.modules,
+                                 {"llama_cpp": module}):
+                result = runner.load(
+                    str(path),
+                    progress_cb=lambda pct, msg: seen.append(
+                        (pct, msg)))
+            self.assertTrue(runner.is_loaded)
+            self.assertGreaterEqual(result["load_time_s"], 0.0)
+            self.assertTrue(seen)
+            for pct, _msg in seen:
+                self.assertIn(pct, (-1, 100),
+                              "fake mid-load percent: %s" % pct)
+            self.assertEqual(seen[0][0], -1)
+            self.assertIn("small.gguf", seen[0][1])
+            self.assertIn("2 KB", seen[0][1])
+            self.assertEqual(seen[-1], (100, "Loaded"))
 
 
 if __name__ == "__main__":

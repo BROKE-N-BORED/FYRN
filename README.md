@@ -32,20 +32,22 @@ stops — it never runs apt itself.
 
 - **Models tab:** every `.gguf` file in your models folder, with its
   size and a fit badge (Fits, Tight, Too big). Click a model to pick
-  it, press Load. Only one model runs at a time; loading a second
-  one unloads the first. Press Unload when you are done to give the
-  RAM back.
+  it, press Load (or double-click a model to load it straight
+  away). Only one model runs at a time; loading a second one
+  unloads the first. Press Unload when you are done to give the
+  RAM back. Remove deletes a model from the folder (it asks first).
 - **Pull models** (Models menu): type a Hugging Face model and its
   file name, like `myname/mymodel mymodel.gguf`, or paste a direct
-  link to a `.gguf` file. Pulls show progress, MB downloaded, and
-  speed, and they resume after a failure or a cancel instead of
-  starting over.
+  link to a `.gguf` file. Not sure what to get first? The Pull
+  window suggests a small first model. Pulls show progress, MB
+  downloaded, and speed, and they resume after a failure or a
+  cancel instead of starting over.
 - **Import a GGUF file** (Models menu): bring in a `.gguf` file from
   anywhere on the disk, such as a fine-tuned model you made
   elsewhere. It copies the file into your models folder.
-- **Settings** (File menu): one setting, the models folder. Pick any
-  folder you like. Everything else (threads, context size) is set by
-  the program itself to fit this PC.
+- **Settings** (File menu): the models folder — pick any folder you
+  like — and a Reduce motion switch. Everything else (threads,
+  context size) is set by the program itself to fit this PC.
 - **Chat tab:** load a model, type a message, press Send. The reply
   streams in. Live numbers show RAM used and free, speed in tokens
   per second, time to first token, and load time.
@@ -63,8 +65,8 @@ stops — it never runs apt itself.
 - The model engine is llama.cpp (CPU only), through
   `llama-cpp-python`. No network is needed except when pulling a
   model.
-- If motion on screen bothers you, start the program with
-  `FYRN_REDUCED_MOTION=1` set: the short fades are skipped
+- If motion on screen bothers you, turn on Reduce motion in
+  Settings (File menu): the short fades and lifts are skipped
   and everything changes instantly instead.
 
 ## Development

@@ -193,7 +193,18 @@ class ZipBuilderTests(unittest.TestCase):
                 timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout
                              + result.stderr)
-            zip_path = copy / "fyrn-v0.1.zip"
+            # The zip name follows the version (a trailing .0 patch
+            # is dropped, so 0.1.0 ships as v0.1 and 0.1.1 as
+            # v0.1.1); derive it, never hardcode it.
+            sys.path.insert(0, str(copy))
+            try:
+                from fyrn import __version__
+            finally:
+                sys.path.remove(str(copy))
+            parts = __version__.split(".")
+            tag = (".".join(parts[:2]) if len(parts) == 3
+                   and parts[2] == "0" else __version__)
+            zip_path = copy / ("fyrn-v%s.zip" % tag)
             self.assertTrue(zip_path.is_file())
             with zipfile.ZipFile(zip_path) as zf:
                 names = zf.namelist()

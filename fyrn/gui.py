@@ -14,25 +14,27 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import (QEvent, QEasingCurve, QLockFile,
+from PySide6.QtCore import (QEvent, QEasingCurve, QLockFile, QPoint,
                             QPropertyAnimation, QRect, QSettings, Qt,
                             QThread, QTimer, Signal)
-from PySide6.QtGui import QGuiApplication, QIcon
+from PySide6.QtGui import QCursor, QGuiApplication, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,
-                               QFrame, QGraphicsOpacityEffect,
-                               QGridLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem,
-                               QMainWindow, QMenu, QMessageBox,
-                               QProgressBar, QPushButton, QScrollArea,
-                               QSizePolicy, QSpacerItem, QTabWidget,
-                               QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
+                               QFileDialog, QFrame,
+                               QGraphicsOpacityEffect, QGridLayout,
+                               QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMainWindow,
+                               QMenu, QMessageBox, QProgressBar,
+                               QPushButton, QScrollArea, QSizePolicy,
+                               QSpacerItem, QTabWidget, QTextEdit,
+                               QToolTip, QVBoxLayout, QWidget)
 
 from . import __version__
 from . import core
-from .core import (ModelController, ModelNotFoundError, ModelTooBigError,
-                   ensure_home, ensure_models_folder, fit_status,
-                   format_size, read_ram_bytes, scan_models)
+from .core import (HEADROOM_BYTES, ModelController, ModelNotFoundError,
+                   ModelTooBigError, ensure_home, ensure_models_folder,
+                   fit_status, format_size, read_ram_bytes, remove_gguf,
+                   scan_models)
 from .debug_log import DebugLogger
 from .pull import (DownloadError, PullCancelled, download_file,
                    parse_model_input)
@@ -50,10 +52,11 @@ ICON_PATH = _HERE.parent / "assets" / "fyrn.png"
 # The look: one dark stylesheet, drawn from the icon, applied by
 # main() across every window. Deep blue-black surfaces (#14202e, the
 # icon tile), ember amber (#f2c14e) for selection and highlights,
-# ember orange (#e8890c) for progress. Nothing here animates; the
-# only motion in the app is the two one-shot 200 ms opacity fades
-# (pull finish, newly pulled card), which the reduced-motion
-# fallback skips entirely.
+# ember orange (#e8890c) for progress. The motion in the app is
+# small and cheap: two one-shot 200 ms opacity fades (pull finish,
+# newly pulled card), a 150 ms press dip on Send/Load/Pull, and a
+# 200 ms 4 px hover lift on cards. The reduced-motion fallback
+# skips all of it.
 DARK_STYLESHEET = """
 QWidget {
     background-color: #14202e;
@@ -189,15 +192,31 @@ QStatusBar {
 """
 
 
+def get_reduce_motion():
+    """The Reduce motion setting (Settings window)."""
+    settings = get_settings()
+    return bool(settings.value("reduce_motion", False, type=bool))
+
+
+def set_reduce_motion(value):
+    settings = get_settings()
+    settings.setValue("reduce_motion", bool(value))
+    settings.sync()
+
+
 def reduced_motion():
     """True when motion should be skipped (reduced-motion fallback).
 
-    Set FYRN_REDUCED_MOTION=1 in the environment. The state
-    changes still happen; only the animation is skipped, so the
-    celebration and the new-card pulse become instant.
+    The Settings window's Reduce motion switch, or the
+    FYRN_REDUCED_MOTION=1 environment variable as an override.
+    The state changes still happen; only the animation is skipped,
+    so the celebration and the new-card pulse become instant.
     """
-    return os.environ.get(
-        "FYRN_REDUCED_MOTION", "").lower() in ("1", "true", "yes")
+    if os.environ.get(
+            "FYRN_REDUCED_MOTION", "").lower() in ("1", "true",
+                                                   "yes"):
+        return True
+    return get_reduce_motion()
 
 HOW_TO_USE_SECTIONS = {
     "Models": (
@@ -207,14 +226,18 @@ HOW_TO_USE_SECTIONS = {
         "size and a fit badge: Fits means it runs fine on this PC, "
         "Tight means it will run but leaves little spare RAM, Too "
         "big means it will not fit in free RAM.\n\n"
-        "Pick a model and press Load. Only one model runs at a time: "
-        "loading a second one unloads the first. Press Unload when "
-        "you are done to give the RAM back.\n\n"
+        "Pick a model and press Load. Double-click a model to load "
+        "it straight away. Only one model runs at a time: loading "
+        "a second one unloads the first. Press Unload when you are "
+        "done to give the RAM back.\n\n"
         "Keyboard works too: Tab moves between models, Space picks "
         "the one in focus, Enter loads it.\n\n"
         "Import brings in a .gguf file from anywhere on the disk, "
         "such as a fine-tuned model you made elsewhere. It copies "
-        "the file into your models folder."
+        "the file into your models folder.\n\n"
+        "Remove deletes a model from the folder. It asks first, "
+        "names the file and its size, and a loaded model is "
+        "unloaded before it is removed."
     ),
     "Pulling a model": (
         "Pull downloads a model from the internet into your models "
@@ -222,6 +245,8 @@ HOW_TO_USE_SECTIONS = {
         "Type a Hugging Face model and its file name, like "
         "myname/mymodel mymodel.gguf, or paste a direct link to a "
         ".gguf file. Then press Pull.\n\n"
+        "Not sure what to get first? The Pull window suggests a "
+        "small first model that fits this PC.\n\n"
         "The window shows progress, how much has downloaded, and the "
         "speed. Press Cancel to stop; the part already downloaded "
         "stays, and pulling again picks up where it stopped instead "
@@ -229,10 +254,13 @@ HOW_TO_USE_SECTIONS = {
         "When the pull finishes, the model appears in the Models tab."
     ),
     "Settings": (
-        "Settings lives in the File menu. It has one setting: the "
-        "models folder, where pulled and imported models are kept.\n\n"
-        "Press Browse to pick a different folder, then Save. The "
-        "Models tab switches to the new folder right away.\n\n"
+        "Settings lives in the File menu. It has two settings: the "
+        "models folder, where pulled and imported models are kept, "
+        "and Reduce motion.\n\n"
+        "Press Browse to pick a different models folder, then Save. "
+        "The Models tab switches to the new folder right away.\n\n"
+        "Check Reduce motion if movement on screen bothers you: "
+        "the short fades and lifts become instant instead.\n\n"
         "Everything else about how models run (threads, context "
         "size) is set by the program itself to fit this PC. There "
         "is nothing else to set."
@@ -289,13 +317,43 @@ def set_models_folder(folder) -> None:
     settings.sync()
 
 
+def save_window_geometry(settings, prefix, widget):
+    """Save a window's geometry under settings prefix/x, y, width,
+    height (U5: windows remember their size and position)."""
+    rect = widget.geometry()
+    settings.setValue("%s/x" % prefix, rect.x())
+    settings.setValue("%s/y" % prefix, rect.y())
+    settings.setValue("%s/width" % prefix, rect.width())
+    settings.setValue("%s/height" % prefix, rect.height())
+    settings.sync()
+
+
+def restore_window_geometry(settings, prefix, widget):
+    """Restore a window's geometry saved by save_window_geometry.
+    Does nothing when nothing is saved, or when the saved rect is
+    off every screen (a monitor setup that changed since)."""
+    values = [settings.value("%s/%s" % (prefix, key), type=int)
+              for key in ("x", "y", "width", "height")]
+    if any(value is None for value in values):
+        return
+    rect = QRect(*values)
+    screens = QGuiApplication.screens()
+    if screens and not any(
+            screen.availableGeometry().intersects(rect)
+            for screen in screens):
+        return
+    widget.setGeometry(rect)
+
+
 # ---------------------------------------------------------------- workers
 
 
 class LoadWorker(QThread):
     """Load a model off the UI thread (U30)."""
 
-    progress = Signal(int, str)  # percent, message
+    # percent, message; percent is -1 when the backend has no
+    # percent to give (indeterminate bar, honest stage text).
+    progress = Signal(int, str)
     finished = Signal(dict)      # {"load_time_s": float, "warning": str}
     failed = Signal(str)         # plain-words message
 
@@ -507,6 +565,75 @@ class SingleInstance:
 
 # ---------------------------------------------------------------- windows
 
+# The suggested first model for a new user: a real repo and file,
+# checked against Hugging Face on 2026-11-13 (Q4_K_M, 0.40 GB, so
+# it fits this PC easily). Never invent a suggestion: if this one
+# ever goes away, the button must go away with it, not guess a
+# replacement.
+FIRST_PULL_SUGGESTION = (
+    "bartowski/Qwen2.5-0.5B-Instruct-GGUF "
+    "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf")
+
+
+class PressDipButton(QPushButton):
+    """A button that dips 3% when pressed (entry 001): scale to
+    0.97 over 150 ms, split 75 ms down and 75 ms back, ease-out.
+    One widget, one shot: the animation moves geometry only and
+    never re-activates the layout (the size hint does not change),
+    so nothing reflows. Skipped under reduced motion. Used for
+    Send, Load, and Pull only; every other button stays still.
+    """
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self._dip_anim = None
+        self._dip_rest = None
+
+    def mousePressEvent(self, event):  # noqa: N802 - Qt naming
+        super().mousePressEvent(event)
+        if reduced_motion() or not self.isEnabled():
+            return
+        # Reuse the stored rest when a return is still in flight:
+        # the current geometry mid-return is not the rest.
+        if self._dip_rest is None:
+            self._dip_rest = QRect(self.geometry())
+        rest = self._dip_rest
+        dx = max(1, rest.width() * 3 // 200)
+        dy = max(1, rest.height() * 3 // 200)
+        shrunk = QRect(rest).adjusted(dx, dy, -dx, -dy)
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(75)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(shrunk)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._dip_anim = anim
+        anim.start()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt naming
+        super().mouseReleaseEvent(event)
+        self._end_dip()
+
+    def _end_dip(self):
+        if self._dip_rest is None:
+            return
+        rest = self._dip_rest
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(75)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(rest)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.finished.connect(
+            lambda a=anim, r=rest: self._on_dip_finished(a, r))
+        self._dip_anim = anim
+        anim.start()
+
+    def _on_dip_finished(self, anim, rest):
+        # Only the current animation may clear the rest: a stale
+        # return finishing after a new press must not un-rest the
+        # button.
+        if self._dip_anim is anim and self._dip_rest == rest:
+            self._dip_rest = None
+
 
 class PullWindow(QDialog):
     """Pull a model: its own window (U1).
@@ -527,6 +654,7 @@ class PullWindow(QDialog):
         self.setWindowTitle("Pull a model")
         self.setMinimumSize(560, 300)
         self.resize(640, 340)
+        restore_window_geometry(get_settings(), "pull_window", self)
 
         layout = QVBoxLayout(self)
 
@@ -537,14 +665,31 @@ class PullWindow(QDialog):
         layout.addWidget(self.input)
 
         help_label = QLabel(
-            "Type a Hugging Face model and its file name, like "
+            "Models come from Hugging Face, a website where models "
+            "are listed. Type a model and its file name, like "
             "myname/mymodel mymodel.gguf, or paste a direct link to "
             "a .gguf file. It saves into your models folder.")
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
 
+        # A new user with no models and no Hugging Face knowledge
+        # needs a real first model to type, not just the shape of
+        # one: one tap fills the field with the suggestion.
+        suggest_label = QLabel(
+            "First time here? Try this small model first. It fits "
+            "this PC easily (about 400 MB).")
+        suggest_label.setWordWrap(True)
+        layout.addWidget(suggest_label)
+
+        suggest_row = QHBoxLayout()
+        self.suggest_button = QPushButton("Try Qwen2.5 0.5B first")
+        self.suggest_button.clicked.connect(self._fill_suggestion)
+        suggest_row.addWidget(self.suggest_button)
+        suggest_row.addStretch(1)
+        layout.addLayout(suggest_row)
+
         buttons = QHBoxLayout()
-        self.pull_button = QPushButton("Pull")
+        self.pull_button = PressDipButton("Pull")
         self.pull_button.clicked.connect(self._start_pull)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self._cancel_pull)
@@ -571,6 +716,11 @@ class PullWindow(QDialog):
         self.busy_dot.setStyleSheet("color: #f2c14e;")
         self.busy_dot.setVisible(False)
         layout.addWidget(self.busy_dot)
+
+    def _fill_suggestion(self):
+        """Fill the field with the suggested first model."""
+        self.input.setText(FIRST_PULL_SUGGESTION)
+        self.input.setFocus()
 
     def _set_busy(self, busy):
         self.busy_dot.setVisible(busy)
@@ -686,8 +836,28 @@ class PullWindow(QDialog):
             self.worker.cancel()
             self.status_label.setText("Stopping...")
 
+    def hideEvent(self, event):  # noqa: N802 - Qt naming
+        # Save on hide as well as close: a dialog hidden by
+        # accept()/reject() never gets a close event.
+        save_window_geometry(get_settings(), "pull_window", self)
+        super().hideEvent(event)
+
     def closeEvent(self, event):  # noqa: N802 - Qt naming
+        save_window_geometry(get_settings(), "pull_window", self)
         if self.worker is not None:
+            # Closing mid-pull stops the download: ask first,
+            # default No, and say the part already downloaded
+            # stays (it does, and the next pull resumes from it).
+            answer = QMessageBox.question(
+                self, "Pull a model",
+                "Stop this pull? The part already downloaded stays, "
+                "and pulling again picks up where it stopped.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
             self.worker.cancel()
             self.worker.wait(5000)
         super().closeEvent(event)
@@ -696,8 +866,9 @@ class PullWindow(QDialog):
 class SettingsWindow(QDialog):
     """Settings: its own resizable pop-up window (U1).
 
-    One setting only: the models folder (U36). The window is
-    resizable and maximizable; nothing pins its size.
+    Two settings, both ones the user would change for a real
+    reason (U36): the models folder, and Reduce motion. The
+    window is resizable and maximizable; nothing pins its size.
     """
 
     folder_changed = Signal(str)
@@ -707,6 +878,8 @@ class SettingsWindow(QDialog):
         self.setWindowTitle("Settings")
         self.setMinimumSize(480, 180)
         self.resize(560, 220)
+        restore_window_geometry(
+            get_settings(), "settings_window", self)
 
         layout = QVBoxLayout(self)
 
@@ -728,6 +901,16 @@ class SettingsWindow(QDialog):
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
 
+        self.motion_check = QCheckBox("Reduce motion")
+        self.motion_check.setChecked(get_reduce_motion())
+        layout.addWidget(self.motion_check)
+
+        motion_help = QLabel(
+            "Less movement on screen. Animations become instant "
+            "instead.")
+        motion_help.setWordWrap(True)
+        layout.addWidget(motion_help)
+
         layout.addStretch(1)
 
         buttons = QHBoxLayout()
@@ -739,6 +922,18 @@ class SettingsWindow(QDialog):
         buttons.addWidget(self.save_button)
         buttons.addWidget(cancel_button)
         layout.addLayout(buttons)
+
+    def hideEvent(self, event):  # noqa: N802 - Qt naming
+        # Save on hide: Save and Cancel hide the dialog without a
+        # close event, and those are the paths that matter here.
+        save_window_geometry(
+            get_settings(), "settings_window", self)
+        super().hideEvent(event)
+
+    def closeEvent(self, event):  # noqa: N802 - Qt naming
+        save_window_geometry(
+            get_settings(), "settings_window", self)
+        super().closeEvent(event)
 
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(
@@ -756,6 +951,7 @@ class SettingsWindow(QDialog):
                 "That folder could not be used (%s)." % exc)
             return
         set_models_folder(folder)
+        set_reduce_motion(self.motion_check.isChecked())
         self.folder_changed.emit(str(folder))
         self.accept()
 
@@ -768,6 +964,7 @@ class HowToUseWindow(QDialog):
         self.setWindowTitle("How to Use")
         self.setMinimumSize(640, 420)
         self.resize(720, 480)
+        restore_window_geometry(get_settings(), "howto_window", self)
 
         layout = QHBoxLayout(self)
         self.section_list = QListWidget()
@@ -785,12 +982,26 @@ class HowToUseWindow(QDialog):
 
         self.section_list.setCurrentRow(0)
 
+    def hideEvent(self, event):  # noqa: N802 - Qt naming
+        save_window_geometry(get_settings(), "howto_window", self)
+        super().hideEvent(event)
+
+    def closeEvent(self, event):  # noqa: N802 - Qt naming
+        save_window_geometry(get_settings(), "howto_window", self)
+        super().closeEvent(event)
+
     def _show_section(self, title):
         self.text_view.setPlainText(
             HOW_TO_USE_SECTIONS.get(title, ""))
 
 
 # ---------------------------------------------------------------- tiles
+
+# Bento grid numbers (entry 005): 3 columns at this window width,
+# 16 px gaps, 12 px corners. Cards size to their content; the hero
+# tile spans the full width and earns it with live stats.
+GRID_COLUMNS = 3
+GRID_SPACING = 16
 
 
 FIT_BADGES = {
@@ -809,21 +1020,39 @@ class ModelCard(QFrame):
 
     clicked = Signal(str)         # path
     double_clicked = Signal(str)  # path
+    remove_requested = Signal(str)  # path
 
     def __init__(self, model, status, loaded=False, hero=False,
-                 parent=None):
+                 free_bytes=None, parent=None):
         super().__init__(parent)
         self.path = str(model["path"])
         self._selected = False
+        # Hover detail (entry 017): the full path, RAM needed vs
+        # free, and why it fits or not, with no click needed. The
+        # data is already in memory, so the preview is instant.
+        self.setToolTip(
+            self._build_tooltip(model, status, free_bytes))
+        # Hover lift (entry 001): the card rises 4 px over 200 ms.
+        # The hover timer guards the bottom 4 px strip: the lift
+        # moves the card out from under a cursor parked there,
+        # which would otherwise bob the card up and down forever.
+        self._lift_anim = None
+        self._lift_rest = None
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setInterval(150)
+        self._hover_timer.timeout.connect(self._check_hover)
         # Keyboard focus: Tab lands on cards, so picking and
         # loading a model never needs the mouse.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setMinimumHeight(120 if hero else 110)
+        # Content height, not a fixed box: a card holds three lines
+        # (name, size, badge), so ~100 px is enough; the old
+        # 110-150 px box left each card ~60% empty inside.
+        self.setMinimumHeight(120 if hero else 96)
         # Cap the height: the grid's expanding spacer takes the
         # leftover space, but without a cap the tiles still grow
         # past their content (250 px tall with 2 models).
-        self.setMaximumHeight(170 if hero else 150)
+        self.setMaximumHeight(170 if hero else 120)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
@@ -857,6 +1086,17 @@ class ModelCard(QFrame):
             badge_row.addWidget(loaded_label)
         badge_row.addStretch(1)
         layout.addLayout(badge_row)
+        # The hero tile earns its size with live stats (load time,
+        # then speed once a reply exists), updated by the main
+        # window's stats refresh. Plain cards have no stats line.
+        self.stats_label = None
+        if hero:
+            self.stats_label = QLabel("")
+            self.stats_label.setObjectName("hero_stats")
+            self.stats_label.setStyleSheet(
+                "font-size: 11pt; color: #999999;")
+            self.stats_label.setWordWrap(True)
+            layout.addWidget(self.stats_label)
         layout.addStretch(1)
 
         # Clicks on the labels must reach the card, not stop at the
@@ -866,26 +1106,69 @@ class ModelCard(QFrame):
                 Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._apply_frame()
 
+    def set_stats(self, text):
+        """Show live stats in the hero tile (no-op on a plain
+        card)."""
+        if self.stats_label is not None:
+            self.stats_label.setText(text)
+
+    @staticmethod
+    def _build_tooltip(model, status, free_bytes):
+        """Hover detail text: full path, size, RAM needed vs free,
+        and the fit reason, in plain words."""
+        lines = ["Full path: %s" % model["path"],
+                 "Size: %s" % format_size(model["size"])]
+        needed = model["size"] + HEADROOM_BYTES
+        if free_bytes is None:
+            lines.append("Needs %s of RAM, free RAM unknown"
+                         % format_size(needed))
+        else:
+            lines.append("Needs %s of RAM, %s free"
+                         % (format_size(needed),
+                            format_size(free_bytes)))
+        reasons = {
+            "fits": "Fits: needs less than 3/4 of free RAM.",
+            "tight": "Tight: fits, but leaves little spare RAM.",
+            "too big": "Too big: needs more RAM than is free.",
+            "unknown": "RAM could not be read, so the fit is "
+                       "unknown.",
+        }
+        lines.append(reasons[status])
+        return "\n".join(lines)
+
     def set_selected(self, selected):
         self._selected = selected
         self._apply_frame()
 
     def _apply_frame(self):
         # Selected and keyboard-focused cards both get the amber
-        # border, so focus is visible at a glance.
+        # border, so focus is visible at a glance. Labels inside
+        # the card are transparent: the global widget background
+        # (#14202e) is darker than the card (#1c2836), so an
+        # opaque label shows a darker band behind its text. The
+        # badge keeps its own background (its own stylesheet wins
+        # over this descendant rule).
         if self._selected or self.hasFocus():
             border = "2px solid #f2c14e"
         else:
             border = "1px solid #555555"
         self.setStyleSheet(
             "ModelCard { border: %s; border-radius: 12px; "
-            "background-color: #1c2836; }" % border)
+            "background-color: #1c2836; } "
+            "ModelCard QLabel { background-color: transparent; }"
+            % border)
 
     def focusInEvent(self, event):  # noqa: N802 - Qt naming
         self._apply_frame()
+        # Keyboard focus shows the same detail hover does, so a
+        # keyboard user gets the preview without a mouse.
+        QToolTip.showText(
+            self.mapToGlobal(QPoint(0, self.height())),
+            self.toolTip(), self)
         super().focusInEvent(event)
 
     def focusOutEvent(self, event):  # noqa: N802 - Qt naming
+        QToolTip.hideText()
         self._apply_frame()
         super().focusOutEvent(event)
 
@@ -907,6 +1190,84 @@ class ModelCard(QFrame):
         self.double_clicked.emit(self.path)
         super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event):  # noqa: N802 - Qt naming
+        """Right-click menu: Remove. The confirm itself lives in
+        the main window, so every remove path asks the same way."""
+        menu = QMenu(self)
+        action = menu.addAction("Remove")
+        chosen = menu.exec(event.globalPos())
+        if chosen is action:
+            self.remove_requested.emit(self.path)
+
+    def enterEvent(self, event):  # noqa: N802 - Qt naming
+        if not reduced_motion():
+            self._start_lift()
+        self._hover_timer.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):  # noqa: N802 - Qt naming
+        # If the cursor is still inside the card's resting place,
+        # the lift itself caused this leave; the hover timer drops
+        # the card once the cursor truly moves away.
+        if self._cursor_outside_rest():
+            self._end_lift()
+            self._hover_timer.stop()
+        super().leaveEvent(event)
+
+    def _start_lift(self):
+        if self._lift_rest is not None:
+            return  # already lifted (or dropping back: let it land)
+        rest = self.geometry()
+        self._lift_rest = QRect(rest)
+        lifted = QRect(rest)
+        lifted.translate(0, -4)
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(200)
+        anim.setStartValue(rest)
+        anim.setEndValue(lifted)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._lift_anim = anim
+        anim.start()
+
+    def _end_lift(self):
+        if self._lift_rest is None:
+            return
+        rest = self._lift_rest
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(200)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(rest)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.finished.connect(
+            lambda a=anim, r=rest: self._on_drop_finished(a, r))
+        self._lift_anim = anim
+        anim.start()
+
+    def _on_drop_finished(self, anim, rest):
+        # Only the current animation may clear the rest: a stale
+        # drop finishing after a new lift must not un-rest the card.
+        if self._lift_anim is anim and self._lift_rest == rest:
+            self._lift_rest = None
+
+    def _cursor_outside_rest(self):
+        if self._lift_rest is None or self.parentWidget() is None:
+            return True
+        point = self.parentWidget().mapFromGlobal(QCursor.pos())
+        return not self._lift_rest.contains(point)
+
+    def _check_hover(self):
+        """Drop a lifted card once the cursor has truly left it:
+        outside both the lifted card and its resting place."""
+        if self._lift_rest is None or self.parentWidget() is None:
+            self._hover_timer.stop()
+            return
+        point = self.parentWidget().mapFromGlobal(QCursor.pos())
+        if (self._lift_rest.contains(point)
+                or self.geometry().contains(point)):
+            return
+        self._end_lift()
+        self._hover_timer.stop()
+
 
 class SkeletonCard(QFrame):
     """Placeholder tile shown while the model list loads."""
@@ -914,11 +1275,14 @@ class SkeletonCard(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setMinimumHeight(110)
-        self.setMaximumHeight(150)
+        # Same height as a regular card, so the list does not jump
+        # when the skeletons are replaced by real cards.
+        self.setMinimumHeight(96)
+        self.setMaximumHeight(120)
         self.setStyleSheet(
             "SkeletonCard { border: 1px solid #444444; "
-            "border-radius: 12px; background-color: #1a2531; }")
+            "border-radius: 12px; background-color: #1a2531; } "
+            "SkeletonCard QLabel { background-color: transparent; }")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
         label = QLabel("Loading models...")
@@ -928,6 +1292,11 @@ class SkeletonCard(QFrame):
 
 
 # ---------------------------------------------------------------- main
+
+# The line between chat turns: a plain row of hyphens (a hyphen
+# line, never an em-dash — U33), so long replies do not run
+# together into one wall of text.
+TURN_DIVIDER = "-" * 24
 
 
 class MainWindow(QMainWindow):
@@ -967,6 +1336,10 @@ class MainWindow(QMainWindow):
         self._scan_worker = None
         self._scan_dirty = False
         self._selected_path = None
+        # A model to select once the next scan finishes (set by
+        # import/pull, which select the new model).
+        self._select_path = None
+        self._hero_card = None  # the loaded model's tile, if any
         self.model_cards = {}  # path string -> ModelCard
         self._pulse_path = None
         self._pulse_anim = None
@@ -974,6 +1347,10 @@ class MainWindow(QMainWindow):
         # (so restoring the default message never clobbers a load
         # or unload message).
         self._empty_status = False
+        # A status message to show once the next scan finishes
+        # (remove/import confirmations): the scan's own status
+        # update would clobber a message shown before the scan.
+        self._status_after_scan = None
 
         self._build_menus()
         self._build_tabs()
@@ -1013,6 +1390,8 @@ class MainWindow(QMainWindow):
         pull_action.triggered.connect(self.show_pull_window)
         import_action = models_menu.addAction("Import a GGUF file")
         import_action.triggered.connect(self.import_model)
+        remove_action = models_menu.addAction("Remove model")
+        remove_action.triggered.connect(self.remove_selected_model)
         refresh_action = models_menu.addAction("Refresh list")
         refresh_action.triggered.connect(self._refresh_model_list)
         unload_action = models_menu.addAction("Unload model")
@@ -1046,7 +1425,7 @@ class MainWindow(QMainWindow):
         self._cards_scroll.setWidgetResizable(True)
         self._cards_widget = QWidget()
         self._cards_layout = QGridLayout(self._cards_widget)
-        self._cards_layout.setSpacing(12)
+        self._cards_layout.setSpacing(GRID_SPACING)
         self._cards_scroll.setWidget(self._cards_widget)
         layout.addWidget(self._cards_scroll)
 
@@ -1070,14 +1449,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.load_progress)
 
         buttons = QHBoxLayout()
-        self.load_button = QPushButton("Load")
+        self.load_button = PressDipButton("Load")
         self.load_button.clicked.connect(self.load_selected_model)
         self.unload_button = QPushButton("Unload")
         self.unload_button.clicked.connect(self.unload_model)
         self.import_button = QPushButton("Import")
         self.import_button.clicked.connect(self.import_model)
-        self.pull_button = QPushButton("Pull")
+        self.pull_button = PressDipButton("Pull")
         self.pull_button.clicked.connect(self.show_pull_window)
+        self.remove_button = QPushButton("Remove")
+        self.remove_button.clicked.connect(self.remove_selected_model)
         self.load_cancel_button = QPushButton("Cancel load")
         self.load_cancel_button.clicked.connect(self._cancel_load)
         self.load_cancel_button.setVisible(False)
@@ -1085,6 +1466,7 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.unload_button)
         buttons.addWidget(self.import_button)
         buttons.addWidget(self.pull_button)
+        buttons.addWidget(self.remove_button)
         buttons.addWidget(self.load_cancel_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
@@ -1093,6 +1475,10 @@ class MainWindow(QMainWindow):
             "Models live in the folder set in File menu, Settings.")
         folder_label.setWordWrap(True)
         layout.addWidget(folder_label)
+
+        hint_label = QLabel("Double-click a model to load it.")
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
 
         self.tabs.addTab(tab, "Models")
 
@@ -1104,7 +1490,9 @@ class MainWindow(QMainWindow):
         frame.setObjectName("empty_state")
         frame.setStyleSheet(
             "QFrame#empty_state { border: 1px solid #555555; "
-            "border-radius: 12px; background-color: #1c2836; }")
+            "border-radius: 12px; background-color: #1c2836; } "
+            "QFrame#empty_state QLabel { "
+            "background-color: transparent; }")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(8)
@@ -1178,7 +1566,7 @@ class MainWindow(QMainWindow):
         self.chat_input = QLineEdit()
         self.chat_input.setPlaceholderText("Type a message")
         self.chat_input.returnPressed.connect(self.send_message)
-        self.send_button = QPushButton("Send")
+        self.send_button = PressDipButton("Send")
         self.send_button.clicked.connect(self.send_message)
         self.stop_button = QPushButton("Stop")
         self.stop_button.clicked.connect(self._stop_reply)
@@ -1228,11 +1616,13 @@ class MainWindow(QMainWindow):
         self._clear_cards()
         for index in range(3):
             self._cards_layout.addWidget(
-                SkeletonCard(), index // 2, index % 2)
+                SkeletonCard(), index // GRID_COLUMNS,
+                index % GRID_COLUMNS)
+        rows = (3 + GRID_COLUMNS - 1) // GRID_COLUMNS
         self._cards_layout.addItem(
             QSpacerItem(0, 0, QSizePolicy.Policy.Minimum,
                         QSizePolicy.Policy.Expanding),
-            2, 0, 1, 2)
+            rows, 0, 1, GRID_COLUMNS)
 
     def _refresh_model_list(self):
         """Show skeleton tiles, then scan the folder off the UI
@@ -1265,21 +1655,25 @@ class MainWindow(QMainWindow):
                            m["name"].lower()))
         row = 0
         col = 0
+        self._hero_card = None
         for model in ordered:
             status = fit_status(model["size"], free_bytes)
             is_loaded = str(model["path"]) == loaded_path
             card = ModelCard(model, status, loaded=is_loaded,
-                             hero=is_loaded)
+                             hero=is_loaded, free_bytes=free_bytes)
             card.clicked.connect(self._on_card_clicked)
             card.double_clicked.connect(self._on_card_double_clicked)
+            card.remove_requested.connect(self._on_remove_requested)
             if is_loaded:
-                self._cards_layout.addWidget(card, row, 0, 1, 2)
+                self._hero_card = card
+                self._cards_layout.addWidget(
+                    card, row, 0, 1, GRID_COLUMNS)
                 row += 1
                 col = 0
             else:
                 self._cards_layout.addWidget(card, row, col)
                 col += 1
-                if col >= 2:
+                if col >= GRID_COLUMNS:
                     col = 0
                     row += 1
             self.model_cards[str(model["path"])] = card
@@ -1289,9 +1683,24 @@ class MainWindow(QMainWindow):
         self._cards_layout.addItem(
             QSpacerItem(0, 0, QSizePolicy.Policy.Minimum,
                         QSizePolicy.Policy.Expanding),
-            spacer_row, 0, 1, 2)
-        # Nothing selected by default, ever (U6).
-        self._selected_path = None
+            spacer_row, 0, 1, GRID_COLUMNS)
+        # The rebuilt hero tile gets its stats right away, instead
+        # of waiting for the next 2-second refresh.
+        self._refresh_stats()
+        # Keep the selection when the selected model is still there
+        # (U28): a refresh must not make the user find and re-click
+        # their model. A refresh never creates a selection from
+        # nothing (U6), except right after an import or pull, which
+        # select the new model.
+        wanted = self._select_path
+        self._select_path = None
+        if wanted is not None and wanted in self.model_cards:
+            self._select_card(wanted)
+        elif (self._selected_path is not None
+                and self._selected_path in self.model_cards):
+            self._select_card(self._selected_path)
+        else:
+            self._selected_path = None
         if skipped:
             lines = ["%s: %s" % (name, reason)
                      for name, reason in skipped]
@@ -1308,6 +1717,11 @@ class MainWindow(QMainWindow):
         # No models at all: the empty state replaces the grid. It
         # disappears the moment a model appears (the next scan).
         self._set_empty_state(not models)
+        # A pending confirmation (remove/import) goes last, so the
+        # scan's own status update never swallows it.
+        if self._status_after_scan is not None:
+            self.statusBar().showMessage(self._status_after_scan)
+            self._status_after_scan = None
         self._update_buttons()
         if self._scan_dirty:
             self._scan_dirty = False
@@ -1334,6 +1748,7 @@ class MainWindow(QMainWindow):
         loading = self.load_worker is not None
         loaded = self.controller.is_loaded
         self.load_button.setEnabled(has_selection and not loading)
+        self.remove_button.setEnabled(has_selection and not loading)
         self.unload_button.setEnabled(loaded and not loading)
         self.send_button.setEnabled(
             loaded and self.chat_worker is None)
@@ -1378,7 +1793,13 @@ class MainWindow(QMainWindow):
         self._update_buttons()
 
     def _on_load_progress(self, pct, message):
-        self.load_progress.setValue(pct)
+        # pct is -1 when the backend has no percent to give: the
+        # bar goes indeterminate instead of showing a fake number.
+        if pct < 0:
+            self.load_progress.setRange(0, 0)
+        else:
+            self.load_progress.setRange(0, 100)
+            self.load_progress.setValue(pct)
         self.statusBar().showMessage(message)
 
     def _on_load_finished(self, result):
@@ -1451,6 +1872,56 @@ class MainWindow(QMainWindow):
         self.transcript.setPlaceholderText(
             "Load a model first, then chat here.")
 
+    def _on_remove_requested(self, path):
+        self._select_card(path)
+        self.remove_selected_model()
+
+    def remove_selected_model(self):
+        path = self._selected_model_path()
+        if path is None:
+            self.statusBar().showMessage(
+                "Pick a model from the list first.")
+            return
+        self._remove_model(path)
+
+    def _remove_model(self, path):
+        """Delete a model file, after a confirm that defaults to
+        No (U31). A loaded model is unloaded first, never deleted
+        out from under the engine."""
+        path = Path(path)
+        if not path.is_file():
+            self.statusBar().showMessage("That model file is gone.")
+            self._refresh_model_list()
+            return
+        loaded = (self.controller.is_loaded
+                  and self.controller.current_path == path)
+        message = (
+            "Remove %s (%s) from your models folder?\n\n"
+            "This deletes the file. You can pull it again later."
+            % (path.name, format_size(path.stat().st_size)))
+        if loaded:
+            message += ("\n\nIt is loaded right now, so it will be "
+                        "unloaded first.")
+        answer = QMessageBox.question(
+            self, "Remove model", message,
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if loaded:
+            self.unload_model()
+        try:
+            remove_gguf(path)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Remove model", str(exc))
+            self._refresh_model_list()
+            return
+        self.log.action("removed: %s" % path.name)
+        self._selected_path = None
+        self._status_after_scan = "%s removed." % path.name
+        self._refresh_model_list()
+
     def import_model(self):
         path, _selected = QFileDialog.getOpenFileName(
             self, "Pick a GGUF model file", str(Path.home()),
@@ -1463,9 +1934,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Import a GGUF file", str(exc))
             return
         self.log.action("imported: %s" % dest.name)
-        self._refresh_model_list()
-        self.statusBar().showMessage(
+        self._status_after_scan = (
             "%s is now in your models folder." % dest.name)
+        self._select_path = str(dest)
+        self._refresh_model_list()
 
     # ------------------------------------------------------------ chat
 
@@ -1481,7 +1953,10 @@ class MainWindow(QMainWindow):
             return
         self.chat_input.clear()
         self.transcript.append("You: %s" % text)
-        self.transcript.append("Model: ")
+        # The reply carries the model name that wrote it (captured
+        # now, so a model switch mid-session never mislabels it).
+        name = self.controller.current_name or "Model"
+        self.transcript.append("%s: " % name)
         self._reply_in_progress = True
         self.log.action("chat sent (%d chars)" % len(text))
         self._set_busy(True)
@@ -1500,6 +1975,14 @@ class MainWindow(QMainWindow):
         self.transcript.setTextCursor(cursor)
         self.transcript.ensureCursorVisible()
 
+    def _end_turn(self, note=None):
+        """Close a chat turn: an optional note, a divider line, and
+        a blank line, so turns never run together (L11)."""
+        if note:
+            self.transcript.append("\n" + note)
+        self.transcript.append(TURN_DIVIDER)
+        self.transcript.append("")
+
     def _on_chat_finished(self, stats):
         self._drop_chat_worker()
         self._reply_in_progress = False
@@ -1507,10 +1990,10 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self._update_buttons()
         if stats.get("stopped"):
-            self.transcript.append("\n(Reply stopped.)")
+            self._end_turn("(Reply stopped.)")
             self.statusBar().showMessage("Reply stopped.")
             return
-        self.transcript.append("")
+        self._end_turn()
         self._last_stats = stats
         self._refresh_stats()
         self.statusBar().showMessage("Reply done.")
@@ -1521,7 +2004,7 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         self.stop_button.setEnabled(False)
         self._update_buttons()
-        self.transcript.append("\n(%s)" % message)
+        self._end_turn("(%s)" % message)
         self.statusBar().showMessage(message)
         self.log.error("chat failed: %s", message)
 
@@ -1541,16 +2024,25 @@ class MainWindow(QMainWindow):
             parts.append("RAM: unknown")
         if self.controller.is_loaded:
             parts.append("Loaded: %s" % self.controller.current_name)
+            loaded_parts = []
             if self.load_time_s is not None:
-                parts.append("Load time: %.1f s" % self.load_time_s)
+                loaded_parts.append("Load time: %.1f s"
+                                    % self.load_time_s)
             stats = getattr(self, "_last_stats", None)
             if stats:
-                parts.append("Speed: %.1f tokens per second"
-                             % stats.get("tokens_per_sec", 0.0))
-                parts.append("First token: %.2f s"
-                             % stats.get("ttft_s", 0.0))
-                parts.append("Reply: %d tokens"
-                             % stats.get("tokens", 0))
+                loaded_parts.append(
+                    "Speed: %.1f tokens per second"
+                    % stats.get("tokens_per_sec", 0.0))
+                loaded_parts.append("First token: %.2f s"
+                                    % stats.get("ttft_s", 0.0))
+                loaded_parts.append("Reply: %d tokens"
+                                    % stats.get("tokens", 0))
+            parts.extend(loaded_parts)
+            # The hero tile shows the same live stats as the Chat
+            # tab, so the loaded model's numbers are visible
+            # without switching tabs.
+            if self._hero_card is not None:
+                self._hero_card.set_stats("  |  ".join(loaded_parts))
         else:
             parts.append("No model loaded.")
         self.stats_label.setText("  |  ".join(parts))
@@ -1578,6 +2070,7 @@ class MainWindow(QMainWindow):
 
     def _on_model_pulled(self, path):
         self._pulse_path = str(path)
+        self._select_path = str(path)
         self._refresh_model_list()
 
     def show_settings(self):
@@ -1638,27 +2131,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ geometry
 
     def _restore_geometry(self):
-        settings = get_settings()
-        values = [settings.value("window/%s" % key, type=int)
-                  for key in ("x", "y", "width", "height")]
-        if any(value is None for value in values):
-            return
-        rect = QRect(*values)
-        screens = QGuiApplication.screens()
-        if screens and not any(
-                screen.availableGeometry().intersects(rect)
-                for screen in screens):
-            return
-        self.setGeometry(rect)
+        restore_window_geometry(get_settings(), "window", self)
 
     def closeEvent(self, event):  # noqa: N802 - Qt naming
-        settings = get_settings()
-        rect = self.geometry()
-        settings.setValue("window/x", rect.x())
-        settings.setValue("window/y", rect.y())
-        settings.setValue("window/width", rect.width())
-        settings.setValue("window/height", rect.height())
-        settings.sync()
+        save_window_geometry(get_settings(), "window", self)
         if self._scan_worker is not None:
             self._scan_worker.wait(5000)
         if self.load_worker is not None:

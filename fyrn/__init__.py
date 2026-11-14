@@ -5,5 +5,5 @@ thing: it does not use the Ollama program and does not speak the
 Ollama API.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __app_name__ = "Fyrn"
