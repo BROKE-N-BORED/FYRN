@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Fyrn icon: a flame in the dark. The ember is the brand. -->
+  <rect x="8" y="8" width="240" height="240" rx="48" fill="#14202e"/>
+  <circle cx="128" cy="136" r="78" fill="#e8890c" fill-opacity="0.35"/>
+  <path d="M128,64 C146,94 166,112 166,142 A38,38 0 1,1 90,142 C90,112 110,94 128,64 Z" fill="#f7b731"/>
+  <path d="M128,108 C138,126 148,136 148,152 A20,20 0 1,1 108,152 C108,136 118,126 128,108 Z" fill="#ffd166"/>
+  <path d="M192,52 L196,62 L206,66 L196,70 L192,80 L188,70 L178,66 L188,62 Z" fill="#ffd166"/>
+</svg>

@@ -1,0 +1,21 @@
+# Build + runtime
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.zip
+.forge/
+logs/
+.gui-smoke-error.txt
+
+# Secrets — never committed (immutable rule)
+.env
+.env.*
+*.env
+local_config.py
+config.local.*
+providers.json
+*.key
+*.pem
+*secret*
+*credentials*

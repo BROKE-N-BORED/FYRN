@@ -1,0 +1,9 @@
+# llama-cpp-python ships NO wheels on PyPI: a plain `pip install` builds
+# llama.cpp from source, which needs a C compiler, cmake, and a long
+# compile on a 2-core PC. The project publishes a pre-built CPU wheel on
+# its own index instead, and --only-binary stops pip ever falling back
+# to a source build if that index ever lags behind PyPI by a version.
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+--only-binary=llama-cpp-python
+PySide6-Essentials
+llama-cpp-python
