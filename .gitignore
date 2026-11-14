@@ -8,6 +8,11 @@ __pycache__/
 logs/
 .gui-smoke-error.txt
 
+# Rendered from assets/fyrn.svg by render_icons.py
+assets/fyrn-48.png
+assets/fyrn-256.png
+assets/fyrn.png
+
 # Secrets — never committed (immutable rule)
 .env
 .env.*

@@ -161,8 +161,19 @@ class ProjectFileTests(unittest.TestCase):
         self.assertIn("#f2c14e", gui)  # ember accent
 
     def test_icon_files_exist(self):
-        for name in ("fyrn.svg", "fyrn-48.png",
-                     "fyrn-256.png", "fyrn.png"):
+        # A fresh clone holds only the SVG (the push path cannot
+        # carry binary PNGs), so render them first when absent.
+        # Render in a SEPARATE process: rendering inside the test
+        # process crashed the suite in another project.
+        pngs = ("fyrn-48.png", "fyrn-256.png", "fyrn.png")
+        if any(not (ROOT / "assets" / name).is_file()
+               for name in pngs):
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "render_icons.py")],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(result.returncode, 0,
+                             result.stdout + result.stderr)
+        for name in ("fyrn.svg",) + pngs:
             path = ROOT / "assets" / name
             self.assertTrue(path.is_file(), name)
             self.assertGreater(path.stat().st_size, 100, name)
