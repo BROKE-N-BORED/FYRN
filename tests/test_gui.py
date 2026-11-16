@@ -2,9 +2,11 @@
 fake .gguf files. No real model, no network (pulls use a local
 fake HTTP server)."""
 
+import json
 import os
 import re
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,17 +20,19 @@ from PySide6.QtWidgets import (QApplication, QLabel, QLineEdit,
 
 from helpers import ModalWatcher, file_bytes, make_fake_gguf
 from helpers import start_range_server, write_gguf_file
-from fyrn.core import HEADROOM_BYTES, fit_status, read_ram_bytes
+from fyrn.core import (HEADROOM_BYTES, ImportCancelled, fit_status,
+                       read_ram_bytes)
 from fyrn.gui import (DARK_STYLESHEET, FIRST_PULL_SUGGESTION,
                             FIT_BADGES, HOW_TO_USE_SECTIONS, ChatInput,
                             HowToUseWindow, MainWindow, ModelCard,
                             PressDipButton, PullWindow, PullWorker,
                             SettingsWindow, SingleInstance, SkeletonCard,
                             TURN_DIVIDER, get_models_folder,
-                            get_reduce_motion, reduced_motion,
-                            set_models_folder, set_reduce_motion)
+                            get_reduce_motion, get_show_ollama_models,
+                            reduced_motion, set_models_folder,
+                            set_reduce_motion, set_show_ollama_models)
 from fyrn.pull import parse_model_input
-from fyrn.runner import FakeRunner
+from fyrn.runner import FakeRunner, RunnerError
 
 GB = 1024 ** 3
 PAYLOAD = bytes(range(256)) * 256  # 64 KiB deterministic bytes
@@ -116,6 +120,10 @@ class GuiTestCase(unittest.TestCase):
         os.environ["FYRN_HOME"] = str(self.home)
         os.environ["FYRN_SETTINGS_FILE"] = str(self.settings_file)
         set_models_folder(self.models)
+        # Discovery is off by default in tests: the sandbox has a
+        # real Ollama store, and its models would appear in every
+        # test window. The discovery tests turn it on explicitly.
+        set_show_ollama_models(False)
         self.watcher = ModalWatcher()
         self.windows = []
         self.servers = []
@@ -171,6 +179,12 @@ class GuiTestCase(unittest.TestCase):
         ok = pump_until(lambda: window.chat_worker is None, 5000)
         QTest.qWait(50)
         self.assertTrue(ok, "chat reply did not finish")
+        return ok
+
+    def wait_import(self, window):
+        ok = pump_until(lambda: window.import_worker is None, 5000)
+        QTest.qWait(50)
+        self.assertTrue(ok, "import did not finish")
         return ok
 
     def _answer_yes(self):
@@ -502,6 +516,7 @@ class MainWindowTests(GuiTestCase):
                 "fyrn.gui.QFileDialog.getOpenFileName",
                 return_value=(str(elsewhere), "")):
             window.import_button.click()
+        self.wait_import(window)
         self.wait_scan(window)
         self.assertIn(str(self.models / "elsewhere.gguf"),
                       window.model_cards)
@@ -571,6 +586,7 @@ class MainWindowTests(GuiTestCase):
                 "fyrn.gui.QFileDialog.getOpenFileName",
                 return_value=(str(elsewhere), "")):
             window.import_button.click()
+        self.wait_import(window)
         self.wait_scan(window)
         self.assertIn("is now in your models folder.",
                       window.statusBar().currentMessage())
@@ -719,10 +735,16 @@ class StatusTimeoutTests(GuiTestCase):
         window._show_status("Reply done.", timeout_ms=50)
         self.assertEqual(window.statusBar().currentMessage(),
                          "Reply done.")
-        QTest.qWait(200)
-        self.assertEqual(window.statusBar().currentMessage(),
-                         "Pick a model and press Load, or pull one "
-                         "from the Models menu.")
+        default = ("Pick a model and press Load, or pull one "
+                   "from the Models menu.")
+        # A fixed wait after a 50 ms timeout is a race under load:
+        # the event loop may not have run the timeout yet. Poll
+        # until the default line is back instead.
+        back = pump_until(
+            lambda: window.statusBar().currentMessage() == default,
+            2000)
+        self.assertTrue(back, "status never fell back to the default")
+        self.assertEqual(window.statusBar().currentMessage(), default)
 
     def test_persistent_message_is_not_clobbered(self):
         make_fake_gguf(self.models / "alpha.gguf", 2048)
@@ -783,6 +805,7 @@ class SelectionTests(GuiTestCase):
                 "fyrn.gui.QFileDialog.getOpenFileName",
                 return_value=(str(elsewhere), "")):
             window.import_button.click()
+        self.wait_import(window)
         self.wait_scan(window)
         self.assertEqual(
             window._selected_path,
@@ -920,6 +943,12 @@ class HoverDetailTests(GuiTestCase):
 
 class MicroInteractionTests(GuiTestCase):
     def test_press_dip_shrinks_and_restores(self):
+        # The dip is a 75 ms animation, and a fixed wait after the
+        # press is a race under load: the animation may not have
+        # run yet when the assertion fires. Poll until the geometry
+        # settles instead: while the button is held, the dipped
+        # size is the settled state, and after release the rest
+        # size is. No assertion reads a transient.
         host = QWidget()
         self.windows.append(host)
         button = PressDipButton("Test", host)
@@ -930,15 +959,22 @@ class MicroInteractionTests(GuiTestCase):
         QTest.mousePress(button, Qt.MouseButton.LeftButton,
                          Qt.KeyboardModifier.NoModifier,
                          button.rect().center())
-        QTest.qWait(120)  # past the 75 ms down animation
-        dipped = button.geometry()
-        self.assertLess(dipped.width(), rest.width())
-        self.assertLess(dipped.height(), rest.height())
+        dipped = None
+        for _ in range(40):  # up to 2 s for the dip to settle
+            current = QRect(button.geometry())
+            if (current.width() < rest.width()
+                    and current.height() < rest.height()):
+                dipped = current
+                break
+            QTest.qWait(50)
+        self.assertIsNotNone(dipped, "button never dipped")
         self.assertEqual(dipped.center(), rest.center())
         QTest.mouseRelease(button, Qt.MouseButton.LeftButton,
                            Qt.KeyboardModifier.NoModifier,
                            button.rect().center())
-        QTest.qWait(150)  # past the 75 ms return animation
+        restored = pump_until(
+            lambda: button.geometry() == rest, 2000)
+        self.assertTrue(restored, "button never came back to rest")
         self.assertEqual(button.geometry(), rest)
 
     def test_press_dip_skipped_under_reduced_motion(self):
@@ -989,13 +1025,21 @@ class MicroInteractionTests(GuiTestCase):
         return window, alpha, beta
 
     def test_card_hover_lift_and_drop(self):
+        # The lift is a 200 ms animation, and a fixed wait after
+        # the hover is a race under load: the animation may not
+        # have finished when the assertion fires. Poll until the
+        # geometry settles instead. No assertion reads a transient.
         window, alpha, beta = self._two_cards()
         rest_y = alpha.geometry().y()
         QTest.mouseMove(alpha, alpha.rect().center())
-        QTest.qWait(300)  # past the 200 ms lift
+        lifted = pump_until(
+            lambda: alpha.geometry().y() == rest_y - 4, 2000)
+        self.assertTrue(lifted, "card never lifted on hover")
         self.assertEqual(alpha.geometry().y(), rest_y - 4)
         QTest.mouseMove(beta, beta.rect().center())
-        QTest.qWait(300)  # past the 200 ms drop
+        dropped = pump_until(
+            lambda: alpha.geometry().y() == rest_y, 2000)
+        self.assertTrue(dropped, "card never dropped after hover")
         self.assertEqual(alpha.geometry().y(), rest_y)
 
     def test_card_lift_does_not_bob_in_bottom_strip(self):
@@ -1006,7 +1050,9 @@ class MicroInteractionTests(GuiTestCase):
         rest_y = alpha.geometry().y()
         strip = QPoint(alpha.width() // 2, alpha.height() - 2)
         QTest.mouseMove(alpha, strip)
-        QTest.qWait(300)
+        lifted = pump_until(
+            lambda: alpha.geometry().y() == rest_y - 4, 2000)
+        self.assertTrue(lifted, "card never lifted on hover")
         first = alpha.geometry().y()
         self.assertEqual(first, rest_y - 4)
         QTest.qWait(300)
@@ -1015,7 +1061,9 @@ class MicroInteractionTests(GuiTestCase):
         # Moving truly away drops it (the hover timer catches the
         # exit, since no leave event fires from the strip).
         QTest.mouseMove(window, QPoint(550, 400))
-        QTest.qWait(500)
+        dropped = pump_until(
+            lambda: alpha.geometry().y() == rest_y, 2000)
+        self.assertTrue(dropped, "card never dropped after hover")
         self.assertEqual(alpha.geometry().y(), rest_y)
 
     def test_card_lift_skipped_under_reduced_motion(self):
@@ -1621,7 +1669,7 @@ class WindowHeightTests(GuiTestCase):
         bottom = settings.save_button.geometry().bottom()
         self.assertLess(settings.height() - bottom, 30)
         helps = [label for label in settings.findChildren(QLabel)
-                 if label.text().startswith("Less movement")]
+                 if label.text().startswith("Fyrn also lists")]
         self.assertEqual(len(helps), 1)
         gap = (settings.save_button.geometry().top()
                - helps[0].geometry().bottom())
@@ -1790,6 +1838,442 @@ class SingleInstanceTests(GuiTestCase):
     def test_notify_without_server_fails(self):
         lone = SingleInstance(self.home)
         self.assertFalse(lone.notify_running())
+
+
+class TopAlignTests(GuiTestCase):
+    def test_mixed_height_cards_share_a_row_top(self):
+        # One card has a description (taller), two do not: the
+        # grid used to center them, so the tall card sat 15 px
+        # above its neighbours and the row looked ragged.
+        write_gguf_file(
+            self.models / "alpha.gguf",
+            {"general.description": "A small test model."})
+        make_fake_gguf(self.models / "beta.gguf", 2048)
+        make_fake_gguf(self.models / "gamma.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        cards = list(window.model_cards.values())
+        self.assertEqual(len(cards), 3)
+        # Park the cursor in empty space first: the mouse position
+        # is global, and a cursor left over a card by the previous
+        # test would lift that card 4 px and skew the measurement.
+        QTest.mouseMove(window, QPoint(550, 400))
+        QTest.qWait(300)  # past the 200 ms drop
+        # Wait for the layout to settle (scroll-area sizing
+        # drifts a few pixels at first).
+        stable = 0
+        last = None
+        for _ in range(40):
+            ys = tuple(card.geometry().y() for card in cards)
+            if ys == last:
+                stable += 1
+                if stable >= 3:
+                    break
+            else:
+                stable = 0
+                last = ys
+            QTest.qWait(50)
+        ys = {card.geometry().y() for card in cards}
+        self.assertEqual(len(ys), 1,
+                         "cards in one row sit at different "
+                         "heights: %s" % sorted(ys))
+
+
+class FailingRunner(FakeRunner):
+    """Loads once, then fails every load after that."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail_next = False
+
+    def load(self, path, progress_cb=None, cancel_event=None):
+        if self.fail_next:
+            raise RunnerError(
+                "The model could not be loaded (fake bad file).")
+        return super().load(path, progress_cb, cancel_event)
+
+
+class FailedLoadTests(GuiTestCase):
+    def test_failed_load_resets_to_nothing_loaded(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        make_fake_gguf(self.models / "beta.gguf", 2048)
+        runner = FailingRunner()
+        window = self.make_window(runner=runner)
+        self.load_first_model(window)
+        self.wait_scan(window)  # the hero tile is built by the scan
+        self.assertIsNotNone(window._hero_card)
+        runner.fail_next = True
+        beta = str(self.models / "beta.gguf")
+        window.model_cards[beta].clicked.emit(beta)
+        window.load_button.click()
+        self.wait_load(window)
+        self.wait_scan(window)
+        self.assertFalse(window.controller.is_loaded)
+        self.assertIsNone(window._hero_card)
+        self.assertEqual(window.transcript.placeholderText(),
+                         "Load a model first, then chat here.")
+        loaded_labels = [label for label in
+                         window.findChildren(QLabel)
+                         if label.text() == "Loaded"]
+        self.assertEqual(loaded_labels, [])
+        self.assertTrue(
+            any(title == "Load model"
+                for title, _text in self.watcher.seen),
+            "no failure modal appeared")
+
+
+class ReplyButtonTests(GuiTestCase):
+    def test_load_unload_remove_disabled_during_a_reply(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        make_fake_gguf(self.models / "beta.gguf", 2048)
+        runner = FakeRunner(
+            reply_text="one two three four five six seven eight",
+            token_delay_s=0.3)
+        window = self.make_window(runner=runner)
+        self.load_first_model(window)
+        beta = str(self.models / "beta.gguf")
+        window.model_cards[beta].clicked.emit(beta)
+        window.chat_input.setText("go")
+        window.send_button.click()
+        pump_until(lambda: window.chat_worker is not None, 5000)
+        self.assertFalse(window.load_button.isEnabled())
+        self.assertFalse(window.unload_button.isEnabled())
+        self.assertFalse(window.remove_button.isEnabled())
+        self.wait_chat(window)
+        self.assertTrue(window.load_button.isEnabled())
+        self.assertTrue(window.unload_button.isEnabled())
+        self.assertTrue(window.remove_button.isEnabled())
+
+
+class LoadOfferedTests(GuiTestCase):
+    def test_load_not_offered_for_the_loaded_model(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        make_fake_gguf(self.models / "beta.gguf", 2048)
+        window = self.make_window()
+        self.load_first_model(window)
+        # Alpha is loaded and selected: Load is not offered.
+        self.assertFalse(window.load_button.isEnabled())
+        beta = str(self.models / "beta.gguf")
+        window.model_cards[beta].clicked.emit(beta)
+        self.assertTrue(window.load_button.isEnabled())
+
+
+class HistoryTests(GuiTestCase):
+    def test_second_message_carries_the_first_turn(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        runner = FakeRunner(reply_text="ok")
+        window = self.make_window(runner=runner)
+        self.load_first_model(window)
+        window.chat_input.setText("first")
+        window.send_button.click()
+        self.wait_chat(window)
+        window.chat_input.setText("second")
+        window.send_button.click()
+        self.wait_chat(window)
+        self.assertEqual(runner.last_history, [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "ok"}])
+
+    def test_clear_empties_history_and_stats(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        runner = FakeRunner(reply_text="ok")
+        window = self.make_window(runner=runner)
+        self.load_first_model(window)
+        window.chat_input.setText("hi there")
+        window.send_button.click()
+        self.wait_chat(window)
+        self.assertIn("Reply: 1 tokens",
+                      window.stats_label.text())
+        self.assertEqual(len(window._chat_history), 2)
+        window.clear_button.click()
+        QTest.qWait(50)
+        self.assertEqual(window.transcript.toPlainText(), "")
+        self.assertNotIn("Reply:", window.stats_label.text())
+        self.assertEqual(window._chat_history, [])
+        # The next message starts fresh: no history reaches the
+        # model for a conversation that no longer exists.
+        window.chat_input.setText("after")
+        window.send_button.click()
+        self.wait_chat(window)
+        self.assertEqual(runner.last_history, [])
+
+
+def make_ollama_store(root, name, tag, digest, description=""):
+    """A minimal fake Ollama store with one model."""
+    root = Path(root)
+    manifest = (root / "manifests" / "registry.ollama.ai"
+                / "library" / name / tag)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({
+        "layers": [
+            {"mediaType": "application/vnd.ollama.image.model",
+             "digest": "sha256:" + digest, "size": 2048}]}),
+        encoding="utf-8")
+    blob = root / "blobs" / ("sha256-" + digest)
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    write_gguf_file(blob, {"general.description": description}
+                    if description else {})
+    return root
+
+
+class OllamaDiscoveryTests(GuiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._old_ollama = os.environ.get("OLLAMA_MODELS")
+        self.store = make_ollama_store(
+            self.base / "ollama-store", "tiny", "1b", "ab" * 32,
+            "Tiny test.")
+        os.environ["OLLAMA_MODELS"] = str(self.store)
+        set_show_ollama_models(True)
+
+    def tearDown(self):
+        if self._old_ollama is None:
+            os.environ.pop("OLLAMA_MODELS", None)
+        else:
+            os.environ["OLLAMA_MODELS"] = self._old_ollama
+        super().tearDown()
+
+    def _ollama_cards(self, window):
+        return [card for card in window.model_cards.values()
+                if card.source == "ollama"]
+
+    def test_ollama_model_appears_with_its_name(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        tiny = [card for card in self._ollama_cards(window)
+                if card.model_name == "tiny:1b"]
+        self.assertEqual(len(tiny), 1)
+        tag = tiny[0].findChild(QLabel, "ollama_tag")
+        self.assertIsNotNone(tag)
+        self.assertEqual(tag.text(), "Ollama")
+        self.assertIn("From Ollama", tiny[0].toolTip())
+
+    def test_ollama_model_loads_under_its_own_name(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        tiny = [card for card in self._ollama_cards(window)
+                if card.model_name == "tiny:1b"][0]
+        window.controller._free_ram_fn = lambda: 8 * GB
+        window._on_card_clicked(tiny.path)
+        window.load_button.click()
+        self.wait_load(window)
+        self.assertTrue(window.controller.is_loaded)
+        # The chat attribution shows the model name, not the
+        # blob's sha256 file name.
+        self.assertEqual(window.controller.current_name, "tiny:1b")
+
+    def test_remove_disabled_for_ollama_models(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        tiny = [card for card in self._ollama_cards(window)
+                if card.model_name == "tiny:1b"][0]
+        window._on_card_clicked(tiny.path)
+        self.assertFalse(window.remove_button.isEnabled())
+
+    def test_toggle_off_hides_ollama_models(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        self.assertTrue(self._ollama_cards(window))
+        set_show_ollama_models(False)
+        window._refresh_model_list()
+        self.wait_scan(window)
+        self.assertEqual(self._ollama_cards(window), [])
+
+
+class ImportWorkerTests(GuiTestCase):
+    def _slow_import(self, source, folder, progress_cb=None,
+                     cancel_event=None):
+        """A stand-in copy that takes ~0.5 s and honours cancel."""
+        total = 10
+        for step in range(1, total + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ImportCancelled("Import stopped.")
+            time.sleep(0.05)
+            if progress_cb is not None:
+                progress_cb(step, total)
+        dest = Path(folder) / Path(source).name
+        dest.write_bytes(b"x")
+        return dest
+
+    def test_import_shows_progress_then_finishes(self):
+        elsewhere = self.base / "elsewhere.gguf"
+        make_fake_gguf(elsewhere, 1024)
+        window = self.make_window()
+        self.wait_scan(window)
+        with mock.patch("fyrn.gui.QFileDialog.getOpenFileName",
+                        return_value=(str(elsewhere), "")), \
+                mock.patch("fyrn.gui.core.import_gguf",
+                           side_effect=self._slow_import):
+            window.import_button.click()
+            moved = pump_until(
+                lambda: window.load_progress.isVisible()
+                and window.load_progress.value() > 0, 5000)
+            self.assertTrue(moved, "no import progress shown")
+            self.wait_import(window)
+        self.wait_scan(window)
+        self.assertTrue((self.models / "elsewhere.gguf").is_file())
+
+    def test_import_cancel_stops_and_leaves_nothing(self):
+        elsewhere = self.base / "elsewhere.gguf"
+        make_fake_gguf(elsewhere, 1024)
+        window = self.make_window()
+        self.wait_scan(window)
+        with mock.patch("fyrn.gui.QFileDialog.getOpenFileName",
+                        return_value=(str(elsewhere), "")), \
+                mock.patch("fyrn.gui.core.import_gguf",
+                           side_effect=self._slow_import):
+            window.import_button.click()
+            pump_until(lambda: window.import_worker is not None,
+                       5000)
+            self.assertTrue(
+                window.import_cancel_button.isVisible())
+            window.import_cancel_button.click()
+            self.wait_import(window)
+        self.assertIn("Import stopped",
+                      window.statusBar().currentMessage())
+        self.assertFalse((self.models / "elsewhere.gguf").exists())
+        self.assertFalse(
+            (self.models / "elsewhere.gguf.part").exists())
+
+
+class BlockingRunner(FakeRunner):
+    """A load that blocks 8 s without checking cancel, like the
+    real backend's constructor: longer than the 5 s close wait."""
+
+    def load(self, path, progress_cb=None, cancel_event=None):
+        time.sleep(8)
+        return super().load(path, progress_cb, cancel_event)
+
+
+class CloseDuringLoadTests(GuiTestCase):
+    def test_close_during_a_load_waits_then_closes_cleanly(self):
+        make_fake_gguf(self.models / "slow.gguf", 4096)
+        window = self.make_window(runner=BlockingRunner())
+        self.wait_scan(window)
+        window.controller._free_ram_fn = lambda: 8 * GB
+        path = sorted(window.model_cards)[0]
+        window.model_cards[path].clicked.emit(path)
+        window.load_button.click()
+        QTimer.singleShot(1000, window.close)
+        pending = pump_until(lambda: window._close_pending, 10000)
+        self.assertTrue(pending,
+                        "close was not deferred while loading")
+        self.assertTrue(window.isVisible())
+        closed = pump_until(lambda: not window.isVisible(), 10000)
+        self.assertTrue(closed,
+                        "window did not close after the load")
+        # The test process surviving this is the proof: the old
+        # code aborted the process (SIGABRT) here.
+
+
+class SlowUncancellableRunner(FakeRunner):
+    """A slow load that cannot be stopped, like the real backend."""
+
+    cancellable_load = False
+
+
+class NonCancellableLoadTests(GuiTestCase):
+    def test_cancel_button_disabled_and_status_says_so(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        runner = SlowUncancellableRunner(load_delay_s=2.0)
+        window = self.make_window(runner=runner)
+        self.wait_scan(window)
+        window.controller._free_ram_fn = lambda: 8 * GB
+        path = sorted(window.model_cards)[0]
+        window.model_cards[path].clicked.emit(path)
+        window.load_button.click()
+        pump_until(lambda: window.load_worker is not None, 5000)
+        QTest.qWait(300)
+        self.assertTrue(window.load_cancel_button.isVisible())
+        self.assertFalse(window.load_cancel_button.isEnabled())
+        self.assertIn("cannot be stopped",
+                      window.statusBar().currentMessage())
+        self.wait_load(window)
+
+
+class PartListTests(GuiTestCase):
+    def test_part_list_shows_resume_and_delete(self):
+        server, url = start_range_server(PAYLOAD)
+        self.servers.append(server)
+        part = self.models / "model.gguf.part"
+        part.write_bytes(PAYLOAD[:len(PAYLOAD) // 2])
+        (self.models / "model.gguf.part.url").write_text(url)
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        QTest.qWait(200)
+        self.assertTrue(pull.parts_list.isVisible())
+        self.assertEqual(pull.parts_list.count(), 1)
+        pull.parts_list.setCurrentRow(0)
+        pull.part_resume_button.click()
+        done = pump_until(lambda: pull.worker is None, 5000)
+        self.assertTrue(done, "resumed pull did not finish")
+        self.assertTrue((self.models / "model.gguf").is_file())
+        self.assertEqual(file_bytes(self.models / "model.gguf"),
+                         PAYLOAD)
+        self.assertEqual(pull.parts_list.count(), 0)
+
+    def test_delete_clears_part_and_sidecars(self):
+        part = self.models / "model.gguf.part"
+        part.write_bytes(b"x" * 100)
+        (self.models / "model.gguf.part.url").write_text(
+            "http://example.com/m.gguf")
+        (self.models / "model.gguf.part.etag").write_text("v1")
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        QTest.qWait(200)
+        self.assertEqual(pull.parts_list.count(), 1)
+        pull.parts_list.setCurrentRow(0)
+        pull.part_delete_button.click()
+        QTest.qWait(100)
+        self.assertFalse(part.exists())
+        self.assertFalse(
+            (self.models / "model.gguf.part.url").exists())
+        self.assertFalse(
+            (self.models / "model.gguf.part.etag").exists())
+        self.assertFalse(pull.parts_list.isVisible())
+
+    def test_resume_without_saved_url_says_so(self):
+        part = self.models / "model.gguf.part"
+        part.write_bytes(b"x" * 100)
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        QTest.qWait(200)
+        pull.parts_list.setCurrentRow(0)
+        pull.part_resume_button.click()
+        QTest.qWait(100)
+        self.assertIn("cannot be resumed",
+                      pull.status_label.text())
+        self.assertIsNone(pull.worker)
+
+    def test_no_parts_means_no_section(self):
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        QTest.qWait(200)
+        self.assertFalse(pull.parts_list.isVisible())
+
+
+class KvCacheGuiTests(GuiTestCase):
+    def test_card_tooltip_uses_real_headroom(self):
+        write_gguf_file(
+            self.models / "a.gguf",
+            {"general.architecture": "llama"},
+            numbers={"llama.block_count": 1,
+                     "llama.attention.head_count": 1,
+                     "llama.attention.head_count_kv": 1,
+                     "llama.attention.key_length": 8,
+                     "llama.attention.value_length": 8})
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "a.gguf")]
+        tip = card.toolTip()
+        # Real headroom is ~64 MB (a tiny KV cache plus working
+        # memory), not the 512 MB fixed fallback.
+        self.assertIn("Needs 64", tip)
+        self.assertNotIn("512 MB", tip)
 
 
 if __name__ == "__main__":

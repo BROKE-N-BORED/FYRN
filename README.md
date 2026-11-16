@@ -11,8 +11,8 @@ checks before it loads: every model shows whether it fits this PC,
 and a model that clearly will not fit is refused with a plain
 message instead of crashing the machine.
 
-The name and version live in one place,
-`fyrn/__init__.py` — nothing else in the code hardcodes them.
+The version lives in one place,
+`fyrn/__init__.py` — nothing else in the code hardcodes it.
 
 ## Install (no terminal needed)
 
@@ -32,7 +32,10 @@ stops — it never runs apt itself.
 
 - **Models tab:** every `.gguf` file in your models folder, with its
   size and a fit badge (Fits, Tight, Too big). A model with a
-  description in its file shows it on its tile. Click a model to
+  description in its file shows it on its tile. Fyrn also lists
+  the models Ollama already downloaded on this PC, so you do not
+  have to pull them again; those stay where Ollama put them, and
+  Fyrn can load them but not remove them. Click a model to
   pick it, press Load (or double-click a model to load it straight
   away). Only one model runs at a time; loading a second one
   unloads the first. Press Unload when you are done to give the
@@ -42,17 +45,24 @@ stops — it never runs apt itself.
   link to a `.gguf` file. Not sure what to get first? The Pull
   window suggests a small first model. Pulls show progress, MB
   downloaded, and speed, and they resume after a failure or a
-  cancel instead of starting over.
+  cancel instead of starting over. Unfinished downloads are listed
+  at the bottom of the Pull window: Resume picks one up, Delete
+  clears it away. A finished pull is checked against the checksum
+  Hugging Face publishes.
 - **Import a GGUF file** (Models menu): bring in a `.gguf` file from
   anywhere on the disk, such as a fine-tuned model you made
-  elsewhere. It copies the file into your models folder.
+  elsewhere. It copies the file into your models folder, with
+  progress and a cancel while it runs.
 - **Settings** (File menu): the models folder — pick any folder you
-  like — and a Reduce motion switch. Everything else (threads,
+  like — a Reduce motion switch, and whether Ollama's already-
+  downloaded models are listed. Everything else (threads,
   context size) is set by the program itself to fit this PC.
 - **Chat tab:** load a model, type a message (Enter sends, Shift+Enter
-  starts a new line), press Send. The reply streams in. Clear
-  empties the transcript. Live numbers show RAM used and free,
-  speed in tokens per second, time to first token, and load time.
+  starts a new line), press Send. The reply streams in, and the
+  model remembers the conversation: each message carries the
+  earlier turns with it. Clear empties the transcript. Live numbers
+  show RAM used and free, speed in tokens per second, time to first
+  token, and load time.
 - **Tray icon:** when your desktop has a system tray, Fyrn shows
   the loaded model and free RAM there; click it to bring Fyrn
   forward.

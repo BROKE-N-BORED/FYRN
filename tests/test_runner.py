@@ -11,10 +11,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from fyrn.runner import (FakeRunner, GenerationCancelled,
-                               LoadCancelled, LlamaRunner, RunnerError,
+from fyrn.runner import (MAX_GENERATION_TOKENS, FakeRunner,
+                               GenerationCancelled, LoadCancelled,
+                               LlamaRunner, RunnerError,
                                auto_context_tokens, auto_threads,
-                               compute_tokens_per_sec)
+                               compute_tokens_per_sec, trim_history)
 
 GB = 1024 ** 3
 
@@ -174,6 +175,122 @@ class LlamaRunnerTests(unittest.TestCase):
             self.assertIn("small.gguf", seen[0][1])
             self.assertIn("2 KB", seen[0][1])
             self.assertEqual(seen[-1], (100, "Loaded"))
+
+
+class TrimHistoryTests(unittest.TestCase):
+    def _turns(self, count, size=10):
+        turns = []
+        for index in range(count):
+            turns.append({"role": "user",
+                          "content": "u%d" % index + "x" * size})
+            turns.append({"role": "assistant",
+                          "content": "a%d" % index + "y" * size})
+        return turns
+
+    def test_under_budget_is_unchanged(self):
+        history = self._turns(2)
+        self.assertEqual(trim_history(history, 1000), history)
+
+    def test_over_budget_drops_oldest_first(self):
+        history = self._turns(3, size=100)
+        trimmed = trim_history(history, 250)
+        # The newest exchange survives; the oldest goes first.
+        self.assertEqual(trimmed[-1]["content"][:2], "a2")
+        self.assertNotIn(history[0], trimmed)
+
+    def test_newest_exchange_always_kept(self):
+        history = self._turns(1, size=500)
+        self.assertEqual(trim_history(history, 10), history)
+
+    def test_empty_stays_empty(self):
+        self.assertEqual(trim_history([]), [])
+
+
+class HistoryFlowTests(unittest.TestCase):
+    def test_fake_runner_receives_history(self):
+        runner = FakeRunner(reply_text="ok")
+        runner.load("/tmp/fake.gguf")
+        history = [{"role": "user", "content": "first"},
+                   {"role": "assistant", "content": "ok"}]
+        runner.generate("second", history=history)
+        self.assertEqual(runner.last_history, history)
+
+    def test_fake_runner_without_history_gets_empty(self):
+        runner = FakeRunner(reply_text="ok")
+        runner.load("/tmp/fake.gguf")
+        runner.generate("hello")
+        self.assertEqual(runner.last_history, [])
+
+
+class CancellableLoadTests(unittest.TestCase):
+    def test_fake_load_can_be_cancelled(self):
+        self.assertTrue(FakeRunner().cancellable_load)
+
+    def test_real_load_cannot_be_cancelled(self):
+        # The Llama() constructor never checks for a cancel, so
+        # the UI must not promise one.
+        self.assertFalse(LlamaRunner().cancellable_load)
+
+
+class FakeChatLlama:
+    """A stand-in for llama_cpp.Llama that records its calls."""
+
+    CREATED = []
+
+    def __init__(self, model_path, n_threads, n_ctx, verbose):
+        self.calls = []
+        FakeChatLlama.CREATED.append(self)
+
+    def create_chat_completion(self, messages, stream,
+                               max_tokens=None):
+        self.calls.append((list(messages), max_tokens))
+
+        def chunks():
+            yield {"choices": [{"delta": {"content": "hi"}}]}
+            yield {"choices": [{"delta": {"content": " there"}}]}
+
+        return chunks()
+
+    def tokenize(self, data):
+        return [1, 2, 3]
+
+
+class LlamaGenerateTests(unittest.TestCase):
+    def _make_runner(self):
+        FakeChatLlama.CREATED.clear()
+        module = types.ModuleType("llama_cpp")
+        module.Llama = FakeChatLlama
+        runner = LlamaRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "small.gguf"
+            path.write_bytes(b"x" * 2048)
+            with mock.patch.dict(sys.modules,
+                                 {"llama_cpp": module}):
+                runner.load(str(path))
+        return runner
+
+    def test_history_is_sent_with_the_prompt(self):
+        runner = self._make_runner()
+        history = [{"role": "user", "content": "my name is Jo"},
+                   {"role": "assistant", "content": "hello Jo"}]
+        pieces = []
+        stats = runner.generate("what is my name?",
+                                on_token=pieces.append,
+                                history=history)
+        self.assertEqual("".join(pieces), "hi there")
+        self.assertEqual(stats["tokens"], 3)
+        llama = FakeChatLlama.CREATED[0]
+        self.assertEqual(len(llama.calls), 1)
+        messages, _max_tokens = llama.calls[0]
+        self.assertEqual(messages, history + [
+            {"role": "user", "content": "what is my name?"}])
+
+    def test_generation_is_capped(self):
+        runner = self._make_runner()
+        runner.generate("hello")
+        _messages, max_tokens = FakeChatLlama.CREATED[0].calls[0]
+        self.assertEqual(max_tokens, MAX_GENERATION_TOKENS)
+        self.assertEqual(MAX_GENERATION_TOKENS, 1024)
 
 
 if __name__ == "__main__":

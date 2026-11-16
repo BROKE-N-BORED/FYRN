@@ -1,5 +1,71 @@
 # Changelog
 
+## Fyrn v0.3 (2026-11-15)
+
+The v0.2 review, built: the bugs and correctness findings, highest
+first. Every item below was found by reading the code and driving
+the app, and every one has a test.
+
+- Fyrn finds the models already on the PC. It lists the models
+  Ollama already downloaded (from Ollama's own store) alongside
+  the models folder, so a model that is already on the disk never
+  needs pulling or typing in. Those models stay where Ollama put
+  them: Fyrn can load them, but it cannot remove them. Turn the
+  listing off in Settings if you only want your models folder.
+- Closing the window during a load no longer crashes the process.
+  A real load cannot be stopped once it starts, so Fyrn waits for
+  it to finish and then closes, instead of destroying a running
+  thread and aborting.
+- A failed load resets the screen to "nothing loaded": the hero
+  tile, the Loaded pill, and the stale stats go away, and the
+  chat hint goes back to the true one. A refused load (too big
+  for RAM) still leaves the current model loaded, as before.
+- Load cancel is honest now: on the real backend the button is
+  greyed out and the status says the load cannot be stopped,
+  because the backend never checks for a cancel mid-load.
+- Load, Unload, and Remove stay disabled while a reply streams,
+  so a reply can no longer come from a model the screen says is
+  gone (or deleted).
+- Import runs on a worker thread with progress and a cancel: a
+  4 GB import no longer freezes the window for ~40 seconds. The
+  copy lands in a .part file and is moved into place only when
+  complete, so a stopped or failed import leaves no partial
+  model behind. Disk space is checked before the copy starts.
+- Cards in a grid row share the same top edge: a card with a
+  description no longer sits above its neighbours.
+- The press-dip test no longer asserts a transient animation
+  state after a fixed wait: it polls until the button settles.
+  The suite failure that used to come and go is gone. Two more
+  tests with the same fixed-wait race (card hover lift, status
+  fallback) poll until settled the same way.
+- A model file vanishing between the existence check and the
+  size check is reported as a missing model, not an uncaught
+  error.
+- The model remembers the conversation: each message carries the
+  earlier turns with it, trimmed to fit the context window
+  (oldest first). Clear empties the history along with the
+  transcript.
+- Replies are capped at 1024 tokens, so a model that never
+  stops talking stops on its own instead of running to context
+  fill.
+- The fit check uses the real KV cache size from the model's own
+  GGUF header (layers, heads, head size, context length) instead
+  of a fixed 512 MB guess, so it stops over-promising on the
+  bigger models.
+- Pulls are verified against the checksum Hugging Face publishes:
+  a corrupt download is deleted, never saved as a model. A resume
+  against an upstream file that changed starts over instead of
+  mixing old and new bytes (the server's ETag is tracked with
+  the partial file).
+- Unfinished downloads are listed at the bottom of the Pull
+  window, with Resume and Delete. A resume needs no retyping:
+  the address travels with the partial file.
+- Clear also clears the stats line: the numbers no longer
+  describe a conversation that no longer exists.
+- Load is not offered for the model that is already loaded.
+- The dead VERSION constant in core.py is gone, and the README
+  line about where the version lives is true again.
+
 ## Fyrn v0.2 (2026-11-13)
 
 The v0.1 UI audit, finished: the 10 low findings, highest first.

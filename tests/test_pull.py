@@ -1,7 +1,9 @@
 """Tests for fyrn.pull: input parsing and resumable
 downloads against a local fake HTTP server (no network)."""
 
+import hashlib
 import http.client
+import json
 import os
 import tempfile
 import threading
@@ -11,7 +13,8 @@ from pathlib import Path
 
 from helpers import file_bytes, make_fake_gguf, start_range_server
 from fyrn.pull import (DownloadError, PullCancelled, download_file,
-                             parse_model_input)
+                             fetch_hf_sha256, parse_hf_url,
+                             parse_model_input, read_part_url)
 
 PAYLOAD = bytes(range(256)) * 256  # 64 KiB deterministic bytes
 
@@ -203,6 +206,193 @@ class DownloadTests(unittest.TestCase):
         path = make_fake_gguf(Path(self.tmp.name) / "a.gguf", 2048)
         self.assertEqual(os.path.getsize(path), 2048)
         self.assertEqual(file_bytes(path)[:4], b"\x00\x01\x02\x03")
+
+
+class HfUrlTests(unittest.TestCase):
+    def test_resolve_link_parses(self):
+        self.assertEqual(
+            parse_hf_url("https://huggingface.co/user/model/"
+                         "resolve/main/m.gguf"),
+            ("user/model", "m.gguf"))
+
+    def test_non_hf_link_is_none(self):
+        self.assertIsNone(
+            parse_hf_url("https://example.com/models/m.gguf"))
+
+    def test_blob_link_is_none(self):
+        # Blob links are converted to resolve links by
+        # parse_model_input before a pull ever starts.
+        self.assertIsNone(
+            parse_hf_url("https://huggingface.co/user/model/"
+                         "blob/main/m.gguf"))
+
+
+class ApiHandler(BaseHTTPRequestHandler):
+    """Serves one fixed Hub API model page."""
+
+    BODY = b"{}"
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(self.BODY)))
+        self.end_headers()
+        self.wfile.write(self.BODY)
+
+
+class FetchHashTests(unittest.TestCase):
+    def setUp(self):
+        self.servers = []
+
+    def tearDown(self):
+        for server in self.servers:
+            server.shutdown()
+            server.server_close()
+
+    def _api(self, body):
+        handler = type("BoundApi", (ApiHandler,),
+                       {"BODY": json.dumps(body).encode("utf-8")})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever,
+                                  daemon=True)
+        thread.start()
+        self.servers.append(server)
+        return "http://127.0.0.1:%d" % server.server_address[1]
+
+    def test_hash_found_for_the_file(self):
+        base = self._api({"siblings": [
+            {"rfilename": "other.gguf",
+             "lfs": {"oid": "deadbeef"}},
+            {"rfilename": "m.gguf",
+             "lfs": {"oid": "abc123"}}]})
+        self.assertEqual(fetch_hf_sha256("user/model", "m.gguf",
+                                         api_base=base),
+                         "abc123")
+
+    def test_missing_file_is_none(self):
+        base = self._api({"siblings": [
+            {"rfilename": "other.gguf",
+             "lfs": {"oid": "deadbeef"}}]})
+        self.assertIsNone(fetch_hf_sha256("user/model", "m.gguf",
+                                          api_base=base))
+
+    def test_dead_server_is_none_not_an_error(self):
+        self.assertIsNone(fetch_hf_sha256(
+            "user/model", "m.gguf",
+            api_base="http://127.0.0.1:1"))
+
+
+class HashVerifyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dest = Path(self.tmp.name) / "model.gguf"
+        self.servers = []
+
+    def tearDown(self):
+        for server in self.servers:
+            server.shutdown()
+            server.server_close()
+        self.tmp.cleanup()
+
+    def test_matching_hash_downloads(self):
+        server, url = start_range_server(PAYLOAD)
+        self.servers.append(server)
+        digest = hashlib.sha256(PAYLOAD).hexdigest()
+        download_file(url, self.dest, expected_sha256=digest)
+        self.assertEqual(file_bytes(self.dest), PAYLOAD)
+
+    def test_mismatched_hash_deletes_and_fails(self):
+        server, url = start_range_server(PAYLOAD)
+        self.servers.append(server)
+        with self.assertRaises(DownloadError) as ctx:
+            download_file(url, self.dest,
+                          expected_sha256="0" * 64)
+        self.assertIn("does not match", str(ctx.exception))
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(
+            os.path.exists(str(self.dest) + ".part"))
+
+
+class EtagTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dest = Path(self.tmp.name) / "model.gguf"
+        self.servers = []
+
+    def tearDown(self):
+        for server in self.servers:
+            server.shutdown()
+            server.server_close()
+        self.tmp.cleanup()
+
+    def _stale_part(self, etag):
+        """A partial file of garbage bytes with a stored ETag."""
+        part = str(self.dest) + ".part"
+        with open(part, "wb") as fh:
+            fh.write(b"garbage-bytes" * 100)
+        with open(part + ".etag", "w", encoding="utf-8") as fh:
+            fh.write(etag)
+
+    def test_changed_upstream_restarts_from_zero(self):
+        server, url = start_range_server(PAYLOAD, etag="v2")
+        self.servers.append(server)
+        self._stale_part("v1")
+        download_file(url, self.dest)
+        # A resume would have kept the garbage prefix; a fresh
+        # download is byte-identical to the payload.
+        self.assertEqual(file_bytes(self.dest), PAYLOAD)
+
+    def test_matching_etag_resumes(self):
+        server, url = start_range_server(PAYLOAD, etag="v1")
+        self.servers.append(server)
+        part = str(self.dest) + ".part"
+        with open(part, "wb") as fh:
+            fh.write(PAYLOAD[:len(PAYLOAD) // 2])
+        with open(part + ".etag", "w", encoding="utf-8") as fh:
+            fh.write("v1")
+        download_file(url, self.dest)
+        self.assertEqual(file_bytes(self.dest), PAYLOAD)
+
+    def test_etag_is_saved_for_the_next_resume(self):
+        server, url = start_range_server(PAYLOAD, etag="v9")
+        self.servers.append(server)
+        event = threading.Event()
+        event.set()
+        with self.assertRaises(PullCancelled):
+            download_file(url, self.dest, cancel_event=event)
+        with open(str(self.dest) + ".part.etag",
+                  encoding="utf-8") as fh:
+            self.assertEqual(fh.read().strip(), "v9")
+
+
+class SidecarTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dest = Path(self.tmp.name) / "model.gguf"
+        self.servers = []
+
+    def tearDown(self):
+        for server in self.servers:
+            server.shutdown()
+            server.server_close()
+        self.tmp.cleanup()
+
+    def test_url_sidecar_survives_cancel_and_dies_on_success(self):
+        server, url = start_range_server(PAYLOAD)
+        self.servers.append(server)
+        event = threading.Event()
+        event.set()
+        with self.assertRaises(PullCancelled):
+            download_file(url, self.dest, cancel_event=event)
+        part = str(self.dest) + ".part"
+        self.assertEqual(read_part_url(part), url)
+        download_file(url, self.dest)
+        self.assertEqual(file_bytes(self.dest), PAYLOAD)
+        self.assertFalse(os.path.exists(part + ".url"))
+        self.assertIsNone(read_part_url(part))
 
 
 if __name__ == "__main__":

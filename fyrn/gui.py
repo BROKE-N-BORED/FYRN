@@ -31,15 +31,18 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
 
 from . import __version__
 from . import core
-from .core import (HEADROOM_BYTES, ModelController, ModelNotFoundError,
-                   ModelTooBigError, ensure_home, ensure_models_folder,
-                   fit_status, format_size, read_ram_bytes, remove_gguf,
-                   scan_models)
+from .core import (HEADROOM_BYTES, ImportCancelled, ModelController,
+                   ModelNotFoundError, ModelTooBigError, ensure_home,
+                   ensure_models_folder, fit_status, format_size,
+                   list_part_files, model_headroom_bytes,
+                   read_ram_bytes, remove_gguf, scan_models)
 from .debug_log import DebugLogger
+from .discover import discover_ollama_models
 from .pull import (DownloadError, PullCancelled, download_file,
-                   parse_model_input)
+                   fetch_hf_sha256, parse_hf_url, parse_model_input,
+                   read_part_url)
 from .runner import (GenerationCancelled, LoadCancelled, LlamaRunner,
-                     RunnerError)
+                     RunnerError, auto_context_tokens, trim_history)
 
 DEFAULT_WIDTH = 1100
 DEFAULT_HEIGHT = 700
@@ -218,6 +221,21 @@ def reduced_motion():
         return True
     return get_reduce_motion()
 
+
+def get_show_ollama_models():
+    """Whether the models Ollama already downloaded are listed
+    (Settings window). On by default: the models are already on
+    the disk, so listing them costs nothing and saves a pull."""
+    settings = get_settings()
+    return bool(settings.value("show_ollama_models", True,
+                               type=bool))
+
+
+def set_show_ollama_models(value):
+    settings = get_settings()
+    settings.setValue("show_ollama_models", bool(value))
+    settings.sync()
+
 HOW_TO_USE_SECTIONS = {
     "First steps": (
         "New here? Start here.\n\n"
@@ -238,6 +256,11 @@ HOW_TO_USE_SECTIONS = {
         "size and a fit badge: Fits means it runs fine on this PC, "
         "Tight means it will run but leaves little spare RAM, Too "
         "big means it will not fit in free RAM.\n\n"
+        "Fyrn also lists the models Ollama already downloaded on "
+        "this PC, so you do not have to pull them again. Those "
+        "models stay where Ollama put them: Fyrn can load them, "
+        "but it cannot remove them. Turn the listing off in "
+        "Settings if you only want your models folder.\n\n"
         "Pick a model and press Load. Double-click a model to load "
         "it straight away. Only one model runs at a time: loading "
         "a second one unloads the first. Press Unload when you are "
@@ -246,7 +269,8 @@ HOW_TO_USE_SECTIONS = {
         "the one in focus, Enter loads it.\n\n"
         "Import brings in a .gguf file from anywhere on the disk, "
         "such as a fine-tuned model you made elsewhere. It copies "
-        "the file into your models folder.\n\n"
+        "the file into your models folder, with progress and a "
+        "cancel while it runs.\n\n"
         "Remove deletes a model from the folder. It asks first, "
         "names the file and its size, and a loaded model is "
         "unloaded before it is removed."
@@ -263,12 +287,18 @@ HOW_TO_USE_SECTIONS = {
         "speed. Press Cancel to stop; the part already downloaded "
         "stays, and pulling again picks up where it stopped instead "
         "of starting over.\n\n"
+        "Unfinished downloads are listed at the bottom of the Pull "
+        "window: Resume picks one up, Delete clears it away.\n\n"
+        "Fyrn checks a finished pull against the checksum Hugging "
+        "Face publishes, so a corrupt download never becomes a "
+        "model.\n\n"
         "When the pull finishes, the model appears in the Models tab."
     ),
     "Settings": (
-        "Settings lives in the File menu. It has two settings: the "
-        "models folder, where pulled and imported models are kept, "
-        "and Reduce motion.\n\n"
+        "Settings lives in the File menu. It has three settings: "
+        "the models folder, where pulled and imported models are "
+        "kept, Reduce motion, and whether Ollama's already-"
+        "downloaded models are listed.\n\n"
         "Press Browse to pick a different models folder, then Save. "
         "The Models tab switches to the new folder right away.\n\n"
         "Check Reduce motion if movement on screen bothers you: "
@@ -374,10 +404,11 @@ class LoadWorker(QThread):
     finished = Signal(dict)      # {"load_time_s": float, "warning": str}
     failed = Signal(str)         # plain-words message
 
-    def __init__(self, controller, path):
+    def __init__(self, controller, path, display_name=None):
         super().__init__()
         self.controller = controller
         self.path = path
+        self.display_name = display_name
         self.cancel_event = threading.Event()
 
     def run(self):
@@ -385,7 +416,8 @@ class LoadWorker(QThread):
             result = self.controller.load(
                 self.path,
                 progress_cb=lambda pct, msg: self.progress.emit(pct, msg),
-                cancel_event=self.cancel_event)
+                cancel_event=self.cancel_event,
+                display_name=self.display_name)
         except LoadCancelled:
             self.failed.emit("Load cancelled.")
         except (ModelTooBigError, ModelNotFoundError) as exc:
@@ -408,10 +440,11 @@ class ChatWorker(QThread):
     finished = Signal(dict)  # generation stats
     failed = Signal(str)
 
-    def __init__(self, runner, prompt):
+    def __init__(self, runner, prompt, history=None):
         super().__init__()
         self.runner = runner
         self.prompt = prompt
+        self.history = list(history or [])
         self.cancel_event = threading.Event()
 
     def run(self):
@@ -419,7 +452,8 @@ class ChatWorker(QThread):
             stats = self.runner.generate(
                 self.prompt,
                 on_token=lambda piece: self.token.emit(piece),
-                cancel_event=self.cancel_event)
+                cancel_event=self.cancel_event,
+                history=self.history)
         except GenerationCancelled:
             self.finished.emit({"stopped": True})
         except RunnerError as exc:
@@ -451,11 +485,20 @@ class PullWorker(QThread):
 
     def run(self):
         try:
+            # A Hugging Face pull is checked against the checksum
+            # the site publishes, so a corrupt download never
+            # becomes a model. No hash means no check, never a
+            # failed pull.
+            expected = None
+            parsed = parse_hf_url(self.url)
+            if parsed is not None:
+                expected = fetch_hf_sha256(*parsed)
             download_file(
                 self.url, self.dest,
                 progress_cb=lambda d, t, s: self.progress.emit(
                     d, -1 if t is None else t, s),
-                cancel_event=self.cancel_event)
+                cancel_event=self.cancel_event,
+                expected_sha256=expected)
         except PullCancelled:
             self.cancelled.emit()
         except DownloadError as exc:
@@ -469,22 +512,70 @@ class PullWorker(QThread):
         self.cancel_event.set()
 
 
+class ImportWorker(QThread):
+    """Copy a .gguf file into the models folder off the UI thread
+    (U30): a 4 GB copy takes ~40 s, and the window must stay
+    alive, with progress and a cancel, while it runs."""
+
+    progress = Signal(int, int)  # copied, total
+    finished = Signal(str)       # saved path
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, source, folder):
+        super().__init__()
+        self.source = source
+        self.folder = folder
+        self.cancel_event = threading.Event()
+
+    def run(self):
+        try:
+            dest = core.import_gguf(
+                self.source, self.folder,
+                progress_cb=lambda c, t: self.progress.emit(c, t),
+                cancel_event=self.cancel_event)
+        except ImportCancelled:
+            self.cancelled.emit()
+        except ValueError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit("The import failed (%s)." % exc)
+        else:
+            self.finished.emit(str(dest))
+
+    def cancel(self):
+        self.cancel_event.set()
+
+
 class ScanWorker(QThread):
     """Scan the models folder off the UI thread (U30).
 
     The disk scan is quick, but it runs on a spinning hard drive,
     so it never blocks the window. While it runs, the Models tab
-    shows skeleton tiles (honest loading).
+    shows skeleton tiles (honest loading). Ollama's already-
+    downloaded models are listed too, unless the setting says
+    otherwise: they are already on the disk, so finding them
+    costs nothing and saves a pull.
     """
 
     finished = Signal(list, list, object)  # models, skipped, free_bytes
 
-    def __init__(self, folder):
+    def __init__(self, folder, include_ollama=True):
         super().__init__()
         self.folder = Path(folder)
+        self.include_ollama = include_ollama
 
     def run(self):
         models, skipped = scan_models(self.folder)
+        if self.include_ollama:
+            discovered, warnings = discover_ollama_models()
+            seen = {str(m["path"]) for m in models}
+            for model in discovered:
+                if str(model["path"]) not in seen:
+                    models.append(model)
+                    seen.add(str(model["path"]))
+            skipped.extend(warnings)
+        models.sort(key=lambda m: m["name"].lower())
         _total, free_bytes = read_ram_bytes()
         self.finished.emit(models, skipped, free_bytes)
 
@@ -734,6 +825,32 @@ class PullWindow(QDialog):
         self.busy_dot.setVisible(False)
         layout.addWidget(self.busy_dot)
 
+        # Unfinished downloads: a .part file in the models folder
+        # is a pull that stopped halfway. It is listed here with
+        # its size, so it can be resumed or cleared away instead
+        # of sitting on the disk unseen. Hidden when there are
+        # none, so the window stays tight.
+        self.parts_label = QLabel("Unfinished downloads")
+        self.parts_label.setWordWrap(True)
+        layout.addWidget(self.parts_label)
+        self.parts_list = QListWidget()
+        self.parts_list.setObjectName("part_list")
+        self.parts_list.setMaximumHeight(120)
+        self.parts_list.itemSelectionChanged.connect(
+            self._update_part_buttons)
+        layout.addWidget(self.parts_list)
+        parts_buttons = QHBoxLayout()
+        self.part_resume_button = QPushButton("Resume")
+        self.part_resume_button.clicked.connect(self._resume_part)
+        self.part_delete_button = QPushButton("Delete")
+        self.part_delete_button.clicked.connect(self._delete_part)
+        parts_buttons.addWidget(self.part_resume_button)
+        parts_buttons.addWidget(self.part_delete_button)
+        parts_buttons.addStretch(1)
+        layout.addLayout(parts_buttons)
+        self._close_pending = False
+        self._refresh_part_list()
+
     def _fill_suggestion(self):
         """Fill the field with the suggested first model."""
         self.input.setText(FIRST_PULL_SUGGESTION)
@@ -765,17 +882,100 @@ class PullWindow(QDialog):
                 "%s is already in your models folder."
                 % target.filename)
             return
+        self._start_download(target.url, dest)
+
+    def _start_download(self, url, dest):
+        """Run a download in the worker: the shared path for a
+        fresh pull and for resuming an unfinished one."""
         if self.log is not None:
-            self.log.action("pull started: %s" % target.filename)
+            self.log.action("pull started: %s" % Path(dest).name)
         self._set_busy(True)
         self.progress_bar.setValue(0)
         self.status_label.setText("Starting download...")
-        self.worker = PullWorker(target.url, dest)
+        self.worker = PullWorker(url, dest)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_finished)
         self.worker.failed.connect(self._on_failed)
         self.worker.cancelled.connect(self._on_cancelled)
         self.worker.start()
+
+    def _refresh_part_list(self):
+        """List the unfinished downloads, or hide the section
+        when there are none."""
+        parts = list_part_files(self.models_folder)
+        show = bool(parts)
+        self.parts_label.setVisible(show)
+        self.parts_list.setVisible(show)
+        self.part_resume_button.setVisible(show)
+        self.part_delete_button.setVisible(show)
+        self.parts_list.clear()
+        if not show:
+            return
+        for part in parts:
+            item = QListWidgetItem(
+                "%s (%s downloaded)"
+                % (part["name"], format_size(part["size"])))
+            item.setData(Qt.ItemDataRole.UserRole, str(part["path"]))
+            self.parts_list.addItem(item)
+        self._update_part_buttons()
+
+    def _update_part_buttons(self):
+        selected = bool(self.parts_list.selectedItems())
+        self.part_resume_button.setEnabled(
+            selected and self.worker is None)
+        self.part_delete_button.setEnabled(selected)
+
+    def _selected_part_path(self):
+        items = self.parts_list.selectedItems()
+        if not items:
+            return None
+        return Path(items[0].data(Qt.ItemDataRole.UserRole))
+
+    def _resume_part(self):
+        """Pick up an unfinished download from its saved address."""
+        if self.worker is not None:
+            return
+        part_path = self._selected_part_path()
+        if part_path is None:
+            return
+        url = read_part_url(part_path)
+        if url is None:
+            self.status_label.setText(
+                "That download cannot be resumed: its address was "
+                "not saved. Delete it and pull the model again.")
+            return
+        dest = part_path.with_name(
+            part_path.name[:-len(".part")])
+        if dest.exists():
+            self.status_label.setText(
+                "%s is already in your models folder." % dest.name)
+            return
+        self.input.setText(url)
+        self._start_download(url, dest)
+        self._update_part_buttons()
+
+    def _delete_part(self):
+        """Clear an unfinished download away, with its sidecars."""
+        part_path = self._selected_part_path()
+        if part_path is None:
+            return
+        name = part_path.name
+        try:
+            size = part_path.stat().st_size
+        except OSError:
+            size = 0
+        for path in (part_path,
+                     Path(str(part_path) + ".url"),
+                     Path(str(part_path) + ".etag")):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        if self.log is not None:
+            self.log.action("deleted unfinished download: %s" % name)
+        self.status_label.setText(
+            "Deleted %s (freed %s)." % (name, format_size(size)))
+        self._refresh_part_list()
 
     def _on_progress(self, downloaded, total, speed):
         if total and total > 0:
@@ -800,9 +1000,18 @@ class PullWindow(QDialog):
         self._celebrate()
         self._set_busy(False)
         self._drop_worker()
+        self._refresh_part_list()
         if self.log is not None:
             self.log.action("pull finished: %s" % path)
         self.model_pulled.emit(path)
+        self._maybe_close_pending()
+
+    def _maybe_close_pending(self):
+        """Close this window if a close was asked for while a pull
+        was running and the pull has now stopped."""
+        if self._close_pending and self.worker is None:
+            self._close_pending = False
+            self.close()
 
     def _celebrate(self):
         """A small quiet celebration when a pull finishes: one
@@ -832,9 +1041,11 @@ class PullWindow(QDialog):
         self.status_label.setText(message)
         self._set_busy(False)
         self._drop_worker()
+        self._refresh_part_list()
         if self.log is not None:
             self.log.error("pull failed: %s", message)
         QMessageBox.warning(self, "Pull a model", message)
+        self._maybe_close_pending()
 
     def _on_cancelled(self):
         self.progress_bar.setRange(0, 100)
@@ -843,6 +1054,8 @@ class PullWindow(QDialog):
             "pulling again picks up where it stopped.")
         self._set_busy(False)
         self._drop_worker()
+        self._refresh_part_list()
+        self._maybe_close_pending()
 
     def _drop_worker(self):
         """Forget the pull worker, after it has fully stopped.
@@ -886,6 +1099,16 @@ class PullWindow(QDialog):
                 return
             self.worker.cancel()
             self.worker.wait(5000)
+            if self.worker is not None and self.worker.isRunning():
+                # A network read can block past the wait: closing
+                # now would destroy a running thread and abort the
+                # process. Stay open and close when it stops.
+                self._close_pending = True
+                self.status_label.setText(
+                    "Stopping the pull. This window will close "
+                    "when it stops.")
+                event.ignore()
+                return
         super().closeEvent(event)
 
 
@@ -937,6 +1160,18 @@ class SettingsWindow(QDialog):
         motion_help.setWordWrap(True)
         layout.addWidget(motion_help)
 
+        self.ollama_check = QCheckBox(
+            "Show models Ollama already downloaded")
+        self.ollama_check.setChecked(get_show_ollama_models())
+        layout.addWidget(self.ollama_check)
+
+        ollama_help = QLabel(
+            "Fyrn also lists the models Ollama downloaded, so you "
+            "do not have to pull them again. Uncheck to list only "
+            "your models folder.")
+        ollama_help.setWordWrap(True)
+        layout.addWidget(ollama_help)
+
         layout.addStretch(1)
 
         buttons = QHBoxLayout()
@@ -978,6 +1213,7 @@ class SettingsWindow(QDialog):
             return
         set_models_folder(folder)
         set_reduce_motion(self.motion_check.isChecked())
+        set_show_ollama_models(self.ollama_check.isChecked())
         self.folder_changed.emit(str(folder))
         self.accept()
 
@@ -1057,6 +1293,11 @@ class ModelCard(QFrame):
                  free_bytes=None, parent=None):
         super().__init__(parent)
         self.path = str(model["path"])
+        # The display name (an Ollama model's name, or the file
+        # name) and where the model came from: "folder" for a file
+        # in the models folder, "ollama" for one Ollama downloaded.
+        self.model_name = model["name"]
+        self.source = model.get("source", "folder")
         self._selected = False
         # Hover detail (entry 017): the full path, RAM needed vs
         # free, and why it fits or not, with no click needed. The
@@ -1134,6 +1375,16 @@ class ModelCard(QFrame):
                 "border: 1px solid #f2c14e; padding: 2px 9px; "
                 "border-radius: 8px;")
             badge_row.addWidget(loaded_label)
+        if self.source == "ollama":
+            # A quiet marker: this model came from Ollama's store,
+            # so Fyrn can load it but not remove it.
+            ollama_label = QLabel("Ollama")
+            ollama_label.setObjectName("ollama_tag")
+            ollama_label.setStyleSheet(
+                "color: #999999; font-size: 11pt; "
+                "border: 1px solid #555555; padding: 2px 9px; "
+                "border-radius: 8px;")
+            badge_row.addWidget(ollama_label)
         badge_row.addStretch(1)
         layout.addLayout(badge_row)
         # The hero tile earns its size with live stats (load time,
@@ -1173,7 +1424,8 @@ class ModelCard(QFrame):
             if len(description) > ModelCard.DESCRIPTION_MAX:
                 description = description[:137] + "..."
             lines.append("About: %s" % description)
-        needed = model["size"] + HEADROOM_BYTES
+        headroom = model.get("headroom_bytes", HEADROOM_BYTES)
+        needed = model["size"] + headroom
         if free_bytes is None:
             lines.append("Needs %s of RAM, free RAM unknown"
                          % format_size(needed))
@@ -1189,6 +1441,9 @@ class ModelCard(QFrame):
                        "unknown.",
         }
         lines.append(reasons[status])
+        if model.get("source") == "ollama":
+            lines.append("From Ollama: it stays where Ollama put "
+                         "it. Fyrn can load it, but not remove it.")
         return "\n".join(lines)
 
     def set_selected(self, selected):
@@ -1441,12 +1696,22 @@ class MainWindow(QMainWindow):
 
         self.load_worker = None
         self.chat_worker = None
+        self.import_worker = None
         self.pull_window = None
         self.settings_window = None
         self.howto_window = None
         self.tray = None
         self.load_time_s = None
         self._reply_in_progress = False
+        # True when the user asked to close while a worker was
+        # still running: the window closes once every worker has
+        # stopped, instead of destroying a running thread.
+        self._close_pending = False
+        # The conversation, as message dicts the model can read:
+        # user and assistant turns, trimmed to the budget. The
+        # transcript on screen is the same conversation in words.
+        self._chat_history = []
+        self._current_reply = ""
 
         # Model tiles (bento grid): the scan runs off the UI thread
         # and the tiles fill in when it finishes.
@@ -1586,12 +1851,16 @@ class MainWindow(QMainWindow):
         self.load_cancel_button = QPushButton("Cancel load")
         self.load_cancel_button.clicked.connect(self._cancel_load)
         self.load_cancel_button.setVisible(False)
+        self.import_cancel_button = QPushButton("Cancel import")
+        self.import_cancel_button.clicked.connect(self._cancel_import)
+        self.import_cancel_button.setVisible(False)
         buttons.addWidget(self.load_button)
         buttons.addWidget(self.unload_button)
         buttons.addWidget(self.import_button)
         buttons.addWidget(self.pull_button)
         buttons.addWidget(self.remove_button)
         buttons.addWidget(self.load_cancel_button)
+        buttons.addWidget(self.import_cancel_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
 
@@ -1776,7 +2045,7 @@ class MainWindow(QMainWindow):
         for index in range(3):
             self._cards_layout.addWidget(
                 SkeletonCard(), index // GRID_COLUMNS,
-                index % GRID_COLUMNS)
+                index % GRID_COLUMNS, Qt.AlignmentFlag.AlignTop)
         rows = (3 + GRID_COLUMNS - 1) // GRID_COLUMNS
         self._cards_layout.addItem(
             QSpacerItem(0, 0, QSizePolicy.Policy.Minimum,
@@ -1791,7 +2060,9 @@ class MainWindow(QMainWindow):
             self._scan_dirty = True
             return
         self._show_skeleton()
-        self._scan_worker = ScanWorker(self.models_folder)
+        self._scan_worker = ScanWorker(
+            self.models_folder,
+            include_ollama=get_show_ollama_models())
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.start()
 
@@ -1816,21 +2087,32 @@ class MainWindow(QMainWindow):
         col = 0
         self._hero_card = None
         for model in ordered:
-            status = fit_status(model["size"], free_bytes)
+            # The fit badge uses this model's real RAM need: the
+            # KV cache for the context length the runner will use,
+            # from the file's own header, not a fixed guess.
+            headroom = model_headroom_bytes(
+                model["path"], auto_context_tokens(free_bytes))
+            model["headroom_bytes"] = headroom
+            status = fit_status(model["size"], free_bytes, headroom)
             is_loaded = str(model["path"]) == loaded_path
             card = ModelCard(model, status, loaded=is_loaded,
                              hero=is_loaded, free_bytes=free_bytes)
             card.clicked.connect(self._on_card_clicked)
             card.double_clicked.connect(self._on_card_double_clicked)
             card.remove_requested.connect(self._on_remove_requested)
+            # Top-aligned: the grid centers tiles vertically by
+            # default, so a taller card (one with a description)
+            # sat above its neighbours and the row looked ragged.
             if is_loaded:
                 self._hero_card = card
                 self._cards_layout.addWidget(
-                    card, row, 0, 1, GRID_COLUMNS)
+                    card, row, 0, 1, GRID_COLUMNS,
+                    Qt.AlignmentFlag.AlignTop)
                 row += 1
                 col = 0
             else:
-                self._cards_layout.addWidget(card, row, col)
+                self._cards_layout.addWidget(
+                    card, row, col, Qt.AlignmentFlag.AlignTop)
                 col += 1
                 if col >= GRID_COLUMNS:
                     col = 0
@@ -1885,6 +2167,8 @@ class MainWindow(QMainWindow):
         if self._scan_dirty:
             self._scan_dirty = False
             self._refresh_model_list()
+        else:
+            self._maybe_close_pending()
 
     def _pulse_card(self, card):
         """One quiet 200 ms fade-in on a newly pulled model, opacity
@@ -1903,19 +2187,51 @@ class MainWindow(QMainWindow):
         anim.start()
 
     def _update_buttons(self):
-        has_selection = self._selected_model_path() is not None
+        selected = self._selected_model_path()
+        has_selection = selected is not None
         loading = self.load_worker is not None
+        importing = self.import_worker is not None
+        replying = self.chat_worker is not None
         loaded = self.controller.is_loaded
-        self.load_button.setEnabled(has_selection and not loading)
-        self.remove_button.setEnabled(has_selection and not loading)
-        self.unload_button.setEnabled(loaded and not loading)
+        # The loaded model is not loadable: clicking Load on it
+        # would pay a full reload cycle for nothing.
+        selected_is_loaded = (loaded and selected is not None
+                              and self.controller.current_path
+                              == selected)
+        selected_card = (self.model_cards.get(str(selected))
+                         if selected is not None else None)
+        # An Ollama model belongs to Ollama: Fyrn lists it, but
+        # it cannot remove it.
+        selected_is_ollama = (selected_card is not None
+                              and selected_card.source == "ollama")
+        # One long operation at a time on the Models tab, and
+        # nothing that touches the loaded model while a reply
+        # streams from it: unloading or deleting a model mid-reply
+        # leaves a reply coming from a model that is gone.
+        self.load_button.setEnabled(
+            has_selection and not loading and not importing
+            and not replying and not selected_is_loaded)
+        self.remove_button.setEnabled(
+            has_selection and not loading and not importing
+            and not replying and not selected_is_ollama)
+        self.unload_button.setEnabled(
+            loaded and not loading and not replying)
+        self.import_button.setEnabled(not loading and not importing)
         self.send_button.setEnabled(
             loaded and self.chat_worker is None)
         self.load_cancel_button.setVisible(loading)
-        self.load_progress.setVisible(loading)
+        # A real load cannot be stopped once it starts (the
+        # backend never checks for a cancel), so the button says
+        # so by being greyed out instead of promising a cancel.
+        self.load_cancel_button.setEnabled(
+            self.runner.cancellable_load)
+        self.import_cancel_button.setVisible(importing)
+        self.load_progress.setVisible(loading or importing)
 
     def load_selected_model(self):
-        if self.load_worker is not None:
+        if (self.load_worker is not None
+                or self.chat_worker is not None
+                or self.import_worker is not None):
             return
         path = self._selected_model_path()
         if path is None:
@@ -1944,7 +2260,10 @@ class MainWindow(QMainWindow):
         self.load_progress.setValue(0)
         self._set_busy(True)
         self._show_status_persistent("Loading %s..." % path.name)
-        self.load_worker = LoadWorker(self.controller, path)
+        card = self.model_cards.get(str(path))
+        display_name = card.model_name if card is not None else None
+        self.load_worker = LoadWorker(self.controller, path,
+                                      display_name=display_name)
         self.load_worker.progress.connect(self._on_load_progress)
         self.load_worker.finished.connect(self._on_load_finished)
         self.load_worker.failed.connect(self._on_load_failed)
@@ -1959,6 +2278,10 @@ class MainWindow(QMainWindow):
         else:
             self.load_progress.setRange(0, 100)
             self.load_progress.setValue(pct)
+        if not self.runner.cancellable_load:
+            # Say it plainly while the load runs: the Cancel
+            # button is greyed out, and this is why.
+            message += " This load cannot be stopped once it starts."
         self._show_status_persistent(message)
 
     def _on_load_finished(self, result):
@@ -1983,6 +2306,7 @@ class MainWindow(QMainWindow):
         # a model IS loaded now, so the hint switches to the true one.
         self.transcript.setPlaceholderText("Type a message below.")
         self.tabs.setCurrentIndex(1)  # Chat tab
+        self._maybe_close_pending()
 
     def _on_load_failed(self, message):
         self._drop_load_worker()
@@ -1990,8 +2314,20 @@ class MainWindow(QMainWindow):
         self._update_buttons()
         self._show_status(message)
         self.log.error("load failed: %s", message)
+        if not self.controller.is_loaded:
+            # The failed load already unloaded the old model, so
+            # nothing is loaded now: the hero tile, the Loaded
+            # pill, and the stale stats must go, and the chat hint
+            # goes back to the true one. (A refused load leaves
+            # the current model loaded, so this only runs when
+            # there really is nothing loaded.)
+            self.load_time_s = None
+            self._refresh_model_list()
+            self.transcript.setPlaceholderText(
+                "Load a model first, then chat here.")
         if message != "Load cancelled.":
             QMessageBox.warning(self, "Load model", message)
+        self._maybe_close_pending()
 
     def _drop_load_worker(self):
         """Forget the load worker, after it has fully stopped
@@ -2009,6 +2345,19 @@ class MainWindow(QMainWindow):
         if worker is not None:
             worker.wait()
 
+    def _maybe_close_pending(self):
+        """Close this window if a close was asked for while a
+        worker was running and every worker has now stopped."""
+        if not self._close_pending:
+            return
+        if (self.load_worker is not None
+                or self.chat_worker is not None
+                or self.import_worker is not None
+                or self._scan_worker is not None):
+            return
+        self._close_pending = False
+        self.close()
+
     def _cancel_load(self):
         if self.load_worker is not None:
             self.load_worker.cancel()
@@ -2017,6 +2366,8 @@ class MainWindow(QMainWindow):
     def unload_model(self):
         if not self.controller.is_loaded:
             return
+        if self.chat_worker is not None:
+            return  # a reply is streaming; Unload waits for it
         name = self.controller.current_name or "model"
         self.controller.unload()
         self.load_time_s = None
@@ -2048,6 +2399,17 @@ class MainWindow(QMainWindow):
         No (U31). A loaded model is unloaded first, never deleted
         out from under the engine."""
         path = Path(path)
+        if self.chat_worker is not None:
+            self._show_status("Wait for the reply to finish first.")
+            return
+        card = self.model_cards.get(str(path))
+        if card is not None and card.source == "ollama":
+            QMessageBox.information(
+                self, "Remove model",
+                "%s belongs to Ollama. Fyrn lists it, but Ollama "
+                "owns the file: remove it with Ollama, not here."
+                % card.model_name)
+            return
         if not path.is_file():
             self._show_status("That model file is gone.")
             self._refresh_model_list()
@@ -2082,21 +2444,80 @@ class MainWindow(QMainWindow):
         self._refresh_model_list()
 
     def import_model(self):
+        """Copy a .gguf file into the models folder, on a worker
+        thread: a multi-GB copy runs for most of a minute, and
+        the window must stay alive, with progress and a cancel,
+        while it runs."""
+        if (self.import_worker is not None
+                or self.load_worker is not None):
+            return
         path, _selected = QFileDialog.getOpenFileName(
             self, "Pick a GGUF model file", str(Path.home()),
             "GGUF models (*.gguf)")
         if not path:
             return
-        try:
-            dest = core.import_gguf(path, self.models_folder)
-        except ValueError as exc:
-            QMessageBox.warning(self, "Import a GGUF file", str(exc))
-            return
+        self.log.action("import started: %s" % Path(path).name)
+        self._set_busy(True)
+        self._show_status_persistent(
+            "Importing %s..." % Path(path).name)
+        self.import_worker = ImportWorker(path, self.models_folder)
+        self.import_worker.progress.connect(self._on_import_progress)
+        self.import_worker.finished.connect(self._on_import_finished)
+        self.import_worker.failed.connect(self._on_import_failed)
+        self.import_worker.cancelled.connect(self._on_import_cancelled)
+        self.import_worker.start()
+        self._update_buttons()
+
+    def _on_import_progress(self, copied, total):
+        if total and total > 0:
+            self.load_progress.setRange(0, 100)
+            self.load_progress.setValue(int(copied * 100 / total))
+            self._show_status_persistent(
+                "Importing: %s of %s"
+                % (format_size(copied), format_size(total)))
+        else:
+            self.load_progress.setRange(0, 0)
+
+    def _on_import_finished(self, path):
+        self._drop_import_worker()
+        self._set_busy(False)
+        self._update_buttons()
+        dest = Path(path)
         self.log.action("imported: %s" % dest.name)
         self._status_after_scan = (
             "%s is now in your models folder." % dest.name)
         self._select_path = str(dest)
         self._refresh_model_list()
+        self._maybe_close_pending()
+
+    def _on_import_failed(self, message):
+        self._drop_import_worker()
+        self._set_busy(False)
+        self._update_buttons()
+        self._show_status(message)
+        self.log.error("import failed: %s", message)
+        QMessageBox.warning(self, "Import a GGUF file", message)
+        self._maybe_close_pending()
+
+    def _on_import_cancelled(self):
+        self._drop_import_worker()
+        self._set_busy(False)
+        self._update_buttons()
+        self._show_status("Import stopped. Nothing was copied.")
+        self._maybe_close_pending()
+
+    def _drop_import_worker(self):
+        """Forget the import worker, after it has fully stopped
+        (see PullWindow._drop_worker for why the wait matters)."""
+        worker = self.import_worker
+        self.import_worker = None
+        if worker is not None:
+            worker.wait()
+
+    def _cancel_import(self):
+        if self.import_worker is not None:
+            self.import_worker.cancel()
+            self._show_status_persistent("Stopping the import...")
 
     # ------------------------------------------------------------ chat
 
@@ -2117,9 +2538,16 @@ class MainWindow(QMainWindow):
         name = self.controller.current_name or "Model"
         self.transcript.append("%s: " % name)
         self._reply_in_progress = True
+        self._current_reply = ""
         self.log.action("chat sent (%d chars)" % len(text))
         self._set_busy(True)
-        self.chat_worker = ChatWorker(self.runner, text)
+        # The earlier turns go with the new message, trimmed to
+        # the budget, so the model answers in context instead of
+        # forgetting every turn.
+        history = trim_history(self._chat_history)
+        self._chat_history.append({"role": "user", "content": text})
+        self.chat_worker = ChatWorker(self.runner, text,
+                                      history=history)
         self.chat_worker.token.connect(self._on_chat_token)
         self.chat_worker.finished.connect(self._on_chat_finished)
         self.chat_worker.failed.connect(self._on_chat_failed)
@@ -2128,6 +2556,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(True)
 
     def _on_chat_token(self, piece):
+        self._current_reply += piece
         cursor = self.transcript.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         cursor.insertText(piece)
@@ -2151,11 +2580,25 @@ class MainWindow(QMainWindow):
         if stats.get("stopped"):
             self._end_turn("(Reply stopped.)")
             self._show_status("Reply stopped.")
+            self._finish_turn()
             return
         self._end_turn()
         self._last_stats = stats
         self._refresh_stats()
         self._show_status("Reply done.")
+        self._finish_turn()
+
+    def _finish_turn(self):
+        """Close a chat turn in the history: the reply (whole or
+        partial) joins the conversation, trimmed to the budget,
+        so the next message carries it."""
+        if self._current_reply:
+            self._chat_history.append(
+                {"role": "assistant",
+                 "content": self._current_reply})
+            self._chat_history = trim_history(self._chat_history)
+        self._current_reply = ""
+        self._maybe_close_pending()
 
     def _on_chat_failed(self, message):
         self._drop_chat_worker()
@@ -2166,6 +2609,10 @@ class MainWindow(QMainWindow):
         self._end_turn("(%s)" % message)
         self._show_status(message)
         self.log.error("chat failed: %s", message)
+        # A failed reply is not a turn: the model said nothing to
+        # remember, so only the partial text is dropped.
+        self._current_reply = ""
+        self._maybe_close_pending()
 
     def _stop_reply(self):
         if self.chat_worker is not None:
@@ -2174,8 +2621,13 @@ class MainWindow(QMainWindow):
 
     def _clear_chat(self):
         """Clear the transcript. Nothing is saved, so nothing is
-        lost: no confirm is needed (L5)."""
+        lost: no confirm is needed (L5). The stats and the model's
+        memory of the conversation go with it: numbers and history
+        describing a conversation that no longer exists would lie."""
         self.transcript.clear()
+        self._last_stats = None
+        self._chat_history = []
+        self._refresh_stats()
 
     def _refresh_stats(self):
         total, free = read_ram_bytes()
@@ -2356,6 +2808,25 @@ class MainWindow(QMainWindow):
         if self.chat_worker is not None:
             self.chat_worker.cancel()
             self.chat_worker.wait(5000)
+        if self.import_worker is not None:
+            self.import_worker.cancel()
+            self.import_worker.wait(5000)
+        workers = (self._scan_worker, self.load_worker,
+                   self.chat_worker, self.import_worker)
+        if any(worker is not None and worker.isRunning()
+               for worker in workers):
+            # A worker is still running after its cancel and wait:
+            # a real load never checks for a cancel, so it runs
+            # until it finishes. Closing now would destroy a
+            # running thread and abort the process ("QThread:
+            # Destroyed while thread is still running"). Stay open
+            # and close once the workers finish.
+            self._close_pending = True
+            self._show_status_persistent(
+                "A model is still loading. Fyrn will close when "
+                "it finishes.")
+            event.ignore()
+            return
         if self.controller.is_loaded:
             self.controller.unload()
         super().closeEvent(event)

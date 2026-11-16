@@ -12,6 +12,30 @@ from the machine, never from a settings screen.
 import os
 import time
 
+# A reply never runs past this many tokens: a model that never
+# emits its stop token would otherwise run to context fill, which
+# is up to ~10 minutes on this PC. 1024 is a full answer from a
+# 2B model, and Stop still cuts it short.
+MAX_GENERATION_TOKENS = 1024
+
+# The conversation history sent with each message is trimmed to
+# this many characters (about 1000 tokens): half the smallest
+# context window, so the history plus the reply always fit.
+MAX_HISTORY_CHARS = 4096
+
+
+def trim_history(history, max_chars=MAX_HISTORY_CHARS):
+    """Trim a message list to the most recent turns that fit the
+    budget, dropping the oldest first. The newest exchange is
+    always kept, even over budget: a reply with no question in
+    front of it answers nothing."""
+    history = list(history)
+    total = sum(len(str(m.get("content", ""))) for m in history)
+    while total > max_chars and len(history) > 2:
+        dropped = history.pop(0)
+        total -= len(str(dropped.get("content", "")))
+    return history
+
 
 class RunnerError(Exception):
     """The model engine failed, in plain words."""
@@ -51,6 +75,12 @@ def auto_context_tokens(free_bytes):
 class Runner:
     """One loaded model. Subclasses do the real work."""
 
+    # True when a load in progress can actually be stopped. The
+    # real backend loads in one long opaque step that never checks
+    # for a cancel, so it says False and the UI stops promising a
+    # cancel it cannot deliver.
+    cancellable_load = True
+
     def __init__(self):
         self.model_path = None
 
@@ -80,10 +110,14 @@ class Runner:
         """Unload the model and free its RAM."""
         self.model_path = None
 
-    def generate(self, prompt, on_token=None, cancel_event=None):
+    def generate(self, prompt, on_token=None, cancel_event=None,
+                 history=None):
         """Stream a reply. Returns a stats dict.
 
         on_token is called with each piece of text as it arrives.
+        history is the earlier turns (a list of {"role": ...,
+        "content": ...} dicts), sent with the new message so the
+        model answers in context instead of forgetting every turn.
         Stats: tokens, elapsed_s, ttft_s (time to first token),
         tokens_per_sec.
         """
@@ -109,6 +143,9 @@ class FakeRunner(Runner):
         self.load_delay_s = load_delay_s
         self.token_delay_s = token_delay_s
         self.ttft_delay_s = ttft_delay_s
+        # The history the last generate() call received, so tests
+        # can check the conversation actually reached the runner.
+        self.last_history = None
 
     def load(self, path, progress_cb=None, cancel_event=None):
         started = time.monotonic()
@@ -127,9 +164,11 @@ class FakeRunner(Runner):
     def unload(self):
         super().unload()
 
-    def generate(self, prompt, on_token=None, cancel_event=None):
+    def generate(self, prompt, on_token=None, cancel_event=None,
+                 history=None):
         if not self.is_loaded:
             raise RunnerError("No model is loaded.")
+        self.last_history = list(history or [])
         started = time.monotonic()
         if self.ttft_delay_s > 0:
             time.sleep(self.ttft_delay_s)
@@ -158,6 +197,10 @@ class LlamaRunner(Runner):
     llama_cpp is imported lazily, inside load(), so the window opens
     and the tests run on a machine without the backend installed.
     """
+
+    # The Llama() constructor is one long opaque step: it never
+    # checks for a cancel, so a load in progress cannot be stopped.
+    cancellable_load = False
 
     def __init__(self, free_ram_fn=None):
         super().__init__()
@@ -224,16 +267,22 @@ class LlamaRunner(Runner):
         self._llm = None
         super().unload()
 
-    def generate(self, prompt, on_token=None, cancel_event=None):
+    def generate(self, prompt, on_token=None, cancel_event=None,
+                 history=None):
         if not self.is_loaded or self._llm is None:
             raise RunnerError("No model is loaded.")
         started = time.monotonic()
         ttft_s = None
         pieces = []
+        # The earlier turns go first, trimmed to the budget, so
+        # the model answers in context; the new message is last.
+        messages = trim_history(history or [])
+        messages.append({"role": "user", "content": prompt})
         try:
             stream = self._llm.create_chat_completion(
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 stream=True,
+                max_tokens=MAX_GENERATION_TOKENS,
             )
             for chunk in stream:
                 if cancel_event is not None and cancel_event.is_set():

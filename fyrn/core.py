@@ -10,7 +10,6 @@ import struct
 from pathlib import Path
 
 APP_NAME = "Fyrn"
-VERSION = "0.2"
 
 # Working headroom a loaded model needs on top of its file size:
 # the prompt context and working memory. 512 MB covers a 4096-token
@@ -108,18 +107,87 @@ def format_size(num_bytes) -> str:
 
 # ---------------------------------------------------------------- fit
 
+# Working memory a loaded model needs beyond its KV cache:
+# compute buffers and the like. Small and fixed; the KV cache is
+# the part that varies with the model and the context length.
+WORKING_BYTES = 64 * 1024 * 1024
 
-def fit_status(file_size_bytes, free_bytes):
+# KV cache element size: the backend stores keys and values as
+# 16-bit floats (2 bytes each).
+_KV_BYTES_PER_VALUE = 2
+
+
+def _is_count(value):
+    """True for a usable GGUF count (an int, not a bool)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def kv_cache_bytes_per_token(header):
+    """KV cache bytes per context token, from a GGUF header.
+
+    header is the dict from _read_gguf_kv (or read_gguf_metadata
+    plus read_gguf_numbers). Each layer stores one key vector and
+    one value vector per token, so the size is layers times (key
+    size plus value size) times 2 bytes. Returns None when the
+    header lacks what the calculation needs, so the caller falls
+    back to the fixed headroom instead of guessing.
+    """
+    arch = header.get("general.architecture")
+    if not isinstance(arch, str) or not arch:
+        return None
+    prefix = arch + "."
+    layers = header.get(prefix + "block_count")
+    if not _is_count(layers) or layers <= 0:
+        return None
+    heads = header.get(prefix + "attention.head_count")
+    heads_kv = header.get(prefix + "attention.head_count_kv", heads)
+    if not _is_count(heads_kv) or heads_kv <= 0:
+        return None
+    key_len = header.get(prefix + "attention.key_length")
+    if key_len is None:
+        # Head dimension from the embedding size and head count.
+        embd = header.get(prefix + "embedding_length")
+        if not _is_count(embd) or not _is_count(heads) or heads <= 0:
+            return None
+        key_len = embd // heads
+    value_len = header.get(prefix + "attention.value_length", key_len)
+    if not _is_count(key_len) or key_len <= 0:
+        return None
+    if not _is_count(value_len) or value_len <= 0:
+        return None
+    per_token = layers * (heads_kv * key_len + heads_kv * value_len)
+    return per_token * _KV_BYTES_PER_VALUE
+
+
+def model_headroom_bytes(path, context_tokens):
+    """RAM a model needs on top of its file size, from its own
+    GGUF header: the KV cache for the context length plus fixed
+    working memory. Falls back to the fixed headroom when the
+    header does not carry the numbers (not a GGUF file, or an
+    older format without them).
+    """
+    per_token = kv_cache_bytes_per_token(_read_gguf_kv(path))
+    if per_token is None:
+        return HEADROOM_BYTES
+    return per_token * max(0, int(context_tokens)) + WORKING_BYTES
+
+
+def fit_status(file_size_bytes, free_bytes, headroom_bytes=None):
     """How a model file fits in free RAM.
 
     "fits" - needs less than 3/4 of free RAM, desktop stays usable.
     "tight" - fits, but leaves little spare RAM.
     "too big" - needs more than free RAM outright.
     "unknown" - free RAM could not be read, so no call is made.
+    headroom_bytes is the RAM needed on top of the file size;
+    None means the fixed headroom (a model whose header was not
+    read, or has no KV numbers).
     """
     if free_bytes is None:
         return "unknown"
-    needed = file_size_bytes + HEADROOM_BYTES
+    if headroom_bytes is None:
+        headroom_bytes = HEADROOM_BYTES
+    needed = file_size_bytes + headroom_bytes
     if needed <= free_bytes * FITS_SHARE_NUM // FITS_SHARE_DEN:
         return "fits"
     if needed <= free_bytes:
@@ -127,14 +195,16 @@ def fit_status(file_size_bytes, free_bytes):
     return "too big"
 
 
-def ram_check(file_size_bytes, free_bytes):
+def ram_check(file_size_bytes, free_bytes, headroom_bytes=None):
     """Verdict before loading a model.
 
     Returns (verdict, message). Verdict is "ok", "warn", or "refuse".
     "unknown" RAM is "ok" with a note: with no numbers, refusing
     would block every load on a machine we cannot measure.
     """
-    status = fit_status(file_size_bytes, free_bytes)
+    if headroom_bytes is None:
+        headroom_bytes = HEADROOM_BYTES
+    status = fit_status(file_size_bytes, free_bytes, headroom_bytes)
     if status == "fits":
         return ("ok", "This model fits your PC.")
     if status == "unknown":
@@ -144,14 +214,14 @@ def ram_check(file_size_bytes, free_bytes):
         return ("warn",
                 "This model is tight on RAM (%s needed, %s free). "
                 "Close other programs first, or it may be slow."
-                % (format_size(file_size_bytes + HEADROOM_BYTES),
+                % (format_size(file_size_bytes + headroom_bytes),
                    format_size(free_bytes)))
     return ("refuse",
             "This model will not fit in free RAM (%s needed, %s "
             "free). It would run out of memory, so it was not "
             "loaded. Close other programs and try again, or pick a "
             "smaller model."
-            % (format_size(file_size_bytes + HEADROOM_BYTES),
+            % (format_size(file_size_bytes + headroom_bytes),
                format_size(free_bytes)))
 
 
@@ -221,13 +291,13 @@ class _GgufReader:
         return struct.unpack(code, self.read(size))[0]
 
 
-def read_gguf_metadata(path):
-    """Read the string metadata from a GGUF file's header.
+def _read_gguf_kv(path):
+    """Read every scalar entry from a GGUF file's header.
 
-    Returns a dict of key -> value for string-valued entries
-    (general.name, general.description, ...). Anything that is
-    not a readable GGUF file, or a header that cannot be parsed,
-    returns {} or a partial dict: a bad file never raises.
+    Returns a dict of key -> value for string and numeric entries
+    (arrays are skipped, not returned). Anything that is not a
+    readable GGUF file, or a header that cannot be parsed, returns
+    {} or a partial dict: a bad file never raises.
     """
     try:
         with open(path, "rb") as fh:
@@ -258,11 +328,35 @@ def read_gguf_metadata(path):
             key = reader.string()
             value_type = reader.u32()
             value = reader.value(value_type)
-            if isinstance(value, str):
+            if value is not None:
                 metadata[key] = value
     except (ValueError, struct.error, UnicodeDecodeError):
         pass  # partial metadata is still real metadata
     return metadata
+
+
+def read_gguf_metadata(path):
+    """Read the string metadata from a GGUF file's header.
+
+    Returns a dict of key -> value for string-valued entries
+    (general.name, general.description, ...). Anything that is
+    not a readable GGUF file, or a header that cannot be parsed,
+    returns {} or a partial dict: a bad file never raises.
+    """
+    return {key: value for key, value in _read_gguf_kv(path).items()
+            if isinstance(value, str)}
+
+
+def read_gguf_numbers(path):
+    """Read the numeric metadata from a GGUF file's header.
+
+    Returns a dict of key -> value for integer and float entries
+    (block counts, head counts, dimensions, ...). Same never-
+    raises promise as read_gguf_metadata.
+    """
+    return {key: value for key, value in _read_gguf_kv(path).items()
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)}
 
 
 def scan_models(folder):
@@ -297,17 +391,26 @@ def scan_models(folder):
         description = read_gguf_metadata(entry).get(
             "general.description", "")
         models.append({"name": entry.name, "path": entry,
-                       "size": size, "description": description})
+                       "size": size, "description": description,
+                       "source": "folder"})
     return models, skipped
 
 
-def import_gguf(source, folder):
+class ImportCancelled(Exception):
+    """The user stopped an import. No partial file is left."""
+
+
+def import_gguf(source, folder, progress_cb=None, cancel_event=None):
     """Copy a loose .gguf file into the models folder.
 
     Returns the destination path. If the file is already in the
-    folder, it is left alone and its path is returned. Raises
-    ValueError with a plain-words message for anything that is not
-    a readable .gguf file.
+    folder, it is left alone and its path is returned. The copy
+    runs in chunks: progress_cb(copied, total) reports it, and
+    cancel_event stops it. The copy lands in a .part file and is
+    moved into place only when complete, so a stopped or failed
+    import leaves no partial model behind. Raises ValueError with
+    a plain-words message for anything that is not a readable
+    .gguf file, and ImportCancelled when the copy is stopped.
     """
     src = Path(source)
     folder = ensure_models_folder(folder)
@@ -326,10 +429,75 @@ def import_gguf(source, folder):
             "A model called %s is already in your models folder."
             % src.name)
     try:
-        shutil.copy2(src, dest)
+        total = src.stat().st_size
     except OSError as exc:
+        raise ValueError("That file could not be read (%s)." % exc)
+    try:
+        free = shutil.disk_usage(folder).free
+    except OSError:
+        free = None
+    if free is not None and total > free:
+        raise ValueError(
+            "There is not enough disk space for %s (%s needed, %s "
+            "free)." % (src.name, format_size(total),
+                        format_size(free)))
+    part = dest.with_name(dest.name + ".part")
+    copied = 0
+    try:
+        with open(src, "rb") as in_fh, open(part, "wb") as out_fh:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ImportCancelled("Import stopped.")
+                chunk = in_fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                out_fh.write(chunk)
+                copied += len(chunk)
+                if progress_cb is not None:
+                    progress_cb(copied, total)
+    except ImportCancelled:
+        _drop_quietly(part)
+        raise
+    except OSError as exc:
+        _drop_quietly(part)
+        raise ValueError("The file could not be copied (%s)." % exc)
+    try:
+        os.replace(part, dest)
+    except OSError as exc:
+        _drop_quietly(part)
         raise ValueError("The file could not be copied (%s)." % exc)
     return dest
+
+
+def _drop_quietly(path):
+    """Delete a file if it is there; a missing file is fine."""
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
+
+
+def list_part_files(folder):
+    """Unfinished downloads in a folder: every *.part file, with
+    name, path, and size, sorted by name. The .etag and .url
+    sidecars belong to the .part file and are not listed."""
+    folder = Path(folder)
+    parts = []
+    if not folder.is_dir():
+        return parts
+    for entry in sorted(folder.iterdir(),
+                        key=lambda p: p.name.lower()):
+        if not entry.name.endswith(".part"):
+            continue
+        if entry.is_dir():
+            continue
+        try:
+            size = entry.stat().st_size
+        except OSError:
+            continue
+        parts.append({"name": entry.name, "path": entry,
+                      "size": size})
+    return parts
 
 
 def remove_gguf(path):
@@ -380,15 +548,33 @@ class ModelController:
             raise ModelNotFoundError(
                 "That model file is gone. It may have been moved or "
                 "deleted.")
-        size = path.stat().st_size
-        return ram_check(size, self._free_ram_fn())
+        try:
+            size = path.stat().st_size
+        except OSError:
+            # The file vanished between the check above and the
+            # stat: gone is gone, whatever the timing.
+            raise ModelNotFoundError(
+                "That model file is gone. It may have been moved or "
+                "deleted.")
+        free = self._free_ram_fn()
+        # The context length the runner will actually use decides
+        # the KV cache size, so the fit check uses the same number
+        # instead of a fixed guess.
+        from .runner import auto_context_tokens
+        headroom = model_headroom_bytes(
+            path, auto_context_tokens(free))
+        return ram_check(size, free, headroom)
 
-    def load(self, path, progress_cb=None, cancel_event=None):
+    def load(self, path, progress_cb=None, cancel_event=None,
+             display_name=None):
         """Load a model, auto-unloading the previous one.
 
         Raises ModelTooBigError when the RAM check refuses, without
         touching the currently loaded model. Returns a dict with
         load_time_s and warning ("" when the fit is clean).
+        display_name is the name the UI shows for the model (an
+        Ollama model's name, for example); the file name is used
+        when it is not given.
         """
         path = Path(path)
         verdict, message = self.check_before_load(path)
@@ -399,7 +585,7 @@ class ModelController:
         result = self.runner.load(
             path, progress_cb=progress_cb, cancel_event=cancel_event)
         self.current_path = path
-        self.current_name = path.name
+        self.current_name = display_name or path.name
         self.load_warning = message if verdict == "warn" else ""
         return {"load_time_s": result.get("load_time_s", 0.0),
                 "warning": self.load_warning}

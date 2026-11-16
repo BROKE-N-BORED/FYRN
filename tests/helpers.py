@@ -33,16 +33,18 @@ def file_bytes(path):
         return fh.read()
 
 
-def write_gguf_file(path, metadata, version=3):
+def write_gguf_file(path, metadata, version=3, numbers=None):
     """Write a minimal valid GGUF file with the given string
-    metadata (dict key -> str), plus one uint32 entry
+    metadata (dict key -> str) and numeric metadata (dict key ->
+    int, written as UINT32), plus one uint32 entry
     (general.file_type) and one string array, so parser tests
     have a real file to read. No tensors."""
     out = bytearray()
     out += b"GGUF"
     out += struct.pack("<I", version)
     entries = list(metadata.items())
-    kv_count = len(entries) + 2  # + uint32 entry + array entry
+    number_entries = list((numbers or {}).items())
+    kv_count = len(entries) + len(number_entries) + 2
     if version == 3:
         out += struct.pack("<Q", 0)  # tensor count
         out += struct.pack("<Q", kv_count)
@@ -59,6 +61,10 @@ def write_gguf_file(path, metadata, version=3):
         put_string(key)
         out.extend(struct.pack("<I", 8))  # STRING
         put_string(value)
+    for key, value in number_entries:
+        put_string(key)
+        out.extend(struct.pack("<I", 4))  # UINT32
+        out.extend(struct.pack("<I", value))
     # One non-string entry: general.file_type, uint32.
     put_string("general.file_type")
     out.extend(struct.pack("<I", 4))  # UINT32
@@ -81,11 +87,13 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
     that ignores Range (the download must restart from 0).
     Set FAIL_AFTER = N to drop the connection after N bytes (the
     download must fail, keeping the partial file for resume).
+    Set ETAG to a string to send it as the ETag header.
     """
 
     PAYLOAD = b""
     SUPPORT_RANGE = True
     FAIL_AFTER = None
+    ETAG = None
 
     def log_message(self, *args):  # keep test output clean
         pass
@@ -117,6 +125,8 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
             self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Accept-Ranges", "bytes")
+        if self.ETAG is not None:
+            self.send_header("ETag", self.ETAG)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -124,14 +134,19 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
             pass
 
 
-def start_range_server(payload, support_range=True, fail_after=None):
-    """Start a local server serving payload. Returns (server, url)."""
+def start_range_server(payload, support_range=True, fail_after=None,
+                       etag=None):
+    """Start a local server serving payload. Returns (server, url).
+    The bound handler class is on server.handler_class, so a test
+    can change its ETAG between requests."""
     handler = type("BoundHandler", (RangeRequestHandler,), {
         "PAYLOAD": payload,
         "SUPPORT_RANGE": support_range,
         "FAIL_AFTER": fail_after,
+        "ETAG": etag,
     })
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.handler_class = handler
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     url = "http://127.0.0.1:%d/model.gguf" % server.server_address[1]

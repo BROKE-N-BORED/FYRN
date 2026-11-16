@@ -3,17 +3,23 @@ import, and the one-model-at-a-time controller."""
 
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import fyrn.core
 from helpers import make_fake_gguf, write_gguf_file
-from fyrn.core import (HEADROOM_BYTES, ModelController,
-                             ModelNotFoundError, ModelTooBigError,
-                             default_models_folder, ensure_home,
-                             ensure_models_folder, fit_status,
-                             format_size, get_home, import_gguf,
+from fyrn.core import (HEADROOM_BYTES, WORKING_BYTES, ImportCancelled,
+                             ModelController, ModelNotFoundError,
+                             ModelTooBigError, default_models_folder,
+                             ensure_home, ensure_models_folder,
+                             fit_status, format_size, get_home,
+                             import_gguf, kv_cache_bytes_per_token,
+                             list_part_files, model_headroom_bytes,
                              ram_check, read_gguf_metadata,
-                             read_ram_bytes, remove_gguf, scan_models)
+                             read_gguf_numbers, read_ram_bytes,
+                             remove_gguf, scan_models)
 from fyrn.runner import FakeRunner
 
 GB = 1024 ** 3
@@ -372,6 +378,216 @@ class ControllerTests(unittest.TestCase):
             runner, free_ram_fn=lambda: 1024)
         verdict, _msg = ctrl_tiny.check_before_load(self.small)
         self.assertEqual(verdict, "refuse")
+
+
+class GgufNumbersTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_numbers_parse_and_strings_still_exclude_them(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf",
+            {"general.architecture": "llama"},
+            numbers={"llama.block_count": 24,
+                     "llama.attention.head_count": 16})
+        numbers = read_gguf_numbers(path)
+        self.assertEqual(numbers.get("llama.block_count"), 24)
+        self.assertEqual(numbers.get("llama.attention.head_count"),
+                         16)
+        # String metadata still excludes numbers (existing
+        # contract: read_gguf_metadata is strings only).
+        metadata = read_gguf_metadata(path)
+        self.assertNotIn("llama.block_count", metadata)
+        self.assertEqual(metadata.get("general.architecture"),
+                         "llama")
+
+    def test_garbage_file_returns_empty_numbers(self):
+        path = make_fake_gguf(self.folder / "fake.gguf", 2048)
+        self.assertEqual(read_gguf_numbers(path), {})
+
+
+class KvCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _header(self, **numbers):
+        header = {"general.architecture": "llama"}
+        header.update(numbers)
+        return header
+
+    def test_per_token_math(self):
+        # 24 layers, 4 KV heads, 128-dim keys and values:
+        # 24 * (4*128 + 4*128) values * 2 bytes = 49,152.
+        header = self._header(
+            **{"llama.block_count": 24,
+               "llama.attention.head_count": 16,
+               "llama.attention.head_count_kv": 4,
+               "llama.attention.key_length": 128,
+               "llama.attention.value_length": 128})
+        self.assertEqual(kv_cache_bytes_per_token(header), 49152)
+
+    def test_head_dim_derived_from_embedding(self):
+        # No key_length: embedding 2048 over 16 heads is 128.
+        header = self._header(
+            **{"llama.block_count": 2,
+               "llama.embedding_length": 2048,
+               "llama.attention.head_count": 16,
+               "llama.attention.head_count_kv": 2})
+        self.assertEqual(kv_cache_bytes_per_token(header),
+                         2 * (2 * 128 + 2 * 128) * 2)
+
+    def test_missing_pieces_return_none(self):
+        self.assertIsNone(kv_cache_bytes_per_token({}))
+        self.assertIsNone(kv_cache_bytes_per_token(
+            self._header(**{"llama.attention.head_count": 16})))
+        self.assertIsNone(kv_cache_bytes_per_token(
+            self._header(**{"llama.block_count": 24})))
+
+    def test_headroom_from_a_real_file(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf",
+            {"general.architecture": "llama"},
+            numbers={"llama.block_count": 2,
+                     "llama.attention.head_count": 4,
+                     "llama.attention.head_count_kv": 1,
+                     "llama.attention.key_length": 64,
+                     "llama.attention.value_length": 64})
+        # Per token: 2 * (64 + 64) * 2 = 512 bytes. At 2048
+        # context: 1 MB, plus the fixed working memory.
+        self.assertEqual(model_headroom_bytes(path, 2048),
+                         512 * 2048 + WORKING_BYTES)
+
+    def test_headroom_falls_back_without_numbers(self):
+        path = make_fake_gguf(self.folder / "fake.gguf", 2048)
+        self.assertEqual(model_headroom_bytes(path, 4096),
+                         HEADROOM_BYTES)
+
+
+class FitHeadroomTests(unittest.TestCase):
+    def test_explicit_headroom_moves_the_verdict(self):
+        free = 8 * GB
+        # 5 GB file, fixed 512 MB headroom: 5.5 GB of 8 GB fits.
+        self.assertEqual(fit_status(5 * GB, free), "fits")
+        # The same file with a real 2 GB headroom: 7 GB is tight.
+        self.assertEqual(fit_status(5 * GB, free, 2 * GB), "tight")
+        # With a real 4 GB headroom: 9 GB of 8 GB is too big.
+        self.assertEqual(fit_status(5 * GB, free, 4 * GB), "too big")
+        # And the other way: a 6 GB file is tight on the fixed
+        # headroom (6.5 GB) but fits on a small real one (6 GB).
+        self.assertEqual(fit_status(6 * GB, free), "tight")
+        self.assertEqual(fit_status(6 * GB, free, 0), "fits")
+
+    def test_ram_check_uses_the_headroom_in_its_message(self):
+        _verdict, message = ram_check(7 * GB, 8 * GB,
+                                      2 * GB)
+        self.assertIn("9.0 GB needed", message)
+
+
+class StatRaceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+        self.small = self.folder / "small.gguf"
+        self.small.write_bytes(b"x" * 1024)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_file_vanishing_between_checks_is_missing(self):
+        runner = FakeRunner()
+        ctrl = ModelController(runner, free_ram_fn=lambda: 8 * GB)
+        fake_path = mock.MagicMock()
+        fake_path.is_file.return_value = True
+        fake_path.stat.side_effect = OSError("vanished")
+        with mock.patch("fyrn.core.Path",
+                        return_value=fake_path):
+            with self.assertRaises(ModelNotFoundError):
+                ctrl.check_before_load(self.small)
+
+
+class ImportChunkedTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.folder = self.base / "models"
+        self.source = self.base / "elsewhere"
+        self.source.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_progress_reports_copied_and_total(self):
+        src = self.source / "big.gguf"
+        make_fake_gguf(src, 3 * 1024 * 1024)  # 3 chunks
+        seen = []
+        dest = import_gguf(
+            src, self.folder,
+            progress_cb=lambda c, t: seen.append((c, t)))
+        self.assertTrue(dest.is_file())
+        self.assertTrue(seen)
+        self.assertEqual(seen[-1], (3 * 1024 * 1024,
+                                    3 * 1024 * 1024))
+        self.assertFalse((self.folder / "big.gguf.part").exists())
+
+    def test_cancel_stops_and_leaves_nothing(self):
+        src = self.source / "big.gguf"
+        make_fake_gguf(src, 2 * 1024 * 1024)
+        event = threading.Event()
+        event.set()
+        with self.assertRaises(ImportCancelled):
+            import_gguf(src, self.folder, cancel_event=event)
+        self.assertFalse((self.folder / "big.gguf").exists())
+        self.assertFalse((self.folder / "big.gguf.part").exists())
+
+    def test_no_disk_space_refuses_plainly(self):
+        src = self.source / "big.gguf"
+        make_fake_gguf(src, 1024)
+        usage = mock.Mock()
+        usage.free = 512  # less than the file
+        with mock.patch("fyrn.core.shutil.disk_usage",
+                        return_value=usage):
+            with self.assertRaises(ValueError) as ctx:
+                import_gguf(src, self.folder)
+        self.assertIn("disk space", str(ctx.exception))
+        self.assertFalse((self.folder / "big.gguf").exists())
+
+
+class ListPartFilesTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_lists_parts_not_sidecars_or_models(self):
+        (self.folder / "a.gguf.part").write_bytes(b"x" * 100)
+        (self.folder / "a.gguf.part.url").write_text("http://x")
+        (self.folder / "a.gguf.part.etag").write_text("v1")
+        (self.folder / "done.gguf").write_bytes(b"y" * 50)
+        parts = list_part_files(self.folder)
+        self.assertEqual([p["name"] for p in parts],
+                         ["a.gguf.part"])
+        self.assertEqual(parts[0]["size"], 100)
+
+    def test_missing_folder_is_empty(self):
+        self.assertEqual(list_part_files(self.folder / "nope"), [])
+
+
+class DeadConstantTests(unittest.TestCase):
+    def test_no_dead_version_constant_in_core(self):
+        # The version lives in fyrn/__init__.py only; a second
+        # copy in core.py is how version drift starts.
+        self.assertFalse(hasattr(fyrn.core, "VERSION"))
+        self.assertEqual(fyrn.core.APP_NAME, "Fyrn")
 
 
 if __name__ == "__main__":

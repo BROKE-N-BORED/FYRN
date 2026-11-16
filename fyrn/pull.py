@@ -6,7 +6,9 @@ One input, two shapes: a Hugging Face model (user/repo plus the
 starting over. Standard library only.
 """
 
+import hashlib
 import http.client
+import json
 import os
 import re
 import time
@@ -89,8 +91,125 @@ def parse_model_input(text):
         "user/model-name file.gguf, or paste a direct .gguf link.")
 
 
+class _EtagChanged(Exception):
+    """The file upstream changed since the partial download: the
+    partial bytes belong to the old file, so the download must
+    start over instead of resuming."""
+
+
+def _drop_quietly(path):
+    """Delete a file if it is there; a missing file is fine."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _read_sidecar(path):
+    """A sidecar file's text, stripped, or None when it is missing
+    or unreadable."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _write_sidecar(path, text):
+    """Write a sidecar file. A failure is ignored: the sidecar is
+    a convenience for resume, never a reason to fail a download."""
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError:
+        pass
+
+
+def read_part_url(part_path):
+    """The address a partial download came from, saved alongside
+    it, or None when it was not saved (a partial file from before
+    this version, or one placed by hand)."""
+    return _read_sidecar(str(part_path) + ".url")
+
+
+def parse_hf_url(url):
+    """The Hugging Face repo and file for a download URL, or None
+    when the URL is not a Hugging Face file link."""
+    parsed = urlparse(url)
+    if parsed.netloc.lower() != "huggingface.co":
+        return None
+    parts = [piece for piece in parsed.path.split("/") if piece]
+    # huggingface.co/user/repo/resolve/rev/file.gguf
+    if len(parts) < 5 or parts[2] != "resolve":
+        return None
+    return ("%s/%s" % (parts[0], parts[1]), "/".join(parts[4:]))
+
+
+def fetch_hf_sha256(repo, filename,
+                    api_base="https://huggingface.co", opener=None):
+    """The SHA-256 Hugging Face publishes for a file, from the Hub
+    API's model page (the LFS oid for the file). Returns None when
+    the hash cannot be found: no hash means no verification, never
+    a failed pull."""
+    url = "%s/api/models/%s" % (api_base.rstrip("/"), repo)
+    open_url = opener or urllib.request.urlopen
+    try:
+        response = open_url(url, timeout=15)
+        try:
+            data = json.loads(response.read().decode("utf-8"))
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
+    for sibling in data.get("siblings") or []:
+        if sibling.get("rfilename") == filename:
+            lfs = sibling.get("lfs") or {}
+            oid = lfs.get("oid")
+            if oid:
+                return oid
+    return None
+
+
+def _sha256_file(path):
+    """The SHA-256 of a file, read in chunks."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_hash(part_path, url_sidecar, etag_sidecar,
+                 expected_sha256):
+    """Check a completed download against its published hash.
+    Nothing to check when no hash was given. A mismatch deletes
+    the download and its sidecars and raises DownloadError, so a
+    corrupt file never becomes a model."""
+    if expected_sha256 is None:
+        return
+    try:
+        actual = _sha256_file(part_path)
+    except OSError as exc:
+        raise DownloadError(
+            "The download could not be checked (%s)." % exc)
+    if actual.lower() != expected_sha256.strip().lower():
+        _drop_quietly(part_path)
+        _drop_quietly(url_sidecar)
+        _drop_quietly(etag_sidecar)
+        raise DownloadError(
+            "The downloaded file does not match the one "
+            "published (its checksum differs). It was deleted, "
+            "not saved as a model. Try pulling it again.")
+
+
 def download_file(url, dest, progress_cb=None, cancel_event=None,
-                  opener=None):
+                  opener=None, expected_sha256=None):
     """Download a URL to dest, resuming a partial file if there is one.
 
     The download lands in dest + ".part" and is moved into place only
@@ -99,13 +218,55 @@ def download_file(url, dest, progress_cb=None, cancel_event=None,
     is called after every chunk. cancel_event stops the download and
     keeps the partial file for the next try.
 
+    Two sidecars travel with the partial file: dest + ".part.url"
+    holds the address it came from (so it can be resumed later
+    without retyping it), and dest + ".part.etag" holds the
+    server's ETag for the file (so a resume against a changed
+    upstream file starts over instead of producing a corrupt
+    model). Both are removed when the download completes.
+
+    expected_sha256, when given, is checked against the completed
+    file before it is moved into place: a mismatch deletes the
+    download and raises DownloadError, so a corrupt file never
+    becomes a "model" that fails confusingly at load.
+
     Returns dest. Raises DownloadError or PullCancelled.
     """
     dest = str(dest)
     part_path = dest + ".part"
+    url_sidecar = part_path + ".url"
+    etag_sidecar = part_path + ".etag"
+    _write_sidecar(url_sidecar, url)
+    restarted = False
+    while True:
+        try:
+            return _download_once(
+                url, dest, part_path, url_sidecar, etag_sidecar,
+                progress_cb, cancel_event, opener, expected_sha256)
+        except _EtagChanged:
+            if restarted:
+                # The fresh attempt cannot resume, so it cannot
+                # raise this; if it ever did, refuse rather than
+                # loop forever.
+                raise DownloadError(
+                    "The download could not start.")
+            restarted = True
+            _drop_quietly(part_path)
+            _drop_quietly(url_sidecar)
+            _drop_quietly(etag_sidecar)
+            _write_sidecar(url_sidecar, url)
+
+
+def _download_once(url, dest, part_path, url_sidecar, etag_sidecar,
+                   progress_cb, cancel_event, opener,
+                   expected_sha256):
+    """One download attempt. Raises _EtagChanged when a resume
+    meets an upstream file that changed since the partial file."""
     existing = 0
     if os.path.exists(part_path):
         existing = os.path.getsize(part_path)
+    stored_etag = (_read_sidecar(etag_sidecar)
+                   if existing > 0 else None)
     request = urllib.request.Request(url)
     if existing > 0:
         request.add_header("Range", "bytes=%d-" % existing)
@@ -115,7 +276,11 @@ def download_file(url, dest, progress_cb=None, cancel_event=None,
     except urllib.error.HTTPError as exc:
         if exc.code == 416:
             # The partial file already covers the whole file.
+            _verify_hash(part_path, url_sidecar, etag_sidecar,
+                         expected_sha256)
             os.replace(part_path, dest)
+            _drop_quietly(url_sidecar)
+            _drop_quietly(etag_sidecar)
             return dest
         if exc.code == 404:
             raise DownloadError(
@@ -137,6 +302,17 @@ def download_file(url, dest, progress_cb=None, cancel_event=None,
 
     status = getattr(response, "status", 200)
     resumed = (status == 206)
+    # The upstream file changed since the partial download: the
+    # partial bytes belong to the old file. Start over, don't mix.
+    etag = response.headers.get("ETag")
+    if resumed and stored_etag and etag and stored_etag != etag:
+        try:
+            response.close()
+        except Exception:
+            pass
+        raise _EtagChanged()
+    if etag:
+        _write_sidecar(etag_sidecar, etag)
     total = None
     content_range = response.headers.get("Content-Range")
     if content_range and "/" in content_range:
@@ -191,5 +367,9 @@ def download_file(url, dest, progress_cb=None, cancel_event=None,
             "The download stopped early (%d of %d bytes). Try again "
             "and it will pick up where it stopped."
             % (downloaded, total))
+    _verify_hash(part_path, url_sidecar, etag_sidecar,
+                 expected_sha256)
     os.replace(part_path, dest)
+    _drop_quietly(url_sidecar)
+    _drop_quietly(etag_sidecar)
     return dest
