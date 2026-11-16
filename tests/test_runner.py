@@ -149,7 +149,7 @@ class LlamaRunnerTests(unittest.TestCase):
         # for the whole load and then jumped to 100%.)
         class FakeLlama:
             def __init__(self, model_path, n_threads, n_ctx,
-                         verbose):
+                         verbose, chat_handler=None):
                 time.sleep(0.05)  # a load takes a moment
 
         module = types.ModuleType("llama_cpp")
@@ -237,8 +237,10 @@ class FakeChatLlama:
 
     CREATED = []
 
-    def __init__(self, model_path, n_threads, n_ctx, verbose):
+    def __init__(self, model_path, n_threads, n_ctx, verbose,
+                 chat_handler=None):
         self.calls = []
+        self.chat_handler = chat_handler
         FakeChatLlama.CREATED.append(self)
 
     def create_chat_completion(self, messages, stream,
@@ -291,6 +293,173 @@ class LlamaGenerateTests(unittest.TestCase):
         _messages, max_tokens = FakeChatLlama.CREATED[0].calls[0]
         self.assertEqual(max_tokens, MAX_GENERATION_TOKENS)
         self.assertEqual(MAX_GENERATION_TOKENS, 1024)
+
+
+class FakeMTMDChatHandler:
+    """A stand-in for llama_cpp's MTMDChatHandler: records how
+    it was built (CPU only, never the GPU)."""
+
+    CREATED = []
+    FAIL = False
+
+    def __init__(self, clip_model_path, verbose=True, use_gpu=True):
+        if FakeMTMDChatHandler.FAIL:
+            raise RuntimeError("projector is broken")
+        self.clip_model_path = clip_model_path
+        self.verbose = verbose
+        self.use_gpu = use_gpu
+        FakeMTMDChatHandler.CREATED.append(self)
+
+
+class VisionTests(unittest.TestCase):
+    """Vision, with the engine's vision path mocked: no real
+    vision model exists in the sandbox, so these tests prove the
+    wiring (projector found, handler built CPU-only, images sent
+    as data: URLs), not that the engine sees."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+        FakeChatLlama.CREATED.clear()
+        FakeMTMDChatHandler.CREATED.clear()
+        FakeMTMDChatHandler.FAIL = False
+        self.picture = self.folder / "photo.png"
+        self.picture.write_bytes(b"\x89PNG fake image bytes")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _modules(self):
+        module = types.ModuleType("llama_cpp")
+        module.Llama = FakeChatLlama
+        chat_format = types.ModuleType("llama_cpp.llama_chat_format")
+        chat_format.MTMDChatHandler = FakeMTMDChatHandler
+        return {"llama_cpp": module,
+                "llama_cpp.llama_chat_format": chat_format}
+
+    def _model(self, name="model.gguf", projector=None):
+        path = self.folder / name
+        path.write_bytes(b"x" * 2048)
+        if projector is not None:
+            (self.folder / projector).write_bytes(b"p" * 100)
+        return path
+
+    def _load(self, path):
+        runner = LlamaRunner()
+        with mock.patch.dict(sys.modules, self._modules()):
+            result = runner.load(str(path))
+        return runner, result
+
+    def test_fake_runner_records_images(self):
+        runner = FakeRunner(supports_vision=True)
+        runner.load("model.gguf")
+        runner.generate("what is this?",
+                        images=[str(self.picture)])
+        self.assertEqual(runner.last_images, [str(self.picture)])
+
+    def test_fake_runner_refuses_images_without_vision(self):
+        runner = FakeRunner()  # supports_vision=False
+        runner.load("model.gguf")
+        with self.assertRaises(Exception) as ctx:
+            runner.generate("what is this?",
+                            images=[str(self.picture)])
+        self.assertIn("cannot see images", str(ctx.exception))
+
+    def test_projector_loads_vision_cpu_only(self):
+        path = self._model(projector="mmproj-model.gguf")
+        runner, result = self._load(path)
+        self.assertTrue(runner.supports_vision)
+        self.assertEqual(runner.projector_path,
+                         str(self.folder / "mmproj-model.gguf"))
+        self.assertNotIn("vision_warning", result)
+        handler = FakeMTMDChatHandler.CREATED[0]
+        self.assertEqual(handler.clip_model_path,
+                         str(self.folder / "mmproj-model.gguf"))
+        self.assertFalse(handler.use_gpu)
+        self.assertFalse(handler.verbose)
+        self.assertIs(FakeChatLlama.CREATED[0].chat_handler, handler)
+
+    def test_broken_projector_loads_text_only(self):
+        FakeMTMDChatHandler.FAIL = True
+        path = self._model(projector="mmproj-model.gguf")
+        runner, result = self._load(path)
+        # The load still succeeds: a projector that cannot be used
+        # never blocks the model itself.
+        self.assertTrue(runner.is_loaded)
+        self.assertFalse(runner.supports_vision)
+        self.assertIsNone(runner.projector_path)
+        self.assertIn("projector file could not be used",
+                      result["vision_warning"])
+
+    def test_vision_model_without_projector_warns(self):
+        from helpers import write_gguf_file
+        path = write_gguf_file(
+            self.folder / "qwen3vl.gguf",
+            {"general.architecture": "qwen3vl"})
+        runner, result = self._load(path)
+        self.assertTrue(runner.is_loaded)
+        self.assertFalse(runner.supports_vision)
+        self.assertIn("projector file is not next to it",
+                      result["vision_warning"])
+
+    def test_text_model_loads_without_warning(self):
+        path = self._model()
+        _runner, result = self._load(path)
+        self.assertNotIn("vision_warning", result)
+
+    def test_images_sent_as_data_urls(self):
+        path = self._model(projector="mmproj-model.gguf")
+        runner, _result = self._load(path)
+        runner.generate("what is in this picture?",
+                        images=[str(self.picture)])
+        llama = FakeChatLlama.CREATED[0]
+        messages, _max_tokens = llama.calls[0]
+        user_message = messages[-1]
+        self.assertEqual(user_message["role"], "user")
+        parts = user_message["content"]
+        self.assertEqual(parts[0],
+                         {"type": "text",
+                          "text": "what is in this picture?"})
+        self.assertEqual(parts[1]["type"], "image_url")
+        url = parts[1]["image_url"]["url"]
+        self.assertTrue(url.startswith("data:image/png;base64,"))
+        import base64
+        self.assertEqual(base64.b64decode(url.split(",", 1)[1]),
+                         b"\x89PNG fake image bytes")
+
+    def test_images_without_vision_refused(self):
+        path = self._model()
+        runner, _result = self._load(path)
+        with self.assertRaises(Exception) as ctx:
+            runner.generate("what is this?",
+                            images=[str(self.picture)])
+        self.assertIn("cannot see images", str(ctx.exception))
+
+    def test_bad_image_type_refused(self):
+        path = self._model(projector="mmproj-model.gguf")
+        runner, _result = self._load(path)
+        gif = self.folder / "anim.gif"
+        gif.write_bytes(b"GIF89a")
+        with self.assertRaises(Exception) as ctx:
+            runner.generate("what is this?", images=[str(gif)])
+        self.assertIn("PNG or JPEG", str(ctx.exception))
+
+    def test_unreadable_image_refused(self):
+        path = self._model(projector="mmproj-model.gguf")
+        runner, _result = self._load(path)
+        with self.assertRaises(Exception) as ctx:
+            runner.generate(
+                "what is this?",
+                images=[str(self.folder / "gone.png")])
+        self.assertIn("could not be read", str(ctx.exception))
+
+    def test_unload_clears_vision(self):
+        path = self._model(projector="mmproj-model.gguf")
+        runner, _result = self._load(path)
+        self.assertTrue(runner.supports_vision)
+        runner.unload()
+        self.assertFalse(runner.supports_vision)
+        self.assertIsNone(runner.projector_path)
 
 
 if __name__ == "__main__":

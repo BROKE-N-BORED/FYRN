@@ -14,7 +14,7 @@ import json
 import os
 from pathlib import Path
 
-from .core import read_gguf_metadata
+from .core import read_gguf_facts, read_gguf_metadata
 
 _MODEL_LAYER = "application/vnd.ollama.image.model"
 
@@ -111,10 +111,13 @@ def discover_ollama_models(store_dirs=None):
             seen_names.add(name)
             # The description comes from the blob's own GGUF
             # header, the same as a folder model: never invented.
+            # The facts (parameter count, quantization, context
+            # length) come from the same header.
             description = read_gguf_metadata(blob).get(
                 "general.description", "")
             models.append({"name": name, "path": blob, "size": size,
                            "description": description,
-                           "source": "ollama"})
+                           "source": "ollama",
+                           "facts": read_gguf_facts(blob)})
     models.sort(key=lambda m: m["name"].lower())
     return models, warnings

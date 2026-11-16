@@ -29,6 +29,29 @@ class PullCancelled(Exception):
     """The user cancelled a pull. The partial file stays for resume."""
 
 
+def format_eta(seconds):
+    """Time remaining in plain words: "about 40 s left",
+    "about 3 min left", "about 1 h 20 min left". None when there
+    is no time to estimate (no speed yet, or nothing left)."""
+    if seconds is None:
+        return None
+    seconds = int(seconds)
+    if seconds <= 0:
+        return None
+    if seconds < 10:
+        return "less than 10 seconds left"
+    if seconds < 60:
+        return "about %d s left" % seconds
+    minutes = seconds // 60
+    if minutes < 60:
+        return "about %d min left" % minutes
+    hours = minutes // 60
+    rest = minutes % 60
+    if rest:
+        return "about %d h %d min left" % (hours, rest)
+    return "about %d h left" % hours
+
+
 class DownloadTarget:
     """A parsed pull request: a URL and the file name to save."""
 

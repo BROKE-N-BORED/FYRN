@@ -54,7 +54,24 @@ class InstallScriptTests(unittest.TestCase):
     def test_install_sh_bakes_app_dir_into_desktop(self):
         text = read("install.sh")
         self.assertIn("__APP_DIR__", text)
+        self.assertIn("__HOME__", text)
         self.assertIn(".local/share/applications", text)
+
+    def test_install_sh_installs_launcher_from_template(self):
+        # The launcher is installed from launcher.sh (which finds
+        # the folder again if it moved), not written inline.
+        text = read("install.sh")
+        self.assertIn("launcher.sh", text)
+        self.assertIn(".local/bin/fyrn", text)
+
+    def test_install_sh_checks_disk_space_first(self):
+        # 1 GB floor, plain message, before the venv is created.
+        text = read("install.sh")
+        self.assertIn("df -P -k", text)
+        self.assertIn("1048576", text)
+        self.assertIn("Not enough free disk space", text)
+        self.assertLess(text.index("df -P -k"),
+                        text.index("python3 -m venv"))
 
     def test_run_sh_launches_from_venv(self):
         text = read("run.sh")
@@ -66,9 +83,15 @@ class InstallScriptTests(unittest.TestCase):
         # `python -m fyrn` only finds the package when the terminal
         # happens to be in the app folder (caught by the install
         # sim: "No module named fyrn" from $HOME).
-        text = read("install.sh")
+        text = read("launcher.sh")
         self.assertIn("PYTHONPATH=", text)
-        self.assertIn(".local/bin/fyrn", text)
+        self.assertIn(".venv/bin/python\" -m fyrn", text)
+
+    def test_launcher_template_has_app_dir_placeholder(self):
+        text = read("launcher.sh")
+        self.assertIn('APP_DIR="__APP_DIR__"', text)
+        self.assertIn("find", text)  # the moved-folder search
+        self.assertIn("exec", text)
 
 
 class DesktopFileTests(unittest.TestCase):
@@ -85,13 +108,15 @@ class DesktopFileTests(unittest.TestCase):
         self.assertNotIn("%k", entries["Exec"])
         self.assertNotIn("%k", entries.get("Icon", ""))
 
-    def test_app_desktop_exec_and_icon_use_app_dir(self):
+    def test_app_desktop_exec_uses_launcher_icon_uses_app_dir(self):
+        # The icon starts Fyrn through the launcher (which finds
+        # the folder again if it moved); the icon image still
+        # comes from the app folder.
         entries = self._entries("Fyrn.desktop")
-        self.assertIn("__APP_DIR__", entries["Exec"])
+        self.assertEqual(entries["Exec"],
+                         "__HOME__/.local/bin/fyrn")
         self.assertEqual(entries["Icon"],
                          "__APP_DIR__/assets/fyrn-48.png")
-        self.assertIn("python3 -c", entries["Exec"])
-        self.assertIn("run.sh", entries["Exec"])
 
     def test_app_desktop_exec_has_no_nested_quotes(self):
         # GLib's desktop parser rejects nested escaped quotes in
@@ -128,8 +153,11 @@ class DesktopFileTests(unittest.TestCase):
 class ProjectFileTests(unittest.TestCase):
     def test_requirements(self):
         text = read("requirements.txt")
-        self.assertIn("PySide6-Essentials", text)
-        self.assertIn("llama-cpp-python", text)
+        # Pinned: an unpinned install drifts with every release,
+        # and a new llama-cpp-python can break the vision handler
+        # or the load path without warning.
+        self.assertIn("PySide6-Essentials==6.12.0", text)
+        self.assertIn("llama-cpp-python==0.3.36", text)
         # llama-cpp-python has no PyPI wheels: without the CPU wheel
         # index + --only-binary, pip builds llama.cpp from source
         # (needs gcc + cmake + a long compile). Pin both lines so the
@@ -232,7 +260,197 @@ class ZipBuilderTests(unittest.TestCase):
                                "fyrn/tests/test_gui.py",
                                "fyrn/assets/fyrn-48.png"):
                     self.assertIn(wanted, names)
+                # The whole tree ships, minus the documented
+                # exclusions: a new file forgotten from the
+                # builder's hand-maintained list fails here, not
+                # on the user's PC. Excluded: caches and build
+                # artifacts (__pycache__, *.pyc, *.zip), the venv
+                # and git, and CI-STATUS.md (the CI verdict file
+                # rides in the push, not in the zip).
+                expected = set()
+                for dirpath, dirnames, filenames in os.walk(copy):
+                    dirnames[:] = [
+                        d for d in dirnames
+                        if d not in ("__pycache__", ".venv", ".git")]
+                    for name in filenames:
+                        if name.endswith((".pyc", ".zip")):
+                            continue
+                        rel = os.path.relpath(
+                            os.path.join(dirpath, name), copy)
+                        if rel == "CI-STATUS.md":
+                            continue
+                        expected.add("fyrn/" + rel)
+                self.assertEqual(set(names), expected)
             self.assertIn("modes ok: True", result.stdout)
+
+
+class DiskSpaceTests(unittest.TestCase):
+    """The installer's disk-space check, with a fake df earlier
+    in PATH than the real one."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.bin = self.base / "bin"
+        self.bin.mkdir()
+        self.copy = self.base / "fyrn"
+        shutil.copytree(
+            ROOT, self.copy,
+            ignore=shutil.ignore_patterns(
+                "__pycache__", "*.zip", "*.pyc"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _fake_df(self, available_kb=None):
+        # A df that reports the given free space (or nothing at
+        # all, when available_kb is None).
+        script = self.bin / "df"
+        if available_kb is None:
+            script.write_text("#!/bin/sh\nexit 1\n")
+        else:
+            script.write_text(
+                "#!/bin/sh\n"
+                "echo 'Filesystem 1024-blocks Used Available "
+                "Capacity Mounted on'\n"
+                "echo '/dev/fake 100000000 90000000 %d 90%% /tmp'\n"
+                % available_kb)
+        script.chmod(0o755)
+
+    def _run_install(self):
+        env = dict(os.environ)
+        env["PATH"] = "%s:%s" % (self.bin, os.environ["PATH"])
+        env["HOME"] = str(self.home)
+        return subprocess.run(
+            ["bash", "install.sh"], cwd=str(self.copy),
+            capture_output=True, text=True, timeout=120, env=env)
+
+    def test_tiny_free_space_refuses_to_install(self):
+        self._fake_df(available_kb=100)
+        result = self._run_install()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Not enough free disk space",
+                      result.stdout)
+        self.assertFalse((self.copy / ".venv").exists())
+
+    def test_unmeasurable_space_warns_and_continues(self):
+        # df fails: the installer warns and carries on to the
+        # python check (which fails here because the fake python3
+        # below cannot import venv — the point is the install got
+        # past the disk check instead of stopping on it).
+        self._fake_df(available_kb=None)
+        fake_python = self.bin / "python3"
+        fake_python.write_text("#!/bin/sh\nexit 1\n")
+        fake_python.chmod(0o755)
+        result = self._run_install()
+        self.assertIn("Could not check free disk space",
+                      result.stdout)
+        self.assertIn("python3-venv is missing", result.stdout)
+        self.assertEqual(result.returncode, 1)
+
+
+class LauncherTests(unittest.TestCase):
+    """The self-healing launcher: a moved folder is found again,
+    and a move it cannot resolve says so plainly."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.home = self.base / "home"
+        self.home.mkdir()
+        (self.home / ".local" / "bin").mkdir(parents=True)
+        (self.home / ".local" / "share" / "applications").mkdir(
+            parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _install_dir(self, *parts):
+        """A fake Fyrn install: install.sh, the fyrn package, and
+        a stub venv python that prints a marker when run."""
+        folder = self.home.joinpath(*parts)
+        folder.mkdir(parents=True)
+        (folder / "install.sh").write_text("#!/usr/bin/env bash\n")
+        (folder / "fyrn").mkdir()
+        (folder / "fyrn" / "__init__.py").write_text(
+            '__version__ = "0.4"\n')
+        venv_bin = folder / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        stub = venv_bin / "python"
+        stub.write_text(
+            "#!/bin/sh\necho FYRN-STARTED-FROM %s\n"
+            % folder)
+        stub.chmod(0o755)
+        return folder
+
+    def _install_launcher(self, app_dir):
+        launcher = self.home / ".local" / "bin" / "fyrn"
+        text = read("launcher.sh").replace("__APP_DIR__",
+                                           str(app_dir))
+        launcher.write_text(text)
+        launcher.chmod(0o755)
+        return launcher
+
+    def _desktop_file(self, app_dir):
+        desktop = (self.home / ".local" / "share" / "applications"
+                   / "Fyrn.desktop")
+        desktop.write_text(
+            "[Desktop Entry]\nType=Application\nName=Fyrn\n"
+            "Exec=%s/.local/bin/fyrn\n"
+            "Icon=%s/assets/fyrn-48.png\n"
+            % (self.home, app_dir))
+        return desktop
+
+    def _run_launcher(self, launcher):
+        env = dict(os.environ)
+        env["HOME"] = str(self.home)
+        return subprocess.run(
+            [str(launcher)], capture_output=True, text=True,
+            timeout=60, env=env)
+
+    def test_fast_path_starts_fyrn_unchanged(self):
+        folder = self._install_dir("fyrn")
+        launcher = self._install_launcher(folder)
+        before = launcher.read_bytes()
+        result = self._run_launcher(launcher)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("FYRN-STARTED-FROM %s" % folder,
+                      result.stdout)
+        self.assertEqual(launcher.read_bytes(), before)
+
+    def test_moved_folder_is_found_and_healed(self):
+        folder = self._install_dir("moved", "fyrn")
+        old = self.home / "old" / "fyrn"
+        launcher = self._install_launcher(old)
+        desktop = self._desktop_file(old)
+        result = self._run_launcher(launcher)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("FYRN-STARTED-FROM %s" % folder,
+                      result.stdout)
+        # The launcher rewrote itself to the new folder, and the
+        # desktop icon points there too.
+        self.assertIn('APP_DIR="%s"' % folder,
+                      launcher.read_text())
+        self.assertIn("Icon=%s/assets/fyrn-48.png" % folder,
+                      desktop.read_text())
+
+    def test_two_folders_is_an_error_not_a_guess(self):
+        self._install_dir("one", "fyrn")
+        self._install_dir("two", "fyrn")
+        launcher = self._install_launcher(self.home / "old" / "fyrn")
+        result = self._run_launcher(launcher)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("more than one Fyrn folder", result.stderr)
+
+    def test_no_folder_is_a_plain_error(self):
+        launcher = self._install_launcher(self.home / "old" / "fyrn")
+        result = self._run_launcher(launcher)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not find its new folder",
+                      result.stderr)
+        self.assertIn("bash install.sh", result.stderr)
 
 
 if __name__ == "__main__":

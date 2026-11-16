@@ -8,11 +8,13 @@ import re
 import tempfile
 import time
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
-from PySide6.QtCore import QPoint, QBuffer, QIODevice, QRect, QTimer, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import (QBuffer, QEvent, QIODevice, QMimeData,
+                             QPoint, QRect, QTimer, Qt, QUrl)
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (QApplication, QLabel, QLineEdit,
                                QMessageBox, QPushButton, QSystemTrayIcon,
@@ -117,8 +119,13 @@ class GuiTestCase(unittest.TestCase):
         self.settings_file = self.base / "settings.ini"
         self._old_home = os.environ.get("FYRN_HOME")
         self._old_settings = os.environ.get("FYRN_SETTINGS_FILE")
+        self._old_xdg = os.environ.get("XDG_DATA_HOME")
         os.environ["FYRN_HOME"] = str(self.home)
         os.environ["FYRN_SETTINGS_FILE"] = str(self.settings_file)
+        # The trash lives in the temp dir too: a remove test must
+        # never touch the real ~/.local/share/Trash.
+        self.data_home = self.base / "data"
+        os.environ["XDG_DATA_HOME"] = str(self.data_home)
         set_models_folder(self.models)
         # Discovery is off by default in tests: the sandbox has a
         # real Ollama store, and its models would appear in every
@@ -155,6 +162,10 @@ class GuiTestCase(unittest.TestCase):
             os.environ.pop("FYRN_SETTINGS_FILE", None)
         else:
             os.environ["FYRN_SETTINGS_FILE"] = self._old_settings
+        if self._old_xdg is None:
+            os.environ.pop("XDG_DATA_HOME", None)
+        else:
+            os.environ["XDG_DATA_HOME"] = self._old_xdg
         self.tmp.cleanup()
 
     def make_window(self, runner=None):
@@ -1202,10 +1213,12 @@ class RemoveModelTests(GuiTestCase):
                       window.model_cards)
         self.assertTrue(
             any("Remove alpha.gguf" in text and "2 KB" in text
+                and "moves the file to the trash" in text
                 for _title, text in self.watcher.seen),
-            "no remove confirm naming the file and size appeared")
+            "no remove confirm naming the file, size, and trash "
+            "appeared")
 
-    def test_remove_yes_deletes_file(self):
+    def test_remove_yes_moves_to_trash(self):
         window = self._one_model()
         self._select(window)
         timer = self._answer_yes()
@@ -1218,7 +1231,13 @@ class RemoveModelTests(GuiTestCase):
         self.assertFalse((self.models / "alpha.gguf").exists())
         self.assertNotIn(str(self.models / "alpha.gguf"),
                          window.model_cards)
-        self.assertIn("removed",
+        # The file is in the trash, recoverable, not deleted.
+        trash_file = (self.data_home / "Trash" / "files"
+                      / "alpha.gguf")
+        self.assertTrue(trash_file.is_file())
+        self.assertTrue((self.data_home / "Trash" / "info"
+                         / "alpha.gguf.trashinfo").is_file())
+        self.assertIn("moved to the trash",
                       window.statusBar().currentMessage())
 
     def test_remove_loaded_model_unloads_first(self):
@@ -1321,7 +1340,10 @@ class PullWindowTests(GuiTestCase):
         self.assertIn("could not understand",
                       pull.status_label.text())
 
-    def test_pull_already_there(self):
+    def test_pull_already_there_asks_to_replace(self):
+        # A model that is already there asks about pulling over
+        # it (default No, the same confirm habit as Remove),
+        # instead of refusing outright.
         make_fake_gguf(self.models / "model.gguf", 1024)
         server, url = start_range_server(PAYLOAD)
         self.servers.append(server)
@@ -1329,10 +1351,15 @@ class PullWindowTests(GuiTestCase):
         pull.input.setText(url)
         pull.pull_button.click()
         QTest.qWait(300)
+        # The watcher clicks the default button (No): no pull
+        # starts, and the file is untouched.
         self.assertIsNone(pull.worker)
-        self.assertEqual(self.watcher.seen, [])
-        self.assertIn("already in your models folder",
-                      pull.status_label.text())
+        self.assertEqual(
+            (self.models / "model.gguf").stat().st_size, 1024)
+        self.assertTrue(
+            any("Pull it again and replace it" in text
+                for _title, text in self.watcher.seen),
+            "no re-pull confirm appeared")
 
     def test_download_failure_shows_modal_and_status(self):
         # The one pull error that keeps the modal: a download
@@ -2274,6 +2301,547 @@ class KvCacheGuiTests(GuiTestCase):
         # memory), not the 512 MB fixed fallback.
         self.assertIn("Needs 64", tip)
         self.assertNotIn("512 MB", tip)
+
+
+class PullQueueTests(GuiTestCase):
+    def make_pull_window(self):
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        return pull
+
+    def _url_for(self, server_url, name):
+        # The fake server serves its payload at any path, so one
+        # server stands in for several models.
+        return server_url.replace("model.gguf", name)
+
+    def test_queue_pulls_in_order(self):
+        server, url = start_range_server(PAYLOAD)
+        self.servers.append(server)
+        pull = self.make_pull_window()
+        pulled = []
+        pull.model_pulled.connect(pulled.append)
+        for name in ("one.gguf", "two.gguf", "three.gguf"):
+            pull.input.setText(self._url_for(url, name))
+            pull.queue_add_button.click()
+        self.assertEqual(len(pull.queue), 3)
+        self.assertTrue(pull.queue_list.isVisible())
+        self.assertEqual(pull.queue_list.count(), 3)
+        pull.queue_pull_button.click()
+        ok = pump_until(
+            lambda: len(pulled) == 3 and not pull._queue_running,
+            10000)
+        self.assertTrue(ok, "queue did not finish")
+        self.assertEqual(pulled, [str(self.models / name)
+                                  for name in ("one.gguf", "two.gguf",
+                                               "three.gguf")])
+        for name in ("one.gguf", "two.gguf", "three.gguf"):
+            self.assertEqual(file_bytes(self.models / name), PAYLOAD)
+        self.assertTrue(all(item["status"] == "done"
+                            for item in pull.queue))
+        self.assertIn("Queue done. 3 models pulled.",
+                      pull.status_label.text())
+
+    def test_queue_duplicate_refused(self):
+        pull = self.make_pull_window()
+        pull.input.setText("http://127.0.0.1:9/one.gguf")
+        pull.queue_add_button.click()
+        pull.input.setText("http://127.0.0.1:9/one.gguf")
+        pull.queue_add_button.click()
+        self.assertEqual(len(pull.queue), 1)
+        self.assertIn("already in the queue",
+                      pull.status_label.text())
+
+    def test_queue_remove_drops_item(self):
+        pull = self.make_pull_window()
+        pull.input.setText("http://127.0.0.1:9/one.gguf")
+        pull.queue_add_button.click()
+        pull.input.setText("http://127.0.0.1:9/two.gguf")
+        pull.queue_add_button.click()
+        pull.queue_list.setCurrentRow(0)
+        pull.queue_remove_button.click()
+        self.assertEqual(len(pull.queue), 1)
+        self.assertEqual(pull.queue[0]["target"].filename,
+                         "two.gguf")
+
+    def test_queue_failure_stops_queue(self):
+        server, url = start_range_server(PAYLOAD)
+        self.servers.append(server)
+        pull = self.make_pull_window()
+        pulled = []
+        pull.model_pulled.connect(pulled.append)
+        pull.input.setText(self._url_for(url, "one.gguf"))
+        pull.queue_add_button.click()
+        pull.input.setText("http://127.0.0.1:1/dead.gguf")
+        pull.queue_add_button.click()
+        pull.input.setText(self._url_for(url, "three.gguf"))
+        pull.queue_add_button.click()
+        pull.queue_pull_button.click()
+        ok = pump_until(
+            lambda: pull.worker is None and not pull._queue_running,
+            10000)
+        self.assertTrue(ok, "queue did not stop after the failure")
+        self.assertEqual(pulled, [str(self.models / "one.gguf")])
+        self.assertFalse((self.models / "three.gguf").exists())
+        self.assertEqual([item["status"] for item in pull.queue],
+                         ["done", "failed", "waiting"])
+        # The failure modal appeared (the watcher dismissed it).
+        self.assertTrue(self.watcher.seen)
+
+    def test_queue_cancel_stops_queue(self):
+        # Deterministic: drive the cancel handler with a running
+        # queue state, instead of racing a real download.
+        pull = self.make_pull_window()
+        pull.input.setText("http://127.0.0.1:9/one.gguf")
+        pull.queue_add_button.click()
+        pull.input.setText("http://127.0.0.1:9/two.gguf")
+        pull.queue_add_button.click()
+        pull._queue_running = True
+        pull._queue_item = pull.queue[0]
+        pull.queue[0]["status"] = "downloading"
+        pull._on_cancelled()
+        self.assertFalse(pull._queue_running)
+        self.assertEqual(pull.queue[0]["status"], "stopped")
+        self.assertEqual(pull.queue[1]["status"], "waiting")
+
+    def test_empty_queue_means_no_section(self):
+        pull = self.make_pull_window()
+        self.assertFalse(pull.queue_list.isVisible())
+
+
+class PullEtaTests(GuiTestCase):
+    def make_pull_window(self):
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        return pull
+
+    def test_eta_shows_time_left(self):
+        pull = self.make_pull_window()
+        pull._on_progress(0, 600 * 1024 * 1024, 1024 * 1024)
+        self.assertIn("about 10 min left",
+                      pull.status_label.text())
+
+    def test_eta_is_smoothed(self):
+        pull = self.make_pull_window()
+        pull._on_progress(0, 600 * 1024 * 1024, 1024 * 1024)
+        self.assertIn("about 10 min left",
+                      pull.status_label.text())
+        # The raw figure is now 1 minute, but the smoothed figure
+        # is 0.7 * 600 + 0.3 * 60 = 438 s: about 7 min.
+        pull._on_progress(540 * 1024 * 1024, 600 * 1024 * 1024,
+                          1024 * 1024)
+        self.assertIn("about 7 min left",
+                      pull.status_label.text())
+
+    def test_no_eta_without_speed(self):
+        pull = self.make_pull_window()
+        pull._on_progress(50 * 1024 * 1024, 100 * 1024 * 1024, 0)
+        self.assertNotIn("left", pull.status_label.text())
+
+
+class BlurValidationTests(GuiTestCase):
+    def make_pull_window(self):
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        return pull
+
+    def test_bad_input_errors_on_blur(self):
+        pull = self.make_pull_window()
+        pull.input.setText("just some words here")
+        pull.input.editingFinished.emit()
+        self.assertIn("could not understand",
+                      pull.status_label.text())
+
+    def test_good_input_clears_error(self):
+        pull = self.make_pull_window()
+        pull.input.setText("just some words here")
+        pull.input.editingFinished.emit()
+        self.assertIn("could not understand",
+                      pull.status_label.text())
+        pull.input.setText("http://127.0.0.1:9/one.gguf")
+        pull.input.editingFinished.emit()
+        self.assertEqual(pull.status_label.text(),
+                         "Nothing pulling yet.")
+
+    def test_empty_input_clears_error(self):
+        pull = self.make_pull_window()
+        pull.input.setText("just some words here")
+        pull.input.editingFinished.emit()
+        pull.input.clear()
+        pull.input.editingFinished.emit()
+        self.assertEqual(pull.status_label.text(),
+                         "Nothing pulling yet.")
+
+    def test_validation_skips_during_pull(self):
+        pull = self.make_pull_window()
+        pull.worker = PullWorker("http://127.0.0.1:9/one.gguf",
+                                 self.models / "one.gguf")
+        try:
+            pull.input.setText("just some words here")
+            pull.input.editingFinished.emit()
+            self.assertEqual(pull.status_label.text(),
+                             "Nothing pulling yet.")
+        finally:
+            pull.worker = None
+
+
+class RepullTests(GuiTestCase):
+    def make_pull_window(self, **kwargs):
+        pull = PullWindow(self.models, **kwargs)
+        self.windows.append(pull)
+        pull.show()
+        return pull
+
+    def test_repull_yes_replaces_file(self):
+        payload1 = b"first" * 100
+        payload2 = b"second" * 100
+        server1, url1 = start_range_server(payload1)
+        server2, url2 = start_range_server(payload2)
+        self.servers.extend([server1, server2])
+        pull = self.make_pull_window()
+        pull.input.setText(url1)
+        pull.pull_button.click()
+        self.assertTrue(pump_until(lambda: pull.worker is None,
+                                   10000),
+                        "first pull did not finish")
+        self.assertEqual(file_bytes(self.models / "model.gguf"),
+                         payload1)
+        pull.input.setText(url2)
+        timer = self._answer_yes()
+        try:
+            pull.pull_button.click()
+        finally:
+            timer.stop()
+            self.watcher.enabled = True
+        self.assertTrue(pump_until(lambda: pull.worker is None,
+                                   10000),
+                        "re-pull did not finish")
+        self.assertEqual(file_bytes(self.models / "model.gguf"),
+                         payload2)
+
+    def test_repull_loaded_model_refused(self):
+        make_fake_gguf(self.models / "model.gguf", 2048)
+        window = self.make_window()
+        self.load_first_model(window)
+        window.show_pull_window()
+        pull = window.pull_window
+        self.windows.append(pull)
+        server, url = start_range_server(PAYLOAD)
+        self.servers.append(server)
+        pull.input.setText(url)
+        pull.pull_button.click()
+        QTest.qWait(300)
+        self.assertIsNone(pull.worker)
+        self.assertIn("Unload it first", pull.status_label.text())
+        self.assertEqual(self.watcher.seen, [])
+
+
+class FactsCardTests(GuiTestCase):
+    def test_real_gguf_shows_facts_line(self):
+        write_gguf_file(
+            self.models / "real.gguf",
+            {"general.architecture": "qwen3"},
+            numbers={"qwen3.context_length": 32768},
+            tensors=[("w", [2000, 1000000], 0)],
+            file_type=15)
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "real.gguf")]
+        facts = card.findChild(QLabel, "model_facts")
+        self.assertIsNotNone(facts)
+        self.assertEqual(facts.text(), "2B · Q4_K_M · 32K context")
+        self.assertIn("Architecture: qwen3", card.toolTip())
+
+    def test_plain_file_shows_no_facts(self):
+        make_fake_gguf(self.models / "plain.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "plain.gguf")]
+        self.assertIsNone(card.findChild(QLabel, "model_facts"))
+
+
+class SearchFilterTests(GuiTestCase):
+    def _three_models(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        make_sparse_gguf(self.models / "beta.gguf",
+                         int(1.5 * GB))
+        make_sparse_gguf(self.models / "gamma.gguf", 4 * GB)
+        window = self.make_window()
+        self.wait_scan(window)
+        return window
+
+    def _visible_names(self, window):
+        return sorted(window.model_cards[path].model_name
+                      for path in window._visible_paths)
+
+    def test_search_filters_by_name(self):
+        window = self._three_models()
+        window.search_box.setText("alp")
+        self.assertEqual(self._visible_names(window),
+                         ["alpha.gguf"])
+        window.search_box.clear()
+        self.assertEqual(len(window._visible_paths), 3)
+
+    def test_search_is_case_insensitive(self):
+        window = self._three_models()
+        window.search_box.setText("BETA")
+        self.assertEqual(self._visible_names(window),
+                         ["beta.gguf"])
+
+    def test_size_filter_buckets(self):
+        window = self._three_models()
+        window.filter_combo.setCurrentText("Small (under 1 GB)")
+        self.assertEqual(self._visible_names(window),
+                         ["alpha.gguf"])
+        window.filter_combo.setCurrentText("Medium (1-3 GB)")
+        self.assertEqual(self._visible_names(window),
+                         ["beta.gguf"])
+        window.filter_combo.setCurrentText("Large (over 3 GB)")
+        self.assertEqual(self._visible_names(window),
+                         ["gamma.gguf"])
+        window.filter_combo.setCurrentText("All models")
+        self.assertEqual(len(window._visible_paths), 3)
+
+    def test_no_match_shows_plain_line(self):
+        window = self._three_models()
+        window.search_box.setText("zzz")
+        self.assertTrue(window._filter_empty_label.isVisible())
+        self.assertIn('No models match "zzz".',
+                      window._filter_empty_label.text())
+        self.assertFalse(window._cards_scroll.isVisible())
+        window.search_box.clear()
+        self.assertFalse(window._filter_empty_label.isVisible())
+        self.assertTrue(window._cards_scroll.isVisible())
+
+    def test_filtered_selection_disables_load_remove(self):
+        window = self._three_models()
+        path = str(self.models / "alpha.gguf")
+        window.model_cards[path].clicked.emit(path)
+        self.assertTrue(window.load_button.isEnabled())
+        self.assertTrue(window.remove_button.isEnabled())
+        window.search_box.setText("gamma")
+        self.assertFalse(window.load_button.isEnabled())
+        self.assertFalse(window.remove_button.isEnabled())
+        window.search_box.clear()
+        self.assertTrue(window.load_button.isEnabled())
+        self.assertTrue(window.remove_button.isEnabled())
+
+    def test_focus_moves_to_search_when_card_filtered_out(self):
+        window = self._three_models()
+        alpha = window.model_cards[str(self.models / "alpha.gguf")]
+        alpha.setFocus()
+        QTest.qWait(50)
+        self.assertTrue(alpha.hasFocus())
+        window.search_box.setText("gamma")
+        QTest.qWait(50)
+        self.assertTrue(window.search_box.hasFocus())
+
+
+class DiffRefreshTests(GuiTestCase):
+    def _many_models(self, count=12):
+        for index in range(count):
+            make_fake_gguf(self.models / ("model-%02d.gguf" % index),
+                           2048)
+        window = self.make_window()
+        window.setMinimumSize(900, 200)
+        window.resize(900, 300)
+        self.wait_scan(window)
+        return window
+
+    def test_refresh_reuses_cards_keeps_scroll_and_focus(self):
+        window = self._many_models()
+        scroll = window._cards_scroll.verticalScrollBar()
+        self.assertTrue(
+            pump_until(lambda: scroll.maximum() > 0, 5000),
+            "no scroll range with 12 cards in a short window")
+        scroll.setValue(scroll.maximum())
+        first = window.model_cards[sorted(window.model_cards)[0]]
+        first.setFocus()
+        QTest.qWait(50)
+        self.assertTrue(first.hasFocus())
+        before = dict(window.model_cards)
+        saved_scroll = scroll.value()
+        window._refresh_model_list()
+        self.wait_scan(window)
+        self.assertEqual(set(window.model_cards), set(before))
+        for key, card in before.items():
+            self.assertIs(window.model_cards[key], card,
+                          "card rebuilt across a refresh: %s" % key)
+        self.assertEqual(scroll.value(), saved_scroll)
+        self.assertTrue(first.hasFocus())
+
+    def test_changed_model_rebuilds_only_its_card(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        make_fake_gguf(self.models / "beta.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        alpha_before = window.model_cards[
+            str(self.models / "alpha.gguf")]
+        beta_before = window.model_cards[
+            str(self.models / "beta.gguf")]
+        make_fake_gguf(self.models / "alpha.gguf", 4096)
+        window._refresh_model_list()
+        self.wait_scan(window)
+        alpha_after = window.model_cards[
+            str(self.models / "alpha.gguf")]
+        beta_after = window.model_cards[
+            str(self.models / "beta.gguf")]
+        self.assertIsNot(alpha_after, alpha_before)
+        self.assertIs(beta_after, beta_before)
+
+
+class AttachTests(GuiTestCase):
+    def _picture(self):
+        pic = self.base / "photo.png"
+        pic.write_bytes(b"\x89PNG fake image bytes")
+        return pic
+
+    def _loaded_window(self, runner):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window(runner=runner)
+        self.load_first_model(window)
+        return window
+
+    def test_attach_disabled_without_vision(self):
+        window = self._loaded_window(FakeRunner())
+        self.assertFalse(window.attach_button.isEnabled())
+
+    def test_attach_disabled_without_model(self):
+        window = self.make_window(
+            runner=FakeRunner(supports_vision=True))
+        self.wait_scan(window)
+        self.assertFalse(window.attach_button.isEnabled())
+
+    def test_attach_and_send_image(self):
+        runner = FakeRunner(reply_text="a cat",
+                            supports_vision=True)
+        window = self._loaded_window(runner)
+        self.assertTrue(window.attach_button.isEnabled())
+        pic = self._picture()
+        with mock.patch(
+                "fyrn.gui.QFileDialog.getOpenFileName",
+                return_value=(str(pic), "")):
+            window.attach_button.click()
+        self.assertTrue(window.attachment_label.isVisible())
+        self.assertIn("photo.png",
+                      window.attachment_label.text())
+        window.chat_input.setText("what is this?")
+        window.send_button.click()
+        self.wait_chat(window)
+        self.assertEqual(runner.last_images, [str(pic)])
+        self.assertIn("Image: photo.png",
+                      window.transcript.toPlainText())
+        self.assertFalse(window.attachment_label.isVisible())
+        self.assertIsNone(window._attached_image)
+
+    def test_remove_attachment(self):
+        runner = FakeRunner(supports_vision=True)
+        window = self._loaded_window(runner)
+        pic = self._picture()
+        with mock.patch(
+                "fyrn.gui.QFileDialog.getOpenFileName",
+                return_value=(str(pic), "")):
+            window.attach_button.click()
+        self.assertIsNotNone(window._attached_image)
+        window.attachment_remove_button.click()
+        self.assertIsNone(window._attached_image)
+        self.assertFalse(window.attachment_label.isVisible())
+
+    def test_vision_warning_in_load_status(self):
+        class WarningRunner(FakeRunner):
+            def load(self, path, progress_cb=None,
+                     cancel_event=None):
+                result = super().load(path, progress_cb,
+                                      cancel_event)
+                result["vision_warning"] = (
+                    "This is a vision model, but its projector "
+                    "file is not next to it.")
+                return result
+
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window(runner=WarningRunner())
+        self.load_first_model(window)
+        message = window.statusBar().currentMessage()
+        self.assertIn("alpha.gguf loaded.", message)
+        self.assertIn("projector file is not next to it", message)
+
+
+class DragDropTests(GuiTestCase):
+    # The mime data must outlive the event: the event holds a
+    # pointer to it, and a mime object that dies while the event
+    # is in use segfaults the process. Every test keeps its mime
+    # in a local until the event is handled.
+    def _mime(self, paths):
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(p)) for p in paths])
+        return mime
+
+    def _drag_event(self, mime):
+        # The 5-argument constructor is the only one this PySide6
+        # build offers, and it is marked deprecated: silence that
+        # warning here, it is not something the test can fix.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            return QDragEnterEvent(
+                QPoint(10, 10), Qt.DropAction.CopyAction, mime,
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier)
+
+    def _drop_event(self, mime):
+        return QDropEvent(
+            QPoint(10, 10), Qt.DropAction.CopyAction, mime,
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+            QEvent.Type.Drop)
+
+    def test_drag_enter_accepts_gguf_rejects_text(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        gguf = self.base / "dropped.gguf"
+        gguf.write_bytes(b"x" * 100)
+        txt = self.base / "notes.txt"
+        txt.write_text("hi")
+        mime = self._mime([gguf])
+        event = self._drag_event(mime)
+        window.dragEnterEvent(event)
+        self.assertTrue(event.isAccepted())
+        mime = self._mime([txt])
+        event = self._drag_event(mime)
+        window.dragEnterEvent(event)
+        self.assertFalse(event.isAccepted())
+
+    def test_drop_imports_file(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        gguf = self.base / "dropped.gguf"
+        gguf.write_bytes(b"x" * 100)
+        mime = self._mime([gguf])
+        event = self._drop_event(mime)
+        window.dropEvent(event)
+        self.assertTrue(event.isAccepted())
+        self.wait_import(window)
+        self.wait_scan(window)
+        self.assertTrue((self.models / "dropped.gguf").is_file())
+        self.assertIn(str(self.models / "dropped.gguf"),
+                      window.model_cards)
+
+    def test_drop_two_files_imports_both(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        first = self.base / "first.gguf"
+        second = self.base / "second.gguf"
+        first.write_bytes(b"1" * 100)
+        second.write_bytes(b"2" * 100)
+        mime = self._mime([first, second])
+        window.dropEvent(self._drop_event(mime))
+        ok = pump_until(
+            lambda: (self.models / "first.gguf").is_file()
+            and (self.models / "second.gguf").is_file()
+            and window.import_worker is None
+            and not window._import_pending,
+            10000)
+        self.assertTrue(ok, "both dropped files did not import")
 
 
 if __name__ == "__main__":

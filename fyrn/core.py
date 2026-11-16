@@ -291,6 +291,49 @@ class _GgufReader:
         return struct.unpack(code, self.read(size))[0]
 
 
+def _parse_gguf_header(data):
+    """Parse a GGUF header's bytes.
+
+    Returns (metadata, reader, tensor_count): metadata is the dict
+    of scalar key -> value entries, reader sits just past the KV
+    section (at the tensor infos), and tensor_count is how many
+    tensors follow. Returns (None, None, None) when the bytes are
+    not a readable GGUF header. A KV section that stops early
+    yields partial metadata with the reader where it stopped, so
+    a bad file still gives what it can.
+    """
+    if len(data) < 8 or data[:4] != _GGUF_MAGIC:
+        return None, None, None
+    reader = _GgufReader(data)
+    reader.pos = 4
+    try:
+        version = reader.u32()
+        if version == 3:
+            tensor_count = reader.u64()
+            kv_count = reader.u64()
+        elif version == 2:
+            tensor_count = reader.read(4)
+            tensor_count = struct.unpack("<I", tensor_count)[0]
+            kv_count = reader.u32()
+        else:
+            return None, None, None
+    except ValueError:
+        return None, None, None
+    if kv_count > _GGUF_MAX_KV:
+        return None, None, None
+    metadata = {}
+    try:
+        for _ in range(kv_count):
+            key = reader.string()
+            value_type = reader.u32()
+            value = reader.value(value_type)
+            if value is not None:
+                metadata[key] = value
+    except (ValueError, struct.error, UnicodeDecodeError):
+        pass  # partial metadata is still real metadata
+    return metadata, reader, tensor_count
+
+
 def _read_gguf_kv(path):
     """Read every scalar entry from a GGUF file's header.
 
@@ -304,35 +347,212 @@ def _read_gguf_kv(path):
             head = fh.read(_GGUF_MAX_HEADER_BYTES)
     except OSError:
         return {}
-    if len(head) < 8 or head[:4] != _GGUF_MAGIC:
-        return {}
-    reader = _GgufReader(head)
-    reader.pos = 4
+    metadata, _reader, _count = _parse_gguf_header(head)
+    return metadata or {}
+
+
+# GGUF general.file_type values, from the llama.cpp enum
+# (verified against llama-cpp-python 0.3.36). Only values here are
+# ever named: an unknown file type shows nothing, never a guess.
+GGUF_FILE_TYPES = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0",
+    8: "Q5_0", 9: "Q5_1", 10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M",
+    13: "Q3_K_L", 14: "Q4_K_S", 15: "Q4_K_M", 16: "Q5_K_S",
+    17: "Q5_K_M", 18: "Q6_K", 19: "IQ2_XXS", 20: "IQ2_XS",
+    21: "Q2_K_S", 22: "IQ3_XS", 23: "IQ3_XXS", 24: "IQ1_S",
+    25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M", 28: "IQ2_S",
+    29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16",
+    36: "TQ1_0", 37: "TQ2_0", 38: "MXFP4_MOE", 39: "NVFP4",
+    40: "Q1_0", 41: "Q2_0",
+}
+
+# GGUF architectures that are vision models in their own right
+# (their language model expects image input). Used only for the
+# "vision model, projector missing" warning: the projector file
+# itself is the signal that decides whether a model can see, so a
+# fine-tune with a projector (Bonsai-2) works without being in
+# this list.
+VISION_ARCHITECTURES = frozenset(
+    ("qwen3vl", "qwen2vl", "llava", "minicpmv"))
+
+
+def read_gguf_tensor_params(path):
+    """The exact parameter count of a GGUF model, from its tensor
+    infos: the sum of every tensor's element count. Returns None
+    when the file is not a GGUF file or the tensor section cannot
+    be read (a bad file never raises, and a count that cannot be
+    trusted is not shown).
+    """
     try:
-        version = reader.u32()
-        if version == 3:
-            reader.u64()  # tensor count
-            kv_count = reader.u64()
-        elif version == 2:
-            reader.read(4)  # tensor count
-            kv_count = reader.u32()
-        else:
-            return {}
-    except ValueError:
-        return {}
-    if kv_count > _GGUF_MAX_KV:
-        return {}
-    metadata = {}
+        with open(path, "rb") as fh:
+            head = fh.read(_GGUF_MAX_HEADER_BYTES)
+    except OSError:
+        return None
+    _metadata, reader, tensor_count = _parse_gguf_header(head)
+    if reader is None or tensor_count is None:
+        return None
+    if tensor_count > 100000:
+        return None
+    total = 0
     try:
-        for _ in range(kv_count):
-            key = reader.string()
-            value_type = reader.u32()
-            value = reader.value(value_type)
-            if value is not None:
-                metadata[key] = value
+        for _ in range(tensor_count):
+            reader.string()  # tensor name
+            n_dims = reader.u32()
+            if n_dims > 8:
+                return None
+            elements = 1
+            for _ in range(n_dims):
+                dim = reader.u64()
+                elements *= dim
+            reader.u32()  # tensor type
+            reader.u64()  # offset
+            total += elements
     except (ValueError, struct.error, UnicodeDecodeError):
-        pass  # partial metadata is still real metadata
-    return metadata
+        return None
+    return total
+
+
+def _format_params(count):
+    """A parameter count in words: 2B, 1.7B, 500M."""
+    if count >= 1_000_000_000:
+        text = "%.1f" % (count / 1_000_000_000)
+        return text[:-2] + "B" if text.endswith(".0") else text + "B"
+    if count >= 1_000_000:
+        return "%dM" % round(count / 1_000_000)
+    return "%d" % count
+
+
+def _format_context(tokens):
+    """A context length in words: 32K context, 4K context."""
+    if tokens >= 1024 and tokens % 1024 == 0:
+        return "%dK context" % (tokens // 1024)
+    return "%d context" % tokens
+
+
+def read_gguf_facts(path):
+    """The real facts about a GGUF model, from its own header.
+
+    Returns a dict with only what the header carries: "params"
+    (exact parameter count, from the tensor infos), "params_text"
+    ("2B"), "architecture" ("qwen3"), "context_length" (tokens),
+    "context_text" ("32K context"), "quantization" ("Q4_K_M").
+    A file without a fact simply lacks that key: nothing is ever
+    invented. A bad file returns {}.
+    """
+    facts = {}
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(_GGUF_MAX_HEADER_BYTES)
+    except OSError:
+        return facts
+    metadata, _reader, _count = _parse_gguf_header(head)
+    if metadata is None:
+        return facts
+    arch = metadata.get("general.architecture")
+    if isinstance(arch, str) and arch:
+        facts["architecture"] = arch
+        context = metadata.get(arch + ".context_length")
+        if _is_count(context) and context > 0:
+            facts["context_length"] = context
+            facts["context_text"] = _format_context(context)
+    file_type = metadata.get("general.file_type")
+    if _is_count(file_type):
+        quant = GGUF_FILE_TYPES.get(file_type)
+        if quant is not None:
+            facts["quantization"] = quant
+    params = read_gguf_tensor_params(path)
+    if params:
+        facts["params"] = params
+        facts["params_text"] = _format_params(params)
+    return facts
+
+
+def format_facts(facts):
+    """A facts dict as one short card line: "2B · Q4_K_M · 32K
+    context". Empty when the header carried nothing to show."""
+    parts = []
+    if facts.get("params_text"):
+        parts.append(facts["params_text"])
+    if facts.get("quantization"):
+        parts.append(facts["quantization"])
+    if facts.get("context_text"):
+        parts.append(facts["context_text"])
+    return " · ".join(parts)
+
+
+def find_projector(model_path):
+    """The vision projector (mmproj) file for a model, if one sits
+    next to it in the same folder: a .gguf file starting with
+    "mmproj-". One candidate wins outright; several are matched by
+    the longest shared name with the model, and a tie means no
+    projector (guessing between two would pick the wrong eyes).
+    Returns a Path or None.
+    """
+    model_path = Path(model_path)
+    folder = model_path.parent
+    if not folder.is_dir():
+        return None
+    candidates = []
+    for entry in folder.iterdir():
+        name = entry.name.lower()
+        if (name.startswith("mmproj-")
+                and name.endswith(".gguf")
+                and entry.is_file()):
+            candidates.append(entry)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    model_stem = _match_stem(model_path.stem)
+    best = None
+    best_score = -1
+    tied = False
+    for candidate in candidates:
+        stem = _match_stem(candidate.stem)
+        score = 0
+        for left, right in zip(model_stem, stem):
+            if left != right:
+                break
+            score += 1
+        if score > best_score:
+            best = candidate
+            best_score = score
+            tied = False
+        elif score == best_score:
+            tied = True
+    return None if tied else best
+
+
+def projector_size_bytes(model_path):
+    """The bytes a model's vision projector adds to a load: the
+    projector file's size when one sits next to the model, else 0.
+    The fit check counts it, or a vision model would load with
+    its eyes unaccounted for and run out of RAM."""
+    projector = find_projector(model_path)
+    if projector is None:
+        return 0
+    try:
+        return projector.stat().st_size
+    except OSError:
+        return 0
+
+
+def _match_stem(stem):
+    """A file stem for projector matching: lowercased, the
+    "mmproj-" prefix and the trailing quantization tag stripped,
+    so "mmproj-Qwen3-VL-2B-Instruct-Q8_0" matches the model
+    "Qwen3-VL-2B-Instruct-Q4_K_M" on "qwen3-vl-2b-instruct"."""
+    stem = stem.lower()
+    if stem.startswith("mmproj-"):
+        stem = stem[len("mmproj-"):]
+    # The last hyphen part is the quantization (Q4_K_M, Q8_0,
+    # F16, ...) when it looks like one.
+    if "-" in stem:
+        head, _sep, tail = stem.rpartition("-")
+        if (tail.startswith(("q", "iq", "f", "bf", "tq"))
+                and any(ch.isdigit() for ch in tail)):
+            stem = head
+    return stem
 
 
 def read_gguf_metadata(path):
@@ -387,12 +607,15 @@ def scan_models(folder):
             continue
         # The description comes from the file's own GGUF header
         # (general.description), never invented: a file without
-        # one simply has no description (L9).
+        # one simply has no description (L9). The facts (parameter
+        # count, quantization, context length) come from the same
+        # header, and a file without them simply has none.
         description = read_gguf_metadata(entry).get(
             "general.description", "")
         models.append({"name": entry.name, "path": entry,
                        "size": size, "description": description,
-                       "source": "folder"})
+                       "source": "folder",
+                       "facts": read_gguf_facts(entry)})
     return models, skipped
 
 
@@ -518,6 +741,79 @@ def remove_gguf(path):
             "The file could not be removed (%s)." % exc)
 
 
+def trash_dir():
+    """The desktop trash folder (freedesktop spec): $XDG_DATA_HOME
+    when set, otherwise ~/.local/share, plus /Trash."""
+    base = os.environ.get("XDG_DATA_HOME")
+    if base:
+        return Path(base) / "Trash"
+    return Path.home() / ".local" / "share" / "Trash"
+
+
+def move_to_trash(path):
+    """Move a .gguf model file to the desktop trash instead of
+    deleting it, so a slip is recoverable from the trash.
+
+    Follows the freedesktop trash spec: the file lands in
+    Trash/files (renamed with a number when the name is taken)
+    and a .trashinfo file in Trash/info records where it came
+    from and when. A move across filesystems falls back to a
+    copy plus delete. Returns the path in the trash. Raises
+    ValueError with a plain-words message when the file is gone,
+    is not a .gguf file, or cannot be moved: a failed move never
+    deletes the file.
+    """
+    from datetime import datetime
+    from urllib.parse import quote
+
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError("That model file is already gone.")
+    if path.suffix.lower() != ".gguf":
+        raise ValueError("That is not a .gguf model file.")
+    trash = trash_dir()
+    files_dir = trash / "files"
+    info_dir = trash / "info"
+    try:
+        files_dir.mkdir(parents=True, exist_ok=True)
+        info_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(
+            "The trash could not be used (%s)." % exc)
+    dest = files_dir / path.name
+    suffix = 1
+    while dest.exists():
+        dest = files_dir / ("%s.%d" % (path.name, suffix))
+        suffix += 1
+    try:
+        os.replace(path, dest)
+    except OSError as exc:
+        if exc.errno != 18:  # not a cross-device move: fail, keep file
+            raise ValueError(
+                "The file could not be moved to the trash (%s)."
+                % exc)
+        try:
+            shutil.copy2(path, dest)
+            path.unlink()
+        except OSError as exc2:
+            _drop_quietly(dest)
+            raise ValueError(
+                "The file could not be moved to the trash (%s)."
+                % exc2)
+    info_path = info_dir / (dest.name + ".trashinfo")
+    try:
+        info_path.write_text(
+            "[Trash Info]\nPath=%s\nDeletionDate=%s\n"
+            % (quote(str(path.resolve()), safe="/"),
+               datetime.now().strftime("%Y-%m-%dT%H:%M:%S")),
+            encoding="utf-8")
+    except OSError:
+        # The file is already in the trash; a missing .trashinfo
+        # only costs the restore path, not the file itself.
+        pass
+    return dest
+
+
 # ---------------------------------------------------------------- loading
 
 
@@ -559,11 +855,13 @@ class ModelController:
         free = self._free_ram_fn()
         # The context length the runner will actually use decides
         # the KV cache size, so the fit check uses the same number
-        # instead of a fixed guess.
+        # instead of a fixed guess. A vision model's projector
+        # counts too: it loads alongside the model.
         from .runner import auto_context_tokens
         headroom = model_headroom_bytes(
             path, auto_context_tokens(free))
-        return ram_check(size, free, headroom)
+        return ram_check(size + projector_size_bytes(path),
+                         free, headroom)
 
     def load(self, path, progress_cb=None, cancel_event=None,
              display_name=None):
@@ -588,7 +886,8 @@ class ModelController:
         self.current_name = display_name or path.name
         self.load_warning = message if verdict == "warn" else ""
         return {"load_time_s": result.get("load_time_s", 0.0),
-                "warning": self.load_warning}
+                "warning": self.load_warning,
+                "vision_warning": result.get("vision_warning", "")}
 
     def unload(self):
         """Unload the current model and free its RAM."""

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from helpers import file_bytes, make_fake_gguf, start_range_server
 from fyrn.pull import (DownloadError, PullCancelled, download_file,
-                             fetch_hf_sha256, parse_hf_url,
+                             fetch_hf_sha256, format_eta, parse_hf_url,
                              parse_model_input, read_part_url)
 
 PAYLOAD = bytes(range(256)) * 256  # 64 KiB deterministic bytes
@@ -393,6 +393,33 @@ class SidecarTests(unittest.TestCase):
         self.assertEqual(file_bytes(self.dest), PAYLOAD)
         self.assertFalse(os.path.exists(part + ".url"))
         self.assertIsNone(read_part_url(part))
+
+
+class FormatEtaTests(unittest.TestCase):
+    def test_none_and_non_positive_are_none(self):
+        self.assertIsNone(format_eta(None))
+        self.assertIsNone(format_eta(0))
+        self.assertIsNone(format_eta(-5))
+
+    def test_under_ten_seconds(self):
+        self.assertEqual(format_eta(3),
+                         "less than 10 seconds left")
+        self.assertEqual(format_eta(9.9),
+                         "less than 10 seconds left")
+
+    def test_seconds(self):
+        self.assertEqual(format_eta(10), "about 10 s left")
+        self.assertEqual(format_eta(45), "about 45 s left")
+
+    def test_minutes(self):
+        self.assertEqual(format_eta(60), "about 1 min left")
+        self.assertEqual(format_eta(150), "about 2 min left")
+        self.assertEqual(format_eta(3540), "about 59 min left")
+
+    def test_hours(self):
+        self.assertEqual(format_eta(3600), "about 1 h left")
+        self.assertEqual(format_eta(5400), "about 1 h 30 min left")
+        self.assertEqual(format_eta(7200), "about 2 h left")
 
 
 if __name__ == "__main__":

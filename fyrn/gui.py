@@ -19,8 +19,8 @@ from PySide6.QtCore import (QEvent, QEasingCurve, QLockFile, QPoint,
                             QThread, QTimer, Signal)
 from PySide6.QtGui import QCursor, QGuiApplication, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
-                               QFileDialog, QFrame,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
+                               QDialog, QFileDialog, QFrame,
                                QGraphicsOpacityEffect, QGridLayout,
                                QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMainWindow,
@@ -33,14 +33,15 @@ from . import __version__
 from . import core
 from .core import (HEADROOM_BYTES, ImportCancelled, ModelController,
                    ModelNotFoundError, ModelTooBigError, ensure_home,
-                   ensure_models_folder, fit_status, format_size,
-                   list_part_files, model_headroom_bytes,
-                   read_ram_bytes, remove_gguf, scan_models)
+                   ensure_models_folder, fit_status, format_facts,
+                   format_size, list_part_files, model_headroom_bytes,
+                   move_to_trash, projector_size_bytes, read_ram_bytes,
+                   scan_models)
 from .debug_log import DebugLogger
 from .discover import discover_ollama_models
 from .pull import (DownloadError, PullCancelled, download_file,
-                   fetch_hf_sha256, parse_hf_url, parse_model_input,
-                   read_part_url)
+                   fetch_hf_sha256, format_eta, parse_hf_url,
+                   parse_model_input, read_part_url)
 from .runner import (GenerationCancelled, LoadCancelled, LlamaRunner,
                      RunnerError, auto_context_tokens, trim_history)
 
@@ -255,7 +256,14 @@ HOW_TO_USE_SECTIONS = {
         "The Models tab lists every model in the folder, with its "
         "size and a fit badge: Fits means it runs fine on this PC, "
         "Tight means it will run but leaves little spare RAM, Too "
-        "big means it will not fit in free RAM.\n\n"
+        "big means it will not fit in free RAM. Each card also "
+        "shows a short factual line from the model's own file, "
+        "such as its size in parameters, its quantization, and "
+        "its context length, when the file carries that "
+        "information.\n\n"
+        "Search the list by name as you type, or narrow it with "
+        "the filter beside the search box: by size, or by where "
+        "the model came from.\n\n"
         "Fyrn also lists the models Ollama already downloaded on "
         "this PC, so you do not have to pull them again. Those "
         "models stay where Ollama put them: Fyrn can load them, "
@@ -270,8 +278,10 @@ HOW_TO_USE_SECTIONS = {
         "Import brings in a .gguf file from anywhere on the disk, "
         "such as a fine-tuned model you made elsewhere. It copies "
         "the file into your models folder, with progress and a "
-        "cancel while it runs.\n\n"
-        "Remove deletes a model from the folder. It asks first, "
+        "cancel while it runs. You can also drag a .gguf file "
+        "onto the window to import it.\n\n"
+        "Remove moves a model to the desktop trash, so you can "
+        "get it back if you change your mind. It asks first, "
         "names the file and its size, and a loaded model is "
         "unloaded before it is removed."
     ),
@@ -280,13 +290,23 @@ HOW_TO_USE_SECTIONS = {
         "folder. Open it from the Models menu.\n\n"
         "Type a Hugging Face model and its file name, like "
         "myname/mymodel mymodel.gguf, or paste a direct link to a "
-        ".gguf file. Then press Pull.\n\n"
+        ".gguf file. If the text is not a model Fyrn can "
+        "understand, the window says so as soon as you move on, "
+        "before Pull is pressed. Then press Pull.\n\n"
         "Not sure what to get first? The Pull window suggests a "
         "small first model that fits this PC.\n\n"
-        "The window shows progress, how much has downloaded, and the "
-        "speed. Press Cancel to stop; the part already downloaded "
-        "stays, and pulling again picks up where it stopped instead "
-        "of starting over.\n\n"
+        "The window shows progress, how much has downloaded, the "
+        "speed, and roughly how long is left. Press Cancel to "
+        "stop; the part already downloaded stays, and pulling "
+        "again picks up where it stopped instead of starting "
+        "over.\n\n"
+        "To pull several models, add each one to the queue, then "
+        "press Pull queue: they download one after another, in "
+        "order. If one fails or is stopped, the rest stay queued.\n\n"
+        "Pulling a model that is already in your folder asks "
+        "whether to pull it again and replace it. The old file is "
+        "kept until the new download finishes. A model that is "
+        "loaded right now cannot be replaced until it is unloaded.\n\n"
         "Unfinished downloads are listed at the bottom of the Pull "
         "window: Resume picks one up, Delete clears it away.\n\n"
         "Fyrn checks a finished pull against the checksum Hugging "
@@ -313,6 +333,12 @@ HOW_TO_USE_SECTIONS = {
         "in as the model writes it. Press Stop to cut a reply short. "
         "Shift+Enter starts a new line without sending. Clear "
         "empties the transcript.\n\n"
+        "Some models can see pictures: a vision model has a "
+        "projector file (its name starts with mmproj) sitting next "
+        "to the model file. With one of those loaded, Attach image "
+        "lets you attach a picture, then ask about it in your "
+        "message. If the loaded model cannot see, Attach image "
+        "stays greyed out.\n\n"
         "If no model is loaded, Send stays greyed out. Load a model "
         "from the Models tab first."
     ),
@@ -440,11 +466,12 @@ class ChatWorker(QThread):
     finished = Signal(dict)  # generation stats
     failed = Signal(str)
 
-    def __init__(self, runner, prompt, history=None):
+    def __init__(self, runner, prompt, history=None, images=None):
         super().__init__()
         self.runner = runner
         self.prompt = prompt
         self.history = list(history or [])
+        self.images = list(images or [])
         self.cancel_event = threading.Event()
 
     def run(self):
@@ -453,7 +480,8 @@ class ChatWorker(QThread):
                 self.prompt,
                 on_token=lambda piece: self.token.emit(piece),
                 cancel_event=self.cancel_event,
-                history=self.history)
+                history=self.history,
+                images=self.images)
         except GenerationCancelled:
             self.finished.emit({"stopped": True})
         except RunnerError as exc:
@@ -747,18 +775,40 @@ class PullWindow(QDialog):
     """Pull a model: its own window (U1).
 
     One input field, explained in plain words underneath (U20).
-    Progress, MB downloaded, and speed while it runs (U26), and the
-    pull resumes after a failure or a cancel (U24).
+    Progress, MB downloaded, speed, and time left while it runs
+    (U26), and the pull resumes after a failure or a cancel (U24).
+    Several models can be queued and pulled in order, one after
+    the other, with no further clicks.
     """
 
     model_pulled = Signal(str)  # saved path
 
-    def __init__(self, models_folder, log=None, parent=None):
+    def __init__(self, models_folder, log=None, parent=None,
+                 is_loaded=None):
         super().__init__(parent)
         self.models_folder = Path(models_folder)
         self.log = log
+        # is_loaded(path) says whether a model file is loaded right
+        # now: a loaded model cannot be re-pulled over (the engine
+        # is reading it). The main window passes its controller's
+        # answer; None means "nothing is loaded".
+        self._is_loaded = is_loaded
         self.worker = None
         self._celebrate_anim = None
+        # The pull queue: [{"target": DownloadTarget,
+        # "status": "waiting"|"downloading"|"done"|"failed"|
+        # "stopped"}]. One worker pulls them in order.
+        self.queue = []
+        self._queue_running = False
+        self._queue_item = None
+        # Smoothed ETA, reset for each download: the raw figure
+        # jumps with every chunk, so the displayed time is an
+        # average of recent ones.
+        self._eta_smoothed = None
+        # True while the status line shows a validation error from
+        # the field losing focus, so a good input restores the
+        # idle line instead of clobbering pull news.
+        self._validation_error = False
         self.setWindowTitle("Pull a model")
         self.setMinimumSize(560, 300)
         self.resize(640, 340)
@@ -770,6 +820,9 @@ class PullWindow(QDialog):
         self.input.setPlaceholderText(
             "myname/mymodel mymodel.gguf  or  https://.../model.gguf")
         self.input.returnPressed.connect(self._start_pull)
+        # Check the moment the field loses focus: a typo caught
+        # here saves a long pull that starts and fails.
+        self.input.editingFinished.connect(self._validate_input)
         layout.addWidget(self.input)
 
         help_label = QLabel(
@@ -799,12 +852,19 @@ class PullWindow(QDialog):
         buttons = QHBoxLayout()
         self.pull_button = PressDipButton("Pull")
         self.pull_button.clicked.connect(self._start_pull)
+        self.queue_add_button = QPushButton("Add to queue")
+        self.queue_add_button.clicked.connect(self._add_to_queue)
+        self.queue_pull_button = QPushButton("Pull queue")
+        self.queue_pull_button.clicked.connect(self._start_queue)
+        self.queue_pull_button.setEnabled(False)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self._cancel_pull)
         self.cancel_button.setEnabled(False)
         self.close_button = QPushButton("Close")
         self.close_button.clicked.connect(self.close)
         buttons.addWidget(self.pull_button)
+        buttons.addWidget(self.queue_add_button)
+        buttons.addWidget(self.queue_pull_button)
         buttons.addWidget(self.cancel_button)
         buttons.addStretch(1)
         buttons.addWidget(self.close_button)
@@ -824,6 +884,26 @@ class PullWindow(QDialog):
         self.busy_dot.setStyleSheet("color: #f2c14e;")
         self.busy_dot.setVisible(False)
         layout.addWidget(self.busy_dot)
+
+        # The pull queue: models waiting their turn, each with its
+        # state (Waiting, Downloading, Done, Failed). Hidden when
+        # the queue is empty, so the window stays tight.
+        self.queue_label = QLabel("Queue")
+        self.queue_label.setWordWrap(True)
+        layout.addWidget(self.queue_label)
+        self.queue_list = QListWidget()
+        self.queue_list.setObjectName("queue_list")
+        self.queue_list.setMaximumHeight(120)
+        self.queue_list.itemSelectionChanged.connect(
+            self._update_queue_buttons)
+        layout.addWidget(self.queue_list)
+        queue_buttons = QHBoxLayout()
+        self.queue_remove_button = QPushButton("Remove from queue")
+        self.queue_remove_button.clicked.connect(self._remove_queued)
+        queue_buttons.addWidget(self.queue_remove_button)
+        queue_buttons.addStretch(1)
+        layout.addLayout(queue_buttons)
+        self._refresh_queue_list()
 
         # Unfinished downloads: a .part file in the models folder
         # is a pull that stopped halfway. It is listed here with
@@ -861,6 +941,52 @@ class PullWindow(QDialog):
         self.pull_button.setEnabled(not busy)
         self.cancel_button.setEnabled(busy)
         self.input.setEnabled(not busy)
+        self._update_queue_buttons()
+
+    def _validate_input(self):
+        """Check the field the moment it loses focus: a bad model
+        name or URL is an inline error right away, not a surprise
+        when Pull is pressed. Never runs during a download (the
+        status line belongs to the pull then)."""
+        if self.worker is not None:
+            return
+        text = self.input.text().strip()
+        if not text:
+            if self._validation_error:
+                self._validation_error = False
+                self.status_label.setText("Nothing pulling yet.")
+            return
+        try:
+            parse_model_input(text)
+        except ValueError as exc:
+            self._validation_error = True
+            self.status_label.setText(str(exc))
+            return
+        if self._validation_error:
+            self._validation_error = False
+            self.status_label.setText("Nothing pulling yet.")
+
+    def _confirm_replace(self, dest):
+        """True when an existing model may be pulled over: a
+        loaded model is refused outright (the engine is reading
+        it), and anything else asks first, default No, the same
+        confirm habit as Remove."""
+        if (self._is_loaded is not None
+                and self._is_loaded(dest)):
+            self.status_label.setText(
+                "%s is loaded right now. Unload it first, then "
+                "pull it again." % dest.name)
+            return False
+        answer = QMessageBox.question(
+            self, "Pull a model",
+            "%s is already in your models folder.\n\n"
+            "Pull it again and replace it? The old file is kept "
+            "until the new download finishes."
+            % dest.name,
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
 
     def _start_pull(self):
         if self.worker is not None:
@@ -876,11 +1002,7 @@ class PullWindow(QDialog):
             self.input.setFocus()
             return
         dest = ensure_models_folder(self.models_folder) / target.filename
-        if dest.exists():
-            # Same pattern: an outcome, not an interruption.
-            self.status_label.setText(
-                "%s is already in your models folder."
-                % target.filename)
+        if dest.exists() and not self._confirm_replace(dest):
             return
         self._start_download(target.url, dest)
 
@@ -889,6 +1011,7 @@ class PullWindow(QDialog):
         fresh pull and for resuming an unfinished one."""
         if self.log is not None:
             self.log.action("pull started: %s" % Path(dest).name)
+        self._eta_smoothed = None
         self._set_busy(True)
         self.progress_bar.setValue(0)
         self.status_label.setText("Starting download...")
@@ -898,6 +1021,157 @@ class PullWindow(QDialog):
         self.worker.failed.connect(self._on_failed)
         self.worker.cancelled.connect(self._on_cancelled)
         self.worker.start()
+
+    # ------------------------------------------------------------ queue
+
+    def _add_to_queue(self):
+        """Queue the model in the field, to pull in order later.
+        The field clears so the next one can be typed straight
+        away. A model already in the folder asks about replacing
+        it, the same as Pull does."""
+        try:
+            target = parse_model_input(self.input.text())
+        except ValueError as exc:
+            self.status_label.setText(str(exc))
+            self.input.setFocus()
+            return
+        dest = ensure_models_folder(self.models_folder) / target.filename
+        if dest.exists() and not self._confirm_replace(dest):
+            return
+        if any(item["target"].filename == target.filename
+               and item["status"] in ("waiting", "downloading")
+               for item in self.queue):
+            self.status_label.setText(
+                "%s is already in the queue." % target.filename)
+            return
+        self.queue.append({"target": target, "status": "waiting"})
+        self.input.clear()
+        self._refresh_queue_list()
+        self._update_queue_buttons()
+        self.status_label.setText(
+            "%s added to the queue." % target.filename)
+
+    def _start_queue(self):
+        """Pull every waiting model in the queue, in order, with
+        no further clicks."""
+        if self.worker is not None or self._queue_running:
+            return
+        if not any(item["status"] == "waiting"
+                   for item in self.queue):
+            return
+        self._queue_running = True
+        self._start_next_queued()
+
+    def _start_next_queued(self):
+        """Start the next waiting item, or finish the queue."""
+        waiting = [item for item in self.queue
+                   if item["status"] == "waiting"]
+        if not waiting:
+            self._end_queue()
+            return
+        item = waiting[0]
+        item["status"] = "downloading"
+        self._queue_item = item
+        self._refresh_queue_list()
+        dest = (ensure_models_folder(self.models_folder)
+                / item["target"].filename)
+        self._start_download(item["target"].url, dest)
+
+    def _end_queue(self):
+        """The queue is done: every waiting item pulled."""
+        self._queue_running = False
+        self._queue_item = None
+        done = sum(1 for item in self.queue
+                   if item["status"] == "done")
+        self._set_busy(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        if done == 1:
+            self.status_label.setText(
+                "Queue done. 1 model pulled.")
+        else:
+            self.status_label.setText(
+                "Queue done. %d models pulled." % done)
+        self._celebrate()
+        self._refresh_part_list()
+        self._maybe_close_pending()
+
+    def _queue_position(self):
+        """(index, total) of the item now downloading, for the
+        status line: "2 of 3"."""
+        total = len(self.queue)
+        if self._queue_item is None:
+            return None
+        try:
+            index = self.queue.index(self._queue_item) + 1
+        except ValueError:
+            return None
+        return index, total
+
+    def _refresh_queue_list(self):
+        """Rebuild the queue list from the queue state. Hidden
+        when the queue is empty."""
+        show = bool(self.queue)
+        self.queue_label.setVisible(show)
+        self.queue_list.setVisible(show)
+        self.queue_remove_button.setVisible(show)
+        self.queue_list.clear()
+        if not show:
+            return
+        for item in self.queue:
+            text = "%s - %s" % (item["target"].filename,
+                                item["status"].capitalize())
+            list_item = QListWidgetItem(text)
+            list_item.setData(Qt.ItemDataRole.UserRole,
+                              item["target"].filename)
+            self.queue_list.addItem(list_item)
+        self._update_queue_buttons()
+
+    def _update_queue_item(self, item):
+        """Refresh one queue item's line in place (its progress
+        changes every chunk; rebuilding the whole list would drop
+        the selection each time)."""
+        for row in range(self.queue_list.count()):
+            list_item = self.queue_list.item(row)
+            if (list_item.data(Qt.ItemDataRole.UserRole)
+                    == item["target"].filename):
+                list_item.setText(
+                    "%s - %s" % (item["target"].filename,
+                                 item["status"].capitalize()))
+                return
+
+    def _update_queue_buttons(self):
+        waiting = any(item["status"] == "waiting"
+                      for item in self.queue)
+        self.queue_pull_button.setEnabled(
+            waiting and self.worker is None
+            and not self._queue_running)
+        # Remove works on a selected item that is not the one now
+        # downloading.
+        selected_item = self._selected_queue_item()
+        self.queue_remove_button.setEnabled(
+            selected_item is not None
+            and selected_item is not self._queue_item)
+
+    def _selected_queue_item(self):
+        items = self.queue_list.selectedItems()
+        if not items:
+            return None
+        filename = items[0].data(Qt.ItemDataRole.UserRole)
+        for item in self.queue:
+            if item["target"].filename == filename:
+                return item
+        return None
+
+    def _remove_queued(self):
+        """Drop the selected item from the queue (never the one
+        now downloading)."""
+        item = self._selected_queue_item()
+        if item is None or item is self._queue_item:
+            return
+        self.queue.remove(item)
+        self._refresh_queue_list()
+        self._update_queue_buttons()
 
     def _refresh_part_list(self):
         """List the unfinished downloads, or hide the section
@@ -978,32 +1252,65 @@ class PullWindow(QDialog):
         self._refresh_part_list()
 
     def _on_progress(self, downloaded, total, speed):
+        # Where this pull sits in the queue: "2 of 3: ...".
+        prefix = ""
+        position = self._queue_position()
+        if position is not None:
+            prefix = "%d of %d: " % position
         if total and total > 0:
             self.progress_bar.setRange(0, 100)
             pct = int(downloaded * 100 / total)
             self.progress_bar.setValue(pct)
+            # Time left, smoothed: the raw figure jumps with every
+            # chunk, so the displayed time is an average of recent
+            # ones, and it only shows when the speed is real.
+            eta_text = ""
+            if speed > 0:
+                raw_eta = (total - downloaded) / speed
+                if self._eta_smoothed is None:
+                    self._eta_smoothed = raw_eta
+                else:
+                    self._eta_smoothed = (
+                        0.7 * self._eta_smoothed + 0.3 * raw_eta)
+                eta = format_eta(self._eta_smoothed)
+                if eta is not None:
+                    eta_text = ", %s" % eta
             self.status_label.setText(
-                "%s of %s downloaded, %s per second"
-                % (format_size(downloaded), format_size(total),
-                   format_size(int(speed))))
+                "%s%s of %s downloaded, %s per second%s"
+                % (prefix, format_size(downloaded),
+                   format_size(total), format_size(int(speed)),
+                   eta_text))
+            if self._queue_item is not None:
+                self._queue_item["status"] = (
+                    "downloading (%d%%)" % pct)
+                self._update_queue_item(self._queue_item)
+                self._queue_item["status"] = "downloading"
         else:
             self.progress_bar.setRange(0, 0)  # unknown total: busy bar
             self.status_label.setText(
-                "%s downloaded, %s per second"
-                % (format_size(downloaded), format_size(int(speed))))
+                "%s%s downloaded, %s per second"
+                % (prefix, format_size(downloaded),
+                   format_size(int(speed))))
 
     def _on_finished(self, path):
+        self._drop_worker()
+        self._refresh_part_list()
+        if self.log is not None:
+            self.log.action("pull finished: %s" % path)
+        self.model_pulled.emit(path)
+        if self._queue_running:
+            # The queue moves on to the next model on its own.
+            if self._queue_item is not None:
+                self._queue_item["status"] = "done"
+                self._update_queue_item(self._queue_item)
+            self._start_next_queued()
+            return
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         self.status_label.setText("Done. The model is in your models "
                                   "folder.")
         self._celebrate()
         self._set_busy(False)
-        self._drop_worker()
-        self._refresh_part_list()
-        if self.log is not None:
-            self.log.action("pull finished: %s" % path)
-        self.model_pulled.emit(path)
         self._maybe_close_pending()
 
     def _maybe_close_pending(self):
@@ -1037,6 +1344,14 @@ class PullWindow(QDialog):
         # A download fails while the user may be elsewhere, so this
         # is the one pull error that keeps the modal: status line
         # for the trace, modal for the attention (L3).
+        # A failure stops the queue: the models still waiting stay
+        # queued, so the user can fix the problem and press Pull
+        # queue again.
+        if self._queue_item is not None:
+            self._queue_item["status"] = "failed"
+            self._update_queue_item(self._queue_item)
+        self._queue_running = False
+        self._queue_item = None
         self.progress_bar.setRange(0, 100)
         self.status_label.setText(message)
         self._set_busy(False)
@@ -1048,6 +1363,13 @@ class PullWindow(QDialog):
         self._maybe_close_pending()
 
     def _on_cancelled(self):
+        # A cancel stops the queue too: the partial download is
+        # kept, and the models still waiting stay queued.
+        if self._queue_item is not None:
+            self._queue_item["status"] = "stopped"
+            self._update_queue_item(self._queue_item)
+        self._queue_running = False
+        self._queue_item = None
         self.progress_bar.setRange(0, 100)
         self.status_label.setText(
             "Pull stopped. The part already downloaded stays, and "
@@ -1087,10 +1409,19 @@ class PullWindow(QDialog):
             # Closing mid-pull stops the download: ask first,
             # default No, and say the part already downloaded
             # stays (it does, and the next pull resumes from it).
+            # With a queue running, the rest of the queue stops
+            # too (the models still waiting stay queued).
+            if self._queue_running:
+                message = ("Stop this pull and the rest of the "
+                           "queue? The part already downloaded "
+                           "stays, and pulling again picks up "
+                           "where it stopped.")
+            else:
+                message = ("Stop this pull? The part already "
+                           "downloaded stays, and pulling again "
+                           "picks up where it stopped.")
             answer = QMessageBox.question(
-                self, "Pull a model",
-                "Stop this pull? The part already downloaded stays, "
-                "and pulling again picks up where it stopped.",
+                self, "Pull a model", message,
                 QMessageBox.StandardButton.Yes
                 | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
@@ -1297,7 +1628,16 @@ class ModelCard(QFrame):
         # name) and where the model came from: "folder" for a file
         # in the models folder, "ollama" for one Ollama downloaded.
         self.model_name = model["name"]
+        self.model_size = model["size"]
         self.source = model.get("source", "folder")
+        # What this card shows, kept so a refresh can tell whether
+        # the card is still true (and reuse the widget) or must be
+        # rebuilt: a re-pulled file has a new size, a load makes a
+        # hero. The fit status is not part of the match: free RAM
+        # moves on its own, and the badge updates in place.
+        self._status = status
+        self._loaded = loaded
+        self._hero = hero
         self._selected = False
         # Hover detail (entry 017): the full path, RAM needed vs
         # free, and why it fits or not, with no click needed. The
@@ -1322,17 +1662,21 @@ class ModelCard(QFrame):
         self.description = (model.get("description") or "").strip()
         if len(self.description) > self.DESCRIPTION_MAX:
             self.description = (self.description[:137] + "...")
+        # The facts line, from the file's own header too
+        # ("2B · Q4_K_M · 32K context"): absent entirely when the
+        # header carries nothing to show.
+        self.facts_text = format_facts(model.get("facts") or {})
         # Content height, not a fixed box: a card holds three lines
         # (name, size, badge), so ~100 px is enough; the old
         # 110-150 px box left each card ~60% empty inside. A card
-        # with a description gets room for it.
+        # with a description or a facts line gets room for it.
         self.setMinimumHeight(120 if hero else 96)
         # Cap the height: the grid's expanding spacer takes the
         # leftover space, but without a cap the tiles still grow
         # past their content (250 px tall with 2 models).
         if hero:
             self.setMaximumHeight(170)
-        elif self.description:
+        elif self.description or self.facts_text:
             self.setMaximumHeight(150)
         else:
             self.setMaximumHeight(120)
@@ -1359,15 +1703,23 @@ class ModelCard(QFrame):
                 "font-size: 11pt; color: #999999;")
             layout.addWidget(desc_label)
 
+        if self.facts_text:
+            facts_label = QLabel(self.facts_text)
+            facts_label.setObjectName("model_facts")
+            facts_label.setWordWrap(True)
+            facts_label.setStyleSheet(
+                "font-size: 11pt; color: #999999;")
+            layout.addWidget(facts_label)
+
         badge_text, badge_color = FIT_BADGES[status]
         badge_row = QHBoxLayout()
-        badge = QLabel(badge_text)
-        badge.setObjectName("fit_badge")
-        badge.setStyleSheet(
+        self._badge_label = QLabel(badge_text)
+        self._badge_label.setObjectName("fit_badge")
+        self._badge_label.setStyleSheet(
             "background-color: %s; color: white; font-size: 11pt; "
             "font-weight: bold; padding: 3px 10px; border-radius: 8px;"
             % badge_color)
-        badge_row.addWidget(badge)
+        badge_row.addWidget(self._badge_label)
         if loaded:
             loaded_label = QLabel("Loaded")
             loaded_label.setStyleSheet(
@@ -1413,6 +1765,36 @@ class ModelCard(QFrame):
         if self.stats_label is not None:
             self.stats_label.setText(text)
 
+    def matches(self, model, loaded):
+        """True when this card still shows this model: same size,
+        description, and facts, and the same loaded state. A card
+        that matches is reused across a refresh (so scroll and
+        focus survive); anything else is rebuilt."""
+        description = (model.get("description") or "").strip()
+        if len(description) > self.DESCRIPTION_MAX:
+            description = description[:137] + "..."
+        return (
+            model["size"] == self.model_size
+            and description == self.description
+            and format_facts(model.get("facts") or {})
+            == self.facts_text
+            and loaded == self._loaded
+            and model.get("source", "folder") == self.source)
+
+    def set_fit_status(self, status, model, free_bytes):
+        """Update the fit badge (and the hover detail) in place:
+        free RAM moves between refreshes, and the badge follows
+        it without rebuilding the card."""
+        self._status = status
+        badge_text, badge_color = FIT_BADGES[status]
+        self._badge_label.setText(badge_text)
+        self._badge_label.setStyleSheet(
+            "background-color: %s; color: white; font-size: 11pt; "
+            "font-weight: bold; padding: 3px 10px; border-radius: 8px;"
+            % badge_color)
+        self.setToolTip(
+            self._build_tooltip(model, status, free_bytes))
+
     @staticmethod
     def _build_tooltip(model, status, free_bytes):
         """Hover detail text: full path, size, RAM needed vs free,
@@ -1424,6 +1806,9 @@ class ModelCard(QFrame):
             if len(description) > ModelCard.DESCRIPTION_MAX:
                 description = description[:137] + "..."
             lines.append("About: %s" % description)
+        architecture = (model.get("facts") or {}).get("architecture")
+        if architecture:
+            lines.append("Architecture: %s" % architecture)
         headroom = model.get("headroom_bytes", HEADROOM_BYTES)
         needed = model["size"] + headroom
         if free_bytes is None:
@@ -1723,8 +2108,26 @@ class MainWindow(QMainWindow):
         self._select_path = None
         self._hero_card = None  # the loaded model's tile, if any
         self.model_cards = {}  # path string -> ModelCard
+        # Display order of the cards (path strings): the hero
+        # first, then name order. Kept apart from the dict, which
+        # holds no order, so a refresh can lay the same widgets
+        # out again without deleting them.
+        self._card_order = []
+        # Cards the search and filter let through (path strings):
+        # Load and Remove only work on a card that is visible.
+        self._visible_paths = set()
         self._pulse_path = None
         self._pulse_anim = None
+        # Files dropped on the window, waiting their turn to
+        # import: one import runs at a time, the rest queue.
+        self._import_pending = []
+        # A picture attached to the next chat message (a vision
+        # model only): None when nothing is attached.
+        self._attached_image = None
+        # A .gguf file dropped on the window imports it, the same
+        # way Import does (dragEnterEvent / dropEvent below). A
+        # QMainWindow accepts drops by default, so no setup is
+        # needed here.
         # True while the status bar shows the empty-folder message
         # (so restoring the default message never clobbers a load
         # or unload message).
@@ -1808,6 +2211,25 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        # Search and filter: the list narrows as you type, and the
+        # menu narrows it by size or where it came from. Both are
+        # plain filters over what is already there.
+        search_row = QHBoxLayout()
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Search models")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.textChanged.connect(self._apply_model_filter)
+        search_row.addWidget(self.search_box)
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems([
+            "All models", "Small (under 1 GB)",
+            "Medium (1-3 GB)", "Large (over 3 GB)",
+            "From Ollama", "In my folder"])
+        self.filter_combo.currentIndexChanged.connect(
+            self._apply_model_filter)
+        search_row.addWidget(self.filter_combo)
+        layout.addLayout(search_row)
+
         # Bento grid: models as tiles, size as hierarchy, fit front
         # and center. The loaded model gets the hero tile.
         self._cards_scroll = QScrollArea()
@@ -1817,6 +2239,14 @@ class MainWindow(QMainWindow):
         self._cards_layout.setSpacing(GRID_SPACING)
         self._cards_scroll.setWidget(self._cards_widget)
         layout.addWidget(self._cards_scroll)
+
+        # The filter found nothing, but models exist: say so in
+        # plain words, in place of the empty grid, instead of
+        # leaving a blank tab that looks broken.
+        self._filter_empty_label = QLabel("")
+        self._filter_empty_label.setWordWrap(True)
+        self._filter_empty_label.setVisible(False)
+        layout.addWidget(self._filter_empty_label)
 
         # The empty state takes the same space when the folder has
         # no models at all: a blank tab with nothing to pick is a
@@ -1922,21 +2352,27 @@ class MainWindow(QMainWindow):
     def _set_empty_state(self, show):
         """Show the empty state (and hide the card grid) or the
         other way round. The status bar follows: it must never
-        say "Pick a model" when there is nothing to pick."""
+        say "Pick a model" when there is nothing to pick. When
+        the grid comes back, the filter owns whether it shows:
+        a filter that matches nothing keeps the "no models match"
+        line in place of the empty grid."""
         self._empty_state.setVisible(show)
-        self._cards_scroll.setVisible(not show)
         if show:
+            self._cards_scroll.setVisible(False)
+            self._filter_empty_label.setVisible(False)
             if (not self.controller.is_loaded
                     and self.load_worker is None):
                 self._show_status_persistent(
                     "No models yet. Pull one or import one to "
                     "get started.")
                 self._empty_status = True
-        elif self._empty_status:
-            self._show_status_persistent(
-                "Pick a model and press Load, or pull one from the "
-                "Models menu.")
-            self._empty_status = False
+        else:
+            if self._empty_status:
+                self._show_status_persistent(
+                    "Pick a model and press Load, or pull one from "
+                    "the Models menu.")
+                self._empty_status = False
+            self._apply_model_filter()
 
     def _build_chat_tab(self):
         tab = QWidget()
@@ -1946,6 +2382,9 @@ class MainWindow(QMainWindow):
         self.transcript.setReadOnly(True)
         self.transcript.setPlaceholderText(
             "Load a model first, then chat here.")
+        # Drops fall through to the window (a .gguf dropped on the
+        # transcript imports it); the text box never swallows one.
+        self.transcript.setAcceptDrops(False)
         layout.addWidget(self.transcript)
 
         # Calm technology: the live numbers sit quietly in muted
@@ -1955,9 +2394,27 @@ class MainWindow(QMainWindow):
         self.stats_label.setStyleSheet("color: #999999;")
         layout.addWidget(self.stats_label)
 
+        # The attached picture, for the next message to a vision
+        # model: shown only while one is attached.
+        attach_row = QHBoxLayout()
+        self.attachment_label = QLabel("")
+        self.attachment_label.setWordWrap(True)
+        attach_row.addWidget(self.attachment_label)
+        self.attachment_remove_button = QPushButton("Remove")
+        self.attachment_remove_button.clicked.connect(
+            self._remove_attachment)
+        attach_row.addWidget(self.attachment_remove_button)
+        attach_row.addStretch(1)
+        layout.addLayout(attach_row)
+        self.attachment_label.setVisible(False)
+        self.attachment_remove_button.setVisible(False)
+
         row = QHBoxLayout()
         self.chat_input = ChatInput()
         self.chat_input.send_requested.connect(self.send_message)
+        self.chat_input.setAcceptDrops(False)
+        self.attach_button = QPushButton("Attach image")
+        self.attach_button.clicked.connect(self._attach_image)
         self.send_button = PressDipButton("Send")
         self.send_button.clicked.connect(self.send_message)
         self.stop_button = QPushButton("Stop")
@@ -1966,6 +2423,7 @@ class MainWindow(QMainWindow):
         self.clear_button = QPushButton("Clear")
         self.clear_button.clicked.connect(self._clear_chat)
         row.addWidget(self.chat_input)
+        row.addWidget(self.attach_button)
         row.addWidget(self.send_button)
         row.addWidget(self.stop_button)
         row.addWidget(self.clear_button)
@@ -2033,6 +2491,11 @@ class MainWindow(QMainWindow):
             item = self._cards_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # Hide before orphaning: a visible widget with no
+                # parent becomes a top-level window until the
+                # delete lands, and a new top-level window steals
+                # this window's activation (and flashes on screen).
+                widget.hide()
                 widget.setParent(None)
                 widget.deleteLater()
         self.model_cards = {}
@@ -2053,13 +2516,17 @@ class MainWindow(QMainWindow):
             rows, 0, 1, GRID_COLUMNS)
 
     def _refresh_model_list(self):
-        """Show skeleton tiles, then scan the folder off the UI
-        thread. A refresh asked for mid-scan runs right after the
-        current scan finishes, never on top of it."""
+        """Scan the folder off the UI thread. A refresh asked for
+        mid-scan runs right after the current scan finishes, never
+        on top of it. Skeleton tiles only show when there are no
+        cards yet (the first scan): on later refreshes the
+        current cards stay visible until the new scan lands, so
+        the list never blanks out under the user."""
         if self._scan_worker is not None:
             self._scan_dirty = True
             return
-        self._show_skeleton()
+        if not self.model_cards:
+            self._show_skeleton()
         self._scan_worker = ScanWorker(
             self.models_folder,
             include_ollama=get_show_ollama_models())
@@ -2074,7 +2541,6 @@ class MainWindow(QMainWindow):
             # exiting; wait for it, or destroying the QThread
             # aborts the process. See PullWindow._drop_worker.
             worker.wait()
-        self._clear_cards()
         loaded_path = (str(self.controller.current_path)
                        if self.controller.is_loaded else None)
         # The loaded model goes first as the hero tile; the rest
@@ -2083,50 +2549,62 @@ class MainWindow(QMainWindow):
             models,
             key=lambda m: (str(m["path"]) != loaded_path,
                            m["name"].lower()))
-        row = 0
-        col = 0
+        # Diff, not rebuild: cards that still show their model
+        # stay exactly where they are (same widget), so scroll
+        # position and keyboard focus survive every refresh.
+        # Cards for models that are gone go away; cards whose
+        # model changed (a re-pull, a load) are rebuilt.
+        new_paths = {str(model["path"]) for model in ordered}
+        for key in list(self.model_cards):
+            if key not in new_paths:
+                card = self.model_cards.pop(key)
+                self._cards_layout.removeWidget(card)
+                # Hide before orphaning (see _clear_cards).
+                card.hide()
+                card.setParent(None)
+                card.deleteLater()
+        self._card_order = []
         self._hero_card = None
         for model in ordered:
             # The fit badge uses this model's real RAM need: the
             # KV cache for the context length the runner will use,
-            # from the file's own header, not a fixed guess.
+            # from the file's own header, not a fixed guess. A
+            # vision model's projector loads with it, so its size
+            # counts too.
             headroom = model_headroom_bytes(
                 model["path"], auto_context_tokens(free_bytes))
             model["headroom_bytes"] = headroom
-            status = fit_status(model["size"], free_bytes, headroom)
+            load_size = (model["size"]
+                         + projector_size_bytes(model["path"]))
+            status = fit_status(load_size, free_bytes, headroom)
             is_loaded = str(model["path"]) == loaded_path
-            card = ModelCard(model, status, loaded=is_loaded,
-                             hero=is_loaded, free_bytes=free_bytes)
-            card.clicked.connect(self._on_card_clicked)
-            card.double_clicked.connect(self._on_card_double_clicked)
-            card.remove_requested.connect(self._on_remove_requested)
-            # Top-aligned: the grid centers tiles vertically by
-            # default, so a taller card (one with a description)
-            # sat above its neighbours and the row looked ragged.
+            key = str(model["path"])
+            card = self.model_cards.get(key)
+            if card is not None and card.matches(model, is_loaded):
+                card.set_fit_status(status, model, free_bytes)
+            else:
+                if card is not None:
+                    self.model_cards.pop(key)
+                    self._cards_layout.removeWidget(card)
+                    # Hide before orphaning (see _clear_cards).
+                    card.hide()
+                    card.setParent(None)
+                    card.deleteLater()
+                card = ModelCard(model, status, loaded=is_loaded,
+                                 hero=is_loaded,
+                                 free_bytes=free_bytes)
+                card.clicked.connect(self._on_card_clicked)
+                card.double_clicked.connect(
+                    self._on_card_double_clicked)
+                card.remove_requested.connect(
+                    self._on_remove_requested)
+                self.model_cards[key] = card
+            self._card_order.append(key)
             if is_loaded:
                 self._hero_card = card
-                self._cards_layout.addWidget(
-                    card, row, 0, 1, GRID_COLUMNS,
-                    Qt.AlignmentFlag.AlignTop)
-                row += 1
-                col = 0
-            else:
-                self._cards_layout.addWidget(
-                    card, row, col, Qt.AlignmentFlag.AlignTop)
-                col += 1
-                if col >= GRID_COLUMNS:
-                    col = 0
-                    row += 1
-            self.model_cards[str(model["path"])] = card
-        # An expanding spacer pins the tiles to the top: without it
-        # the grid stretches a short list of tiles to fill the tab.
-        spacer_row = row + 1 if col else row
-        self._cards_layout.addItem(
-            QSpacerItem(0, 0, QSizePolicy.Policy.Minimum,
-                        QSizePolicy.Policy.Expanding),
-            spacer_row, 0, 1, GRID_COLUMNS)
-        # The rebuilt hero tile gets its stats right away, instead
-        # of waiting for the next 2-second refresh.
+        self._apply_model_filter()
+        # The hero tile gets its stats right away, instead of
+        # waiting for the next 2-second refresh.
         self._refresh_stats()
         # Keep the selection when the selected model is still there
         # (U28): a refresh must not make the user find and re-click
@@ -2170,6 +2648,129 @@ class MainWindow(QMainWindow):
         else:
             self._maybe_close_pending()
 
+    def _filter_matches(self, card):
+        """True when a card passes the search text and the size or
+        source menu: a name substring, case-insensitive, and one
+        real bucket (size in 1024-based GB, the same units the
+        sizes on the cards use)."""
+        text = self.search_box.text().strip().lower()
+        if text and text not in card.model_name.lower():
+            return False
+        choice = self.filter_combo.currentText()
+        size = card.model_size
+        if choice == "Small (under 1 GB)":
+            return size < 1024 ** 3
+        if choice == "Medium (1-3 GB)":
+            return 1024 ** 3 <= size < 3 * 1024 ** 3
+        if choice == "Large (over 3 GB)":
+            return size >= 3 * 1024 ** 3
+        if choice == "From Ollama":
+            return card.source == "ollama"
+        if choice == "In my folder":
+            return card.source != "ollama"
+        return True
+
+    def _apply_model_filter(self):
+        """Narrow the visible cards to the search text and the
+        size or source menu, and lay the grid out again. The
+        cards themselves are never deleted: hidden cards leave
+        the grid and are hidden, and come back when the filter
+        clears. If the focused card is filtered out, focus moves
+        to the search box instead of landing nowhere."""
+        if not self.model_cards:
+            self._visible_paths = set()
+            self._filter_empty_label.setVisible(False)
+            return
+        visible = {key for key, card in self.model_cards.items()
+                   if self._filter_matches(card)}
+        self._visible_paths = visible
+        widget = QApplication.focusWidget()
+        while widget is not None and not isinstance(
+                widget, ModelCard):
+            widget = widget.parent()
+        focus_lost = (widget is not None
+                      and widget.path not in visible)
+        self._relayout_cards(visible)
+        if focus_lost:
+            self.search_box.setFocus()
+        if visible:
+            self._filter_empty_label.setVisible(False)
+            self._cards_scroll.setVisible(True)
+        else:
+            text = self.search_box.text().strip()
+            if text:
+                self._filter_empty_label.setText(
+                    "No models match \"%s\"." % text)
+            else:
+                self._filter_empty_label.setText(
+                    "No models in this filter.")
+            self._filter_empty_label.setVisible(True)
+            self._cards_scroll.setVisible(False)
+        self._update_buttons()
+
+    def _relayout_cards(self, visible_paths):
+        """Lay the cards out again in display order, without
+        deleting any of them: every widget is taken out of the
+        grid and the visible ones are put back, so scroll
+        position and keyboard focus survive (the widgets
+        themselves never go away). Cards hidden by the filter
+        leave the grid and are hidden; skeleton tiles from the
+        first scan are dropped for good. The scroll value is
+        saved and restored, so a refresh never jumps the list
+        back to the top."""
+        scroll_bar = self._cards_scroll.verticalScrollBar()
+        saved_scroll = scroll_bar.value()
+        while self._cards_layout.count():
+            item = self._cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget is None:
+                continue  # the spacer; re-added below
+            if widget not in self.model_cards.values():
+                # Hide before orphaning (see _clear_cards).
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+        row = 0
+        col = 0
+        for key in self._card_order:
+            card = self.model_cards.get(key)
+            if card is None:
+                continue
+            if key not in visible_paths:
+                card.setVisible(False)
+                continue
+            # Add to the grid BEFORE showing it: a card fresh from
+            # the scan has no parent yet, and showing a parentless
+            # widget makes it a top-level window, which steals this
+            # window's activation (and flashes on screen). Once it
+            # is in the layout it is a child, and showing it is
+            # safe.
+            # Top-aligned: the grid centers tiles vertically by
+            # default, so a taller card (one with a description)
+            # sat above its neighbours and the row looked ragged.
+            if card is self._hero_card:
+                self._cards_layout.addWidget(
+                    card, row, 0, 1, GRID_COLUMNS,
+                    Qt.AlignmentFlag.AlignTop)
+                row += 1
+                col = 0
+            else:
+                self._cards_layout.addWidget(
+                    card, row, col, Qt.AlignmentFlag.AlignTop)
+                col += 1
+                if col >= GRID_COLUMNS:
+                    col = 0
+                    row += 1
+            card.setVisible(True)
+        # An expanding spacer pins the tiles to the top: without it
+        # the grid stretches a short list of tiles to fill the tab.
+        spacer_row = row + 1 if col else row
+        self._cards_layout.addItem(
+            QSpacerItem(0, 0, QSizePolicy.Policy.Minimum,
+                        QSizePolicy.Policy.Expanding),
+            spacer_row, 0, 1, GRID_COLUMNS)
+        scroll_bar.setValue(saved_scroll)
+
     def _pulse_card(self, card):
         """One quiet 200 ms fade-in on a newly pulled model, opacity
         only (the delight moment). Skipped under reduced motion."""
@@ -2204,21 +2805,33 @@ class MainWindow(QMainWindow):
         # it cannot remove it.
         selected_is_ollama = (selected_card is not None
                               and selected_card.source == "ollama")
+        # A card the search or filter hides cannot be loaded or
+        # removed: the user cannot see what they would be acting
+        # on. The selection itself stays, so clearing the filter
+        # brings the buttons back.
+        selected_visible = (selected is None
+                            or str(selected) in self._visible_paths)
         # One long operation at a time on the Models tab, and
         # nothing that touches the loaded model while a reply
         # streams from it: unloading or deleting a model mid-reply
         # leaves a reply coming from a model that is gone.
         self.load_button.setEnabled(
-            has_selection and not loading and not importing
-            and not replying and not selected_is_loaded)
+            has_selection and selected_visible and not loading
+            and not importing and not replying
+            and not selected_is_loaded)
         self.remove_button.setEnabled(
-            has_selection and not loading and not importing
-            and not replying and not selected_is_ollama)
+            has_selection and selected_visible and not loading
+            and not importing and not replying
+            and not selected_is_ollama)
         self.unload_button.setEnabled(
             loaded and not loading and not replying)
         self.import_button.setEnabled(not loading and not importing)
         self.send_button.setEnabled(
             loaded and self.chat_worker is None)
+        # Attach only works when the loaded model can see: a
+        # text-only model has nothing to do with a picture.
+        self.attach_button.setEnabled(
+            loaded and self.runner.supports_vision)
         self.load_cancel_button.setVisible(loading)
         # A real load cannot be stopped once it starts (the
         # backend never checks for a cancel), so the button says
@@ -2297,10 +2910,16 @@ class MainWindow(QMainWindow):
         self._refresh_model_list()
         name = self.controller.current_name or "model"
         if warning:
-            self._show_status(
-                "%s loaded, but RAM is tight." % name)
+            message = "%s loaded, but RAM is tight." % name
         else:
-            self._show_status("%s loaded." % name)
+            message = "%s loaded." % name
+        # A vision model without its projector loads as text only:
+        # say so in the same breath, so the user knows why the
+        # Attach button stays greyed out.
+        vision_warning = result.get("vision_warning", "")
+        if vision_warning:
+            message = "%s %s" % (message, vision_warning)
+        self._show_status(message)
         self.log.action("load finished: %s" % name)
         # The empty transcript no longer says "Load a model first":
         # a model IS loaded now, so the hint switches to the true one.
@@ -2392,12 +3011,20 @@ class MainWindow(QMainWindow):
             self._show_status(
                 "Pick a model from the list first.")
             return
+        if str(path) not in self._visible_paths:
+            # The card is hidden by the search or filter: the user
+            # cannot see what they would be removing.
+            self._show_status(
+                "That model is hidden by the search. Clear the "
+                "search to remove it.")
+            return
         self._remove_model(path)
 
     def _remove_model(self, path):
-        """Delete a model file, after a confirm that defaults to
-        No (U31). A loaded model is unloaded first, never deleted
-        out from under the engine."""
+        """Move a model file to the desktop trash, after a confirm
+        that defaults to No (U31). A loaded model is unloaded
+        first, never deleted out from under the engine. The trash
+        keeps the file, so a mistaken remove is undoable."""
         path = Path(path)
         if self.chat_worker is not None:
             self._show_status("Wait for the reply to finish first.")
@@ -2418,7 +3045,8 @@ class MainWindow(QMainWindow):
                   and self.controller.current_path == path)
         message = (
             "Remove %s (%s) from your models folder?\n\n"
-            "This deletes the file. You can pull it again later."
+            "This moves the file to the trash. You can get it "
+            "back from the trash."
             % (path.name, format_size(path.stat().st_size)))
         if loaded:
             message += ("\n\nIt is loaded right now, so it will be "
@@ -2433,14 +3061,16 @@ class MainWindow(QMainWindow):
         if loaded:
             self.unload_model()
         try:
-            remove_gguf(path)
+            move_to_trash(path)
         except ValueError as exc:
+            # The file is still there: a failed move never deletes.
             QMessageBox.warning(self, "Remove model", str(exc))
             self._refresh_model_list()
             return
-        self.log.action("removed: %s" % path.name)
+        self.log.action("removed to trash: %s" % path.name)
         self._selected_path = None
-        self._status_after_scan = "%s removed." % path.name
+        self._status_after_scan = (
+            "%s moved to the trash." % path.name)
         self._refresh_model_list()
 
     def import_model(self):
@@ -2456,6 +3086,11 @@ class MainWindow(QMainWindow):
             "GGUF models (*.gguf)")
         if not path:
             return
+        self._start_import(path)
+
+    def _start_import(self, path):
+        """Start importing one .gguf file: the shared path for
+        the Import dialog and for files dropped on the window."""
         self.log.action("import started: %s" % Path(path).name)
         self._set_busy(True)
         self._show_status_persistent(
@@ -2467,6 +3102,57 @@ class MainWindow(QMainWindow):
         self.import_worker.cancelled.connect(self._on_import_cancelled)
         self.import_worker.start()
         self._update_buttons()
+
+    # ------------------------------------------------ drag and drop
+
+    def dragEnterEvent(self, event):  # noqa: N802 - Qt naming
+        """A .gguf file dragged over the window is an import
+        waiting to happen; anything else is not ours."""
+        if self._dropped_gguf_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):  # noqa: N802 - Qt naming
+        """Drop .gguf files to import them, one after another,
+        through the same worker as Import."""
+        paths = self._dropped_gguf_paths(event.mimeData())
+        if not paths:
+            super().dropEvent(event)
+            return
+        event.acceptProposedAction()
+        self._import_dropped(paths)
+
+    def _dropped_gguf_paths(self, mime_data):
+        """The .gguf files in a drag: local file URLs only, and
+        only files that exist."""
+        paths = []
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.suffix.lower() == ".gguf" and path.is_file():
+                paths.append(path)
+        return paths
+
+    def _import_dropped(self, paths):
+        """Import dropped files in order: the first starts now
+        (or queues behind a running import), the rest wait."""
+        if self.load_worker is not None:
+            self._show_status(
+                "Wait for the load to finish, then drop the file "
+                "again.")
+            return
+        if self.import_worker is not None:
+            self._import_pending.extend(paths)
+            return
+        self._import_pending.extend(paths)
+        self._start_import(self._import_pending.pop(0))
+
+    def _drain_import_pending(self):
+        """Start the next dropped import, if one is waiting."""
+        if self._import_pending and self.import_worker is None:
+            self._start_import(self._import_pending.pop(0))
 
     def _on_import_progress(self, copied, total):
         if total and total > 0:
@@ -2488,6 +3174,7 @@ class MainWindow(QMainWindow):
             "%s is now in your models folder." % dest.name)
         self._select_path = str(dest)
         self._refresh_model_list()
+        self._drain_import_pending()
         self._maybe_close_pending()
 
     def _on_import_failed(self, message):
@@ -2496,6 +3183,15 @@ class MainWindow(QMainWindow):
         self._update_buttons()
         self._show_status(message)
         self.log.error("import failed: %s", message)
+        # A failure stops the dropped queue too: the files still
+        # waiting are left alone, so the user can see the error
+        # and decide, instead of a modal appearing over the next
+        # import already running.
+        if self._import_pending:
+            count = len(self._import_pending)
+            self._import_pending = []
+            message = ("%s\n\n%d more dropped file(s) were not "
+                       "imported." % (message, count))
         QMessageBox.warning(self, "Import a GGUF file", message)
         self._maybe_close_pending()
 
@@ -2504,6 +3200,9 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         self._update_buttons()
         self._show_status("Import stopped. Nothing was copied.")
+        # A cancel stops the whole drop: the files still waiting
+        # are left alone.
+        self._import_pending = []
         self._maybe_close_pending()
 
     def _drop_import_worker(self):
@@ -2521,6 +3220,30 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ chat
 
+    def _attach_image(self):
+        """Pick a picture to send with the next message. Only a
+        vision model can see it, so the button is greyed out
+        otherwise. PNG and JPEG only: those are the formats the
+        engine's image loader knows."""
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "Pick a picture", str(Path.home()),
+            "Pictures (*.png *.jpg *.jpeg)")
+        if not path:
+            return
+        self._attached_image = Path(path)
+        self.attachment_label.setText(
+            "Attached: %s" % self._attached_image.name)
+        self.attachment_label.setVisible(True)
+        self.attachment_remove_button.setVisible(True)
+
+    def _remove_attachment(self):
+        """Drop the attached picture: the next message goes
+        without it."""
+        self._attached_image = None
+        self.attachment_label.setText("")
+        self.attachment_label.setVisible(False)
+        self.attachment_remove_button.setVisible(False)
+
     def send_message(self):
         if self.chat_worker is not None:
             return
@@ -2533,6 +3256,14 @@ class MainWindow(QMainWindow):
             return
         self.chat_input.clear()
         self.transcript.append("You: %s" % text)
+        # A picture goes with the message (a vision model only):
+        # the transcript notes it, so the turn reads true later.
+        images = []
+        if self._attached_image is not None:
+            images = [str(self._attached_image)]
+            self.transcript.append(
+                "Image: %s" % self._attached_image.name)
+            self._remove_attachment()
         # The reply carries the model name that wrote it (captured
         # now, so a model switch mid-session never mislabels it).
         name = self.controller.current_name or "Model"
@@ -2547,7 +3278,8 @@ class MainWindow(QMainWindow):
         history = trim_history(self._chat_history)
         self._chat_history.append({"role": "user", "content": text})
         self.chat_worker = ChatWorker(self.runner, text,
-                                      history=history)
+                                      history=history,
+                                      images=images)
         self.chat_worker.token.connect(self._on_chat_token)
         self.chat_worker.finished.connect(self._on_chat_finished)
         self.chat_worker.failed.connect(self._on_chat_failed)
@@ -2715,10 +3447,18 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy):
         self.busy_dot.setVisible(busy)
 
+    def _is_model_loaded(self, path):
+        """True when this file is the model loaded right now:
+        the Pull window asks before pulling over it."""
+        return (self.controller.is_loaded
+                and self.controller.current_path is not None
+                and str(self.controller.current_path) == str(path))
+
     def show_pull_window(self):
         if self.pull_window is None:
             self.pull_window = PullWindow(
-                self.models_folder, log=self.log)
+                self.models_folder, log=self.log,
+                is_loaded=self._is_model_loaded)
             self.pull_window.setAttribute(
                 Qt.WidgetAttribute.WA_DeleteOnClose)
             self.pull_window.destroyed.connect(self._pull_closed)

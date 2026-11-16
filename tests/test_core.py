@@ -14,12 +14,15 @@ from fyrn.core import (HEADROOM_BYTES, WORKING_BYTES, ImportCancelled,
                              ModelController, ModelNotFoundError,
                              ModelTooBigError, default_models_folder,
                              ensure_home, ensure_models_folder,
-                             fit_status, format_size, get_home,
-                             import_gguf, kv_cache_bytes_per_token,
-                             list_part_files, model_headroom_bytes,
-                             ram_check, read_gguf_metadata,
-                             read_gguf_numbers, read_ram_bytes,
-                             remove_gguf, scan_models)
+                             find_projector, fit_status, format_facts,
+                             format_size, get_home, import_gguf,
+                             kv_cache_bytes_per_token, list_part_files,
+                             model_headroom_bytes, move_to_trash,
+                             projector_size_bytes, ram_check,
+                             read_gguf_facts, read_gguf_metadata,
+                             read_gguf_numbers, read_gguf_tensor_params,
+                             read_ram_bytes, remove_gguf, scan_models,
+                             trash_dir)
 from fyrn.runner import FakeRunner
 
 GB = 1024 ** 3
@@ -588,6 +591,256 @@ class DeadConstantTests(unittest.TestCase):
         # copy in core.py is how version drift starts.
         self.assertFalse(hasattr(fyrn.core, "VERSION"))
         self.assertEqual(fyrn.core.APP_NAME, "Fyrn")
+
+
+class GgufFactsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_full_facts_from_header(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf",
+            {"general.architecture": "qwen3"},
+            numbers={"qwen3.context_length": 32768},
+            tensors=[("blk.0.attn_q.weight", [2000, 1000000], 0)],
+            file_type=15)  # Q4_K_M
+        facts = read_gguf_facts(path)
+        self.assertEqual(facts["params"], 2000000000)
+        self.assertEqual(facts["params_text"], "2B")
+        self.assertEqual(facts["architecture"], "qwen3")
+        self.assertEqual(facts["context_length"], 32768)
+        self.assertEqual(facts["context_text"], "32K context")
+        self.assertEqual(facts["quantization"], "Q4_K_M")
+        self.assertEqual(format_facts(facts),
+                         "2B · Q4_K_M · 32K context")
+
+    def test_millions_format(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf", {},
+            tensors=[("w", [1000, 1000], 0)])
+        facts = read_gguf_facts(path)
+        self.assertEqual(facts["params_text"], "1M")
+        self.assertEqual(format_facts(facts), "1M · F32")
+
+    def test_unknown_file_type_shows_nothing(self):
+        # A file type the table does not know is no fact at all:
+        # never a guess.
+        path = write_gguf_file(self.folder / "a.gguf", {},
+                               file_type=999)
+        facts = read_gguf_facts(path)
+        self.assertNotIn("quantization", facts)
+        self.assertEqual(format_facts(facts), "")
+
+    def test_context_needs_architecture(self):
+        # A context length without its architecture key is not
+        # attributable to anything: no context fact.
+        path = write_gguf_file(
+            self.folder / "a.gguf", {},
+            numbers={"qwen3.context_length": 32768})
+        facts = read_gguf_facts(path)
+        self.assertNotIn("context_length", facts)
+        self.assertNotIn("context_text", facts)
+
+    def test_architecture_without_context(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf",
+            {"general.architecture": "qwen3"})
+        facts = read_gguf_facts(path)
+        self.assertEqual(facts["architecture"], "qwen3")
+        self.assertNotIn("context_length", facts)
+
+    def test_bad_file_has_no_facts(self):
+        path = make_fake_gguf(self.folder / "fake.gguf", 2048)
+        self.assertEqual(read_gguf_facts(path), {})
+        self.assertEqual(format_facts({}), "")
+
+    def test_missing_file_has_no_facts(self):
+        self.assertEqual(
+            read_gguf_facts(self.folder / "nope.gguf"), {})
+
+    def test_scan_includes_facts(self):
+        write_gguf_file(
+            self.folder / "real.gguf",
+            {"general.architecture": "qwen3"},
+            file_type=15)
+        make_fake_gguf(self.folder / "plain.gguf", 1024)
+        models, _skipped = scan_models(self.folder)
+        by_name = {m["name"]: m for m in models}
+        self.assertEqual(
+            by_name["real.gguf"]["facts"]["quantization"],
+            "Q4_K_M")
+        self.assertEqual(by_name["plain.gguf"]["facts"], {})
+
+
+class TensorParamsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_exact_count_sums_tensors(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf", {},
+            tensors=[("a", [2, 3], 0), ("b", [4], 0)])
+        self.assertEqual(read_gguf_tensor_params(path), 10)
+
+    def test_no_tensors_is_zero(self):
+        path = write_gguf_file(self.folder / "a.gguf", {})
+        self.assertEqual(read_gguf_tensor_params(path), 0)
+
+    def test_bad_file_is_none(self):
+        path = make_fake_gguf(self.folder / "fake.gguf", 2048)
+        self.assertIsNone(read_gguf_tensor_params(path))
+
+    def test_truncated_tensor_section_is_none(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf", {},
+            tensors=[("a", [2, 3], 0), ("b", [4], 0)])
+        data = path.read_bytes()
+        cut = self.folder / "cut.gguf"
+        cut.write_bytes(data[:-4])  # mid-tensor-info
+        self.assertIsNone(read_gguf_tensor_params(cut))
+
+
+class FindProjectorTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _model(self, name="Qwen3-VL-2B-Instruct-Q4_K_M.gguf"):
+        path = self.folder / name
+        path.write_bytes(b"x")
+        return path
+
+    def test_no_projector_is_none(self):
+        self.assertIsNone(find_projector(self._model()))
+        self.assertEqual(projector_size_bytes(self._model()), 0)
+
+    def test_one_candidate_wins(self):
+        model = self._model()
+        projector = self.folder / "mmproj-Qwen3-VL-2B-Q8_0.gguf"
+        projector.write_bytes(b"p" * 100)
+        self.assertEqual(find_projector(model), projector)
+        self.assertEqual(projector_size_bytes(model), 100)
+
+    def test_matching_stem_wins(self):
+        model = self._model()
+        wrong = self.folder / "mmproj-llava-1.6-mistral-7b.gguf"
+        wrong.write_bytes(b"x")
+        right = self.folder / "mmproj-Qwen3-VL-2B-Instruct-Q8_0.gguf"
+        right.write_bytes(b"x")
+        self.assertEqual(find_projector(model), right)
+
+    def test_tie_is_none(self):
+        model = self._model("model.gguf")
+        (self.folder / "mmproj-a-q4_k_m.gguf").write_bytes(b"x")
+        (self.folder / "mmproj-b-q4_k_m.gguf").write_bytes(b"x")
+        # Both share nothing with the model name: a tie means no
+        # projector, never a guess between two.
+        self.assertIsNone(find_projector(model))
+
+    def test_case_insensitive_and_non_gguf_ignored(self):
+        model = self._model()
+        (self.folder / "mmproj-foo.txt").write_bytes(b"x")
+        projector = self.folder / "MMPROJ-Qwen3-VL-2B-Q8_0.GGUF"
+        projector.write_bytes(b"x")
+        self.assertEqual(find_projector(model), projector)
+
+    def test_missing_folder_is_none(self):
+        self.assertIsNone(
+            find_projector(self.folder / "nope" / "a.gguf"))
+
+
+class MoveToTrashTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+        self.data_home = self.folder / "data"
+        self._old_xdg = os.environ.get("XDG_DATA_HOME")
+        os.environ["XDG_DATA_HOME"] = str(self.data_home)
+
+    def tearDown(self):
+        if self._old_xdg is None:
+            os.environ.pop("XDG_DATA_HOME", None)
+        else:
+            os.environ["XDG_DATA_HOME"] = self._old_xdg
+        self.tmp.cleanup()
+
+    def test_trash_dir_uses_xdg_data_home(self):
+        self.assertEqual(trash_dir(), self.data_home / "Trash")
+
+    def test_move_lands_in_trash_with_info(self):
+        path = self.folder / "alpha.gguf"
+        path.write_bytes(b"model-bytes")
+        dest = move_to_trash(path)
+        self.assertFalse(path.exists())
+        self.assertEqual(dest, self.data_home / "Trash" / "files"
+                         / "alpha.gguf")
+        self.assertEqual(dest.read_bytes(), b"model-bytes")
+        info = (self.data_home / "Trash" / "info"
+                / "alpha.gguf.trashinfo").read_text()
+        self.assertIn("[Trash Info]", info)
+        self.assertIn("Path=%s" % path.resolve(), info)
+        self.assertRegex(info, r"DeletionDate=\d{4}-\d{2}-\d{2}T"
+                         r"\d{2}:\d{2}:\d{2}")
+
+    def test_collision_numbers_the_name(self):
+        first_dir = self.folder / "one"
+        second_dir = self.folder / "two"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        (first_dir / "same.gguf").write_bytes(b"1")
+        (second_dir / "same.gguf").write_bytes(b"2")
+        move_to_trash(first_dir / "same.gguf")
+        dest = move_to_trash(second_dir / "same.gguf")
+        self.assertEqual(dest.name, "same.gguf.1")
+        self.assertEqual(dest.read_bytes(), b"2")
+        self.assertTrue((self.data_home / "Trash" / "info"
+                         / "same.gguf.1.trashinfo").is_file())
+
+    def test_missing_file_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            move_to_trash(self.folder / "gone.gguf")
+        self.assertIn("already gone", str(ctx.exception))
+
+    def test_non_gguf_raises_and_keeps_file(self):
+        path = self.folder / "notes.txt"
+        path.write_bytes(b"x")
+        with self.assertRaises(ValueError) as ctx:
+            move_to_trash(path)
+        self.assertIn("not a .gguf", str(ctx.exception))
+        self.assertTrue(path.exists())
+
+    def test_cross_device_falls_back_to_copy(self):
+        path = self.folder / "alpha.gguf"
+        path.write_bytes(b"model-bytes")
+        with mock.patch("fyrn.core.os.replace",
+                        side_effect=OSError(
+                            18, "Invalid cross-device link")):
+            dest = move_to_trash(path)
+        self.assertFalse(path.exists())
+        self.assertEqual(dest.read_bytes(), b"model-bytes")
+
+    def test_failed_move_keeps_the_file(self):
+        path = self.folder / "alpha.gguf"
+        path.write_bytes(b"model-bytes")
+        with mock.patch("fyrn.core.os.replace",
+                        side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(ValueError):
+                move_to_trash(path)
+        self.assertTrue(path.exists())
+        self.assertEqual(path.read_bytes(), b"model-bytes")
+        self.assertFalse((self.data_home / "Trash" / "files"
+                          / "alpha.gguf").exists())
 
 
 if __name__ == "__main__":

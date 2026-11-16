@@ -1,0 +1,43 @@
+{
+  "_comment": "Local CI config for Fyrn (BNB-TOOLS T28). Run with: sh ci/check.sh",
+  "_suite_command": "ci/run_suite.sh picks the shared venv Python and the extracted Qt libraries when they exist (the sandbox), and falls back to plain python3 anywhere else.",
+  "_suite_timeout": "The suite takes 150-200s when the sandbox is quiet and over 280s when other threads run suites at the same time, so the timeout is hang detection, not a speed limit.",
+  "_zip_executable_globs": "install.sh, run.sh, and the .desktop files ship executable \u2014 the same set build_zip.py stores as 0o100755. launcher.sh and ci/check.sh are templates invoked via sed/sh and ship 0o100644, so they are deliberately NOT matched by a *.sh glob.",
+  "doc_counts": [
+    {
+      "kind": "files",
+      "label": "test files",
+      "min": 1,
+      "path": "tests",
+      "pattern": "test_*.py"
+    },
+    {
+      "kind": "files",
+      "label": "source files",
+      "min": 1,
+      "path": "fyrn",
+      "pattern": "*.py"
+    }
+  ],
+  "mode_check": true,
+  "project": "fyrn",
+  "status_file": "CI-STATUS.md",
+  "suite_command": [
+    "sh",
+    "ci/run_suite.sh"
+  ],
+  "suite_timeout": 600,
+  "zip": true,
+  "zip_executable_globs": [
+    "install.sh",
+    "run.sh",
+    "*.desktop"
+  ],
+  "zip_executables": [
+    "install.sh",
+    "run.sh",
+    "Fyrn.desktop",
+    "Install-Fyrn.desktop"
+  ],
+  "zip_top": "fyrn"
+}

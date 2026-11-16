@@ -48,6 +48,11 @@ EXEC_FILES = {
 PLAIN_FILES = [
     "build_zip.py",
     "render_icons.py",
+    "launcher.sh",
+    "ci/local_ci.py",
+    "ci/check.sh",
+    "ci/config.json",
+    "ci/run_suite.sh",
     "requirements.txt",
     "README.md",
     "CHANGELOG.md",

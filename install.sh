@@ -9,6 +9,28 @@ cd "$DIR"
 
 echo "Installing Fyrn..."
 
+# Disk space, before anything is created: the venv plus
+# dependencies need room, and a mid-install ENOSPC leaves a
+# broken half-install. 1 GB is the floor. If free space cannot
+# be measured, warn and carry on: an unmeasurable check must
+# not block an install.
+# The || true keeps a failing df from killing the script
+# under set -euo pipefail: an unmeasurable check warns and
+# carries on, it never aborts the install.
+FREE_KB="$(df -P -k "$DIR" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+case "$FREE_KB" in
+  ''|*[!0-9]*)
+    echo "Could not check free disk space; continuing anyway."
+    ;;
+  *)
+    if [ "$FREE_KB" -lt 1048576 ]; then
+      echo "Not enough free disk space to install Fyrn."
+      echo "Fyrn needs at least 1 GB free where it is installed."
+      exit 1
+    fi
+    ;;
+esac
+
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Python 3 is needed and was not found."
   exit 1
@@ -79,7 +101,12 @@ rm -f "$DIR/.gui-smoke-error.txt"
 
 mkdir -p "$HOME/.local/share/applications" "$HOME/.local/bin"
 
-sed "s|__APP_DIR__|$DIR|g" Fyrn.desktop \
+# The desktop file starts Fyrn through the launcher in
+# ~/.local/bin/fyrn (not run.sh directly): the launcher finds the
+# folder again if it moved, so the icon keeps working after a
+# move. Desktop files do not expand $HOME, so the home folder is
+# baked in too.
+sed -e "s|__APP_DIR__|$DIR|g" -e "s|__HOME__|$HOME|g" Fyrn.desktop \
   > "$HOME/.local/share/applications/Fyrn.desktop"
 
 if [ -d "$HOME/Desktop" ]; then
@@ -90,13 +117,9 @@ if [ -d "$HOME/Desktop" ]; then
     2>/dev/null || true
 fi
 
-# PYTHONPATH points at the app folder: without it, `fyrn` only
-# works when the terminal happens to be in the app folder, because
-# `python -m fyrn` finds the package through the working directory.
-{
-  echo '#!/usr/bin/env bash'
-  echo "PYTHONPATH=\"$DIR\${PYTHONPATH:+:\$PYTHONPATH}\" exec \"$DIR/.venv/bin/python\" -m fyrn \"\$@\""
-} > "$HOME/.local/bin/fyrn"
+# The launcher, from the launcher.sh template: it starts Fyrn
+# from this folder, and finds the folder again if it moved.
+sed "s|__APP_DIR__|$DIR|g" launcher.sh > "$HOME/.local/bin/fyrn"
 chmod +x "$HOME/.local/bin/fyrn"
 
 echo "Fyrn installed."

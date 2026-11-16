@@ -81,6 +81,12 @@ class Runner:
     # cancel it cannot deliver.
     cancellable_load = True
 
+    # True when the loaded model can see images: a vision model
+    # whose projector (mmproj) file was found and loaded. The UI
+    # enables Attach only then, so a text model never promises
+    # sight it does not have.
+    supports_vision = False
+
     def __init__(self):
         self.model_path = None
 
@@ -111,13 +117,16 @@ class Runner:
         self.model_path = None
 
     def generate(self, prompt, on_token=None, cancel_event=None,
-                 history=None):
+                 history=None, images=None):
         """Stream a reply. Returns a stats dict.
 
         on_token is called with each piece of text as it arrives.
         history is the earlier turns (a list of {"role": ...,
         "content": ...} dicts), sent with the new message so the
         model answers in context instead of forgetting every turn.
+        images is a list of image file paths to send with the
+        message; a model that cannot see raises RunnerError
+        instead of pretending to look at them.
         Stats: tokens, elapsed_s, ttft_s (time to first token),
         tokens_per_sec.
         """
@@ -134,7 +143,8 @@ class FakeRunner(Runner):
     """
 
     def __init__(self, reply_text=None, load_delay_s=0.0,
-                 token_delay_s=0.0, ttft_delay_s=0.0):
+                 token_delay_s=0.0, ttft_delay_s=0.0,
+                 supports_vision=False):
         super().__init__()
         self.reply_text = (
             reply_text
@@ -143,9 +153,12 @@ class FakeRunner(Runner):
         self.load_delay_s = load_delay_s
         self.token_delay_s = token_delay_s
         self.ttft_delay_s = ttft_delay_s
+        self.supports_vision = supports_vision
         # The history the last generate() call received, so tests
         # can check the conversation actually reached the runner.
         self.last_history = None
+        # The images the last generate() call received, same idea.
+        self.last_images = None
 
     def load(self, path, progress_cb=None, cancel_event=None):
         started = time.monotonic()
@@ -165,10 +178,16 @@ class FakeRunner(Runner):
         super().unload()
 
     def generate(self, prompt, on_token=None, cancel_event=None,
-                 history=None):
+                 history=None, images=None):
         if not self.is_loaded:
             raise RunnerError("No model is loaded.")
+        if images and not self.supports_vision:
+            raise RunnerError(
+                "This model cannot see images. Load a vision "
+                "model (one with its projector file next to it) "
+                "to ask about a picture.")
         self.last_history = list(history or [])
+        self.last_images = list(images or [])
         started = time.monotonic()
         if self.ttft_delay_s > 0:
             time.sleep(self.ttft_delay_s)
@@ -191,11 +210,39 @@ class FakeRunner(Runner):
                                                          elapsed_s)}
 
 
+# Image types the attach dialog offers: PNG and JPEG are what
+# the engine's image loader is known to handle.
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
+_IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg",
+               ".jpeg": "image/jpeg"}
+
+
+def _image_data_url(path):
+    """An image file as a data: URL for the engine's image loader
+    (it takes data: URLs and web addresses, not local paths)."""
+    import base64
+
+    suffix = os.path.splitext(str(path))[1].lower()
+    mime = _IMAGE_MIME.get(suffix)
+    if mime is None:
+        raise RunnerError(
+            "That image type cannot be used. Pick a PNG or JPEG "
+            "picture.")
+    with open(path, "rb") as fh:
+        encoded = base64.b64encode(fh.read()).decode("ascii")
+    return "data:%s;base64,%s" % (mime, encoded)
+
+
 class LlamaRunner(Runner):
     """The real runner: GGUF models on the CPU via llama.cpp.
 
     llama_cpp is imported lazily, inside load(), so the window opens
     and the tests run on a machine without the backend installed.
+
+    Vision: a model with its projector (mmproj) file next to it
+    loads through the engine's mtmd handler, so it can answer
+    about pictures. The handler runs on the CPU (use_gpu=False):
+    this PC has no GPU to offload to.
     """
 
     # The Llama() constructor is one long opaque step: it never
@@ -206,6 +253,12 @@ class LlamaRunner(Runner):
         super().__init__()
         self._llm = None
         self._free_ram_fn = free_ram_fn
+        self._vision = False
+        self.projector_path = None
+
+    @property
+    def supports_vision(self):
+        return self._vision
 
     def _free_ram(self):
         if self._free_ram_fn is not None:
@@ -241,12 +294,41 @@ class LlamaRunner(Runner):
             raise LoadCancelled("Load cancelled.")
         threads = auto_threads()
         context = auto_context_tokens(self._free_ram())
+        # Vision: a projector file next to the model means the
+        # model can see. It loads through the engine's mtmd
+        # handler (CPU only). A projector that cannot be used
+        # never blocks the load: the model still loads, as text
+        # only, and the warning says why it cannot see.
+        from .core import (VISION_ARCHITECTURES, find_projector,
+                           read_gguf_metadata)
+        projector = find_projector(path)
+        chat_handler = None
+        vision_warning = ""
+        if projector is not None:
+            try:
+                from llama_cpp.llama_chat_format import (
+                    MTMDChatHandler)
+                chat_handler = MTMDChatHandler(
+                    str(projector), verbose=False, use_gpu=False)
+            except Exception as exc:
+                chat_handler = None
+                vision_warning = (
+                    "Its projector file could not be used (%s), so "
+                    "it loads as text only." % exc)
+        elif (read_gguf_metadata(path).get("general.architecture")
+                in VISION_ARCHITECTURES):
+            vision_warning = (
+                "This is a vision model, but its projector file "
+                "is not next to it, so it loads as text only. "
+                "Put the mmproj file in the same folder to let "
+                "it see.")
         try:
             self._llm = Llama(
                 model_path=str(path),
                 n_threads=threads,
                 n_ctx=context,
                 verbose=False,
+                chat_handler=chat_handler,
             )
         except Exception as exc:
             self._llm = None
@@ -259,25 +341,52 @@ class LlamaRunner(Runner):
         if progress_cb is not None:
             progress_cb(100, "Loaded")
         self.model_path = str(path)
-        return {"load_time_s": time.monotonic() - started}
+        self._vision = chat_handler is not None
+        self.projector_path = (str(projector)
+                               if chat_handler is not None else None)
+        result = {"load_time_s": time.monotonic() - started}
+        if vision_warning:
+            result["vision_warning"] = vision_warning
+        return result
 
     def unload(self):
         # Dropping the reference frees the model; the backend holds
-        # no other state.
+        # no other state. The vision state goes with it.
         self._llm = None
+        self._vision = False
+        self.projector_path = None
         super().unload()
 
     def generate(self, prompt, on_token=None, cancel_event=None,
-                 history=None):
+                 history=None, images=None):
         if not self.is_loaded or self._llm is None:
             raise RunnerError("No model is loaded.")
+        if images and not self._vision:
+            raise RunnerError(
+                "This model cannot see images. Load a vision "
+                "model (one with its projector file next to it) "
+                "to ask about a picture.")
         started = time.monotonic()
         ttft_s = None
         pieces = []
         # The earlier turns go first, trimmed to the budget, so
         # the model answers in context; the new message is last.
+        # With pictures, the new message carries them as image
+        # parts the engine's vision handler turns into sight.
         messages = trim_history(history or [])
-        messages.append({"role": "user", "content": prompt})
+        if images:
+            parts = [{"type": "text", "text": prompt}]
+            for image_path in images:
+                try:
+                    url = _image_data_url(image_path)
+                except OSError as exc:
+                    raise RunnerError(
+                        "That picture could not be read (%s)." % exc)
+                parts.append({"type": "image_url",
+                              "image_url": {"url": url}})
+            messages.append({"role": "user", "content": parts})
+        else:
+            messages.append({"role": "user", "content": prompt})
         try:
             stream = self._llm.create_chat_completion(
                 messages=messages,

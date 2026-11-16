@@ -33,12 +33,19 @@ def file_bytes(path):
         return fh.read()
 
 
-def write_gguf_file(path, metadata, version=3, numbers=None):
+def write_gguf_file(path, metadata, version=3, numbers=None,
+                    tensors=None, file_type=0):
     """Write a minimal valid GGUF file with the given string
     metadata (dict key -> str) and numeric metadata (dict key ->
     int, written as UINT32), plus one uint32 entry
-    (general.file_type) and one string array, so parser tests
-    have a real file to read. No tensors."""
+    (general.file_type, the file_type argument, default F32)
+    and one string array, so parser tests have a real file to
+    read. tensors is a list of (name, dims, type) tuples
+    written as tensor infos after the KV section (v3 only); the
+    default is no tensors."""
+    if tensors and version != 3:
+        raise ValueError("tensors are only supported for GGUF v3")
+    tensors = list(tensors or [])
     out = bytearray()
     out += b"GGUF"
     out += struct.pack("<I", version)
@@ -46,7 +53,7 @@ def write_gguf_file(path, metadata, version=3, numbers=None):
     number_entries = list((numbers or {}).items())
     kv_count = len(entries) + len(number_entries) + 2
     if version == 3:
-        out += struct.pack("<Q", 0)  # tensor count
+        out += struct.pack("<Q", len(tensors))  # tensor count
         out += struct.pack("<Q", kv_count)
     else:
         out += struct.pack("<I", 0)
@@ -68,7 +75,7 @@ def write_gguf_file(path, metadata, version=3, numbers=None):
     # One non-string entry: general.file_type, uint32.
     put_string("general.file_type")
     out.extend(struct.pack("<I", 4))  # UINT32
-    out.extend(struct.pack("<I", 0))
+    out.extend(struct.pack("<I", file_type))
     # One array entry: two strings, skipped by the parser.
     put_string("general.tags")
     out.extend(struct.pack("<I", 9))  # ARRAY
@@ -76,6 +83,16 @@ def write_gguf_file(path, metadata, version=3, numbers=None):
     out.extend(struct.pack("<Q", 2))
     put_string("test")
     put_string("gguf")
+    # Tensor infos: name, dimension count, dimensions, type,
+    # offset (no tensor data follows; the parser only reads the
+    # infos for the parameter count).
+    for name, dims, tensor_type in tensors:
+        put_string(name)
+        out.extend(struct.pack("<I", len(dims)))
+        for dim in dims:
+            out.extend(struct.pack("<Q", dim))
+        out.extend(struct.pack("<I", tensor_type))
+        out.extend(struct.pack("<Q", 0))
     Path(path).write_bytes(bytes(out))
     return path
 

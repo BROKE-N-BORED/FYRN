@@ -1,5 +1,75 @@
 # Changelog
 
+## Fyrn v0.4 (2026-11-16)
+
+The v0.2 review, continued: install and first-run, then workflow.
+Every item below has a test.
+
+- Vision models can see. A model with its projector (mmproj)
+  file next to it loads through the engine's vision handler (CPU
+  only), and the Chat tab gains an Attach image button: pick a
+  PNG or JPEG picture, ask about it. A vision model without its
+  projector loads as text only and says so in the status line,
+  and the fit badge counts the projector's size. Not yet verified
+  with a real vision model: no Qwen3-VL-2B or similar model
+  exists in the test sandbox, so the wiring is proven with the
+  engine's handler mocked, and the real-model check is still
+  owed on a PC that has one.
+- Remove moves a model to the desktop trash instead of deleting
+  it, so a mistaken remove is undoable from the trash. The
+  confirm says so in plain words.
+- Search and filter on the Models tab: a search box that narrows
+  the list as you type, and a menu for size (under 1 GB, 1-3 GB,
+  over 3 GB) or where the model came from (Ollama, my folder). A
+  filter that matches nothing says so instead of leaving a blank
+  tab. Load and Remove only work on a card you can see.
+- Cards show real facts from the model's own header: parameter
+  count, quantization, and context length ("2B · Q4_K_M · 32K
+  context"), and the architecture in the hover detail. A file
+  whose header carries nothing shows nothing: nothing is ever
+  invented.
+- Pulls can be queued: add several models, press Pull queue, and
+  one worker pulls them in order, each with its own state
+  (Waiting, Downloading, Done, Failed). A failure or a cancel
+  stops the queue and leaves the rest waiting.
+- Pulls show time left, smoothed so the number does not jump
+  with every chunk ("about 3 min left"), and the queue position
+  while a queue runs ("2 of 3").
+- The pull field is checked the moment it loses focus: a bad
+  model name or URL is an inline error right away, not a
+  surprise when Pull is pressed.
+- A model that is already in the folder can be pulled again: it
+  asks first (default No, the same confirm habit as Remove),
+  and the old file is kept until the new download finishes. A
+  model that is loaded right now is refused outright, with a
+  plain message to unload it first.
+- Refreshing the model list no longer rebuilds the whole grid:
+  cards that still show their model stay exactly where they are,
+  so scroll position and keyboard focus survive every refresh.
+  Only a model that changed (a re-pull, a load) gets a new card.
+- Drop .gguf files on the window to import them, one after
+  another, through the same worker as Import (progress, cancel,
+  no partial model left behind).
+- The installer checks free disk space first (1 GB floor) and
+  refuses plainly when there is not enough, instead of dying
+  mid-install with a broken half-install. When free space cannot
+  be measured, it warns and carries on.
+- The folder can move. Fyrn starts through a launcher that finds
+  the folder again if it was moved or renamed, rewrites itself
+  and the desktop icon to the new home, and starts Fyrn from
+  there. When it cannot find the folder, or finds more than one,
+  it says so plainly instead of guessing.
+- Dependencies are pinned (PySide6-Essentials 6.12.0,
+  llama-cpp-python 0.3.36), so an install today is the install
+  that was tested.
+- The zip test now covers the whole tree: a file forgotten from
+  the builder's hand-maintained list fails the suite instead of
+  shipping a zip without it.
+- Local CI (BNB-TOOLS T28): `sh ci/check.sh` runs the suite,
+  builds a throwaway release-shaped zip and verifies its stored
+  modes, checks the executables carry their exec bits on disk,
+  and writes the verdict to CI-STATUS.md.
+
 ## Fyrn v0.3 (2026-11-15)
 
 The v0.2 review, built: the bugs and correctness findings, highest
