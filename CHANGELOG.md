@@ -1,5 +1,64 @@
 # Changelog
 
+## Fyrn v0.5 (2026-11-16)
+
+The v0.2 review, finished: usability and polish. Every item
+below has a test.
+
+- Keyboard focus and selection are different things now, and they
+  look different: a selected card has a solid amber border (the
+  one Load will act on), a card that only has keyboard focus has
+  a dashed blue ring. Both at once reads as selected.
+- The app follows the system text size: no fixed point sizes
+  anywhere in the app, so a larger system font scales every label
+  and every card grows with it instead of clipping.
+- Keyboard shortcuts: Ctrl+L load, Ctrl+P pull, Ctrl+I import,
+  Ctrl+U unload, Delete remove, F5 refresh, Ctrl+F focus search,
+  Ctrl+, settings, Ctrl+K command palette, Ctrl+Q quit, F1 How
+  to Use. Every shortcut shows in its menu, and the buttons list
+  theirs in their tooltips.
+- Every button has a tooltip saying what it does (and its
+  shortcut, when it has one). No button is left bare.
+- All colours live in one place now (fyrn/theme.py): the dark
+  theme's tokens, and a high-contrast theme beside them. The look
+  is unchanged; only the source of the values moved.
+- The pull progress view is tidier: the busy dot sits on the
+  progress bar's row instead of its own row, and percent, MB,
+  speed, and time left live in one stats line under the bar. The
+  bars themselves carry no text (the numbers are in the stats
+  line, where they stay readable).
+- A second launch is fast: it raises the running window without
+  importing Qt at all (a lock file plus a socket, stdlib only),
+  instead of paying the full startup cost to discover Fyrn is
+  already open. Measured with a real running instance: 0.37-0.60
+  s per second launch, against the review's 11.49 s baseline.
+- Cold start is faster: the pull module, the debug logger, and
+  QtNetwork are imported only when they are actually needed
+  instead of at startup. Measured by CPU time (the sandbox's
+  wall clock is too load-noisy to claim seconds from): importing
+  the window module costs 0.22 s of CPU against 0.30 s before,
+  and the whole start to a shown window 0.33 s against 0.40 s.
+- Command palette (Ctrl+K, or Help menu): every command in one
+  searchable list. Type a few letters, press Enter.
+- A pull finishing plays a short two-note chime (generated in
+  code, no sound file, no new dependency), unless it is muted in
+  Settings. It needs a sound backend: on a machine with no audio
+  output device there is no chime, and the visual signal (the
+  status fade) is the whole signal. The sound itself is not yet
+  verified on a machine with audio.
+- The model list moves: new cards fade in one after another,
+  cards that change place in a re-sort glide to their new spot,
+  and scrolling past the top or bottom shows a subtle edge glow.
+  All of it is one-shot opacity and geometry work, cheap on a
+  2-core CPU with no GPU, and all of it is skipped under Reduce
+  motion.
+- Compact model list (Settings): smaller cards, four across, so
+  at least half again as many models fit on screen at once. The
+  description and facts stay in each card's tooltip.
+- High-contrast mode (Settings): black and white with yellow
+  highlights, every bit of text at least 7 to 1 against its
+  background. Applies live, no restart.
+
 ## Fyrn v0.4 (2026-11-16)
 
 The v0.2 review, continued: install and first-run, then workflow.

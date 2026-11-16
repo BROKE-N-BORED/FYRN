@@ -17,8 +17,9 @@ from pathlib import Path
 from PySide6.QtCore import (QEvent, QEasingCurve, QLockFile, QPoint,
                             QPropertyAnimation, QRect, QSettings, Qt,
                             QThread, QTimer, Signal)
-from PySide6.QtGui import QCursor, QGuiApplication, QIcon
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from shiboken6 import isValid
+from PySide6.QtGui import (QAction, QCursor, QGuiApplication, QIcon,
+                           QKeySequence, QShortcut)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
                                QDialog, QFileDialog, QFrame,
                                QGraphicsOpacityEffect, QGridLayout,
@@ -37,13 +38,14 @@ from .core import (HEADROOM_BYTES, ImportCancelled, ModelController,
                    format_size, list_part_files, model_headroom_bytes,
                    move_to_trash, projector_size_bytes, read_ram_bytes,
                    scan_models)
-from .debug_log import DebugLogger
 from .discover import discover_ollama_models
-from .pull import (DownloadError, PullCancelled, download_file,
-                   fetch_hf_sha256, format_eta, parse_hf_url,
-                   parse_model_input, read_part_url)
+# The pull module is imported lazily, inside the methods that use
+# it: it costs ~0.4 s of cold start, and nothing needs it until a
+# pull actually runs.
 from .runner import (GenerationCancelled, LoadCancelled, LlamaRunner,
                      RunnerError, auto_context_tokens, trim_history)
+from .theme import (DARK, HIGH_CONTRAST, THEMES, build_stylesheet,
+                    fit_badges, rgba_string)
 
 DEFAULT_WIDTH = 1100
 DEFAULT_HEIGHT = 700
@@ -53,147 +55,16 @@ SETTINGS_APP = "fyrn"
 _HERE = Path(__file__).resolve().parent
 ICON_PATH = _HERE.parent / "assets" / "fyrn.png"
 
-# The look: one dark stylesheet, drawn from the icon, applied by
-# main() across every window. Deep blue-black surfaces (#14202e, the
-# icon tile), ember amber (#f2c14e) for selection and highlights,
-# ember orange (#e8890c) for progress. The motion in the app is
-# small and cheap: two one-shot 200 ms opacity fades (pull finish,
-# newly pulled card), a 150 ms press dip on Send/Load/Pull, and a
-# 200 ms 4 px hover lift on cards. The reduced-motion fallback
-# skips all of it.
-DARK_STYLESHEET = """
-QWidget {
-    background-color: #14202e;
-    color: #e8e8e8;
-    font-size: 11pt;
-}
-QMainWindow, QDialog {
-    background-color: #14202e;
-}
-QLabel {
-    color: #e8e8e8;
-}
-QPushButton {
-    background-color: #243447;
-    border: 1px solid #3a4d63;
-    border-radius: 6px;
-    padding: 6px 16px;
-    color: #e8e8e8;
-}
-QPushButton:hover {
-    border-color: #f2c14e;
-}
-QPushButton:pressed {
-    background-color: #1a2836;
-}
-QPushButton:focus {
-    border-color: #f2c14e;
-}
-QPushButton:disabled {
-    color: #666666;
-    border-color: #2a3644;
-}
-QLineEdit, QTextEdit {
-    background-color: #0f1822;
-    border: 1px solid #3a4d63;
-    border-radius: 6px;
-    padding: 5px 8px;
-    color: #e8e8e8;
-    selection-background-color: #e8890c;
-}
-QLineEdit:focus, QTextEdit:focus {
-    border-color: #f2c14e;
-}
-QTabWidget::pane {
-    border: 1px solid #3a4d63;
-    background-color: #14202e;
-}
-QTabBar::tab {
-    background-color: #1a2836;
-    border: 1px solid #3a4d63;
-    border-bottom: none;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-    padding: 8px 20px;
-    color: #bbbbbb;
-}
-QTabBar::tab:selected {
-    background-color: #243447;
-    color: #f2c14e;
-    border-bottom: 2px solid #f2c14e;
-}
-QMenuBar {
-    background-color: #14202e;
-    color: #e8e8e8;
-}
-QMenuBar::item {
-    padding: 4px 10px;
-}
-QMenuBar::item:selected {
-    background-color: #243447;
-}
-QMenu {
-    background-color: #1c2836;
-    border: 1px solid #3a4d63;
-    color: #e8e8e8;
-}
-QMenu::item:selected {
-    background-color: #243447;
-    color: #f2c14e;
-}
-QProgressBar {
-    background-color: #0f1822;
-    border: 1px solid #3a4d63;
-    border-radius: 6px;
-    text-align: center;
-    color: #e8e8e8;
-}
-QProgressBar::chunk {
-    background-color: #e8890c;
-    border-radius: 6px;
-}
-QScrollBar:vertical {
-    background-color: #14202e;
-    width: 12px;
-}
-QScrollBar::handle:vertical {
-    background-color: #3a4d63;
-    border-radius: 6px;
-    min-height: 30px;
-}
-QScrollBar::handle:vertical:hover {
-    background-color: #f2c14e;
-}
-QScrollBar:horizontal {
-    background-color: #14202e;
-    height: 12px;
-}
-QScrollBar::handle:horizontal {
-    background-color: #3a4d63;
-    border-radius: 6px;
-    min-width: 30px;
-}
-QScrollBar::handle:horizontal:hover {
-    background-color: #f2c14e;
-}
-QListWidget {
-    background-color: #0f1822;
-    border: 1px solid #3a4d63;
-    border-radius: 6px;
-}
-QListWidget::item:selected {
-    background-color: #243447;
-    color: #f2c14e;
-}
-QScrollArea {
-    background-color: #14202e;
-    border: none;
-}
-QStatusBar {
-    background-color: #0f1822;
-    color: #bbbbbb;
-}
-"""
+# The look: one stylesheet per theme, built from the design
+# tokens in fyrn/theme.py and applied by main() across every
+# window. No fixed point sizes anywhere: the application font
+# (and the user's system text size) shows through. The motion in
+# the app is small and cheap: two one-shot 200 ms opacity fades
+# (pull finish, newly pulled card), a 150 ms press dip on
+# Send/Load/Pull, and a 200 ms 4 px hover lift on cards. The
+# reduced-motion fallback skips all of it.
+DARK_STYLESHEET = build_stylesheet(DARK)
+HIGH_CONTRAST_STYLESHEET = build_stylesheet(HIGH_CONTRAST)
 
 
 def get_reduce_motion():
@@ -236,6 +107,58 @@ def set_show_ollama_models(value):
     settings = get_settings()
     settings.setValue("show_ollama_models", bool(value))
     settings.sync()
+
+
+def get_high_contrast():
+    """The high-contrast theme (Settings window). Off by
+    default: the dark theme is the look Fyrn has always had."""
+    settings = get_settings()
+    return bool(settings.value("high_contrast", False, type=bool))
+
+
+def set_high_contrast(value):
+    settings = get_settings()
+    settings.setValue("high_contrast", bool(value))
+    settings.sync()
+
+
+def get_compact_list():
+    """The compact model list (Settings window). Off by
+    default: full-size cards, three across."""
+    settings = get_settings()
+    return bool(settings.value("compact_list", False, type=bool))
+
+
+def set_compact_list(value):
+    settings = get_settings()
+    settings.setValue("compact_list", bool(value))
+    settings.sync()
+
+
+def get_chime_muted():
+    """The pull-complete chime mute (Settings window). Off by
+    default: the chime plays when a pull finishes, per the
+    library entry's rule (default on, mute available)."""
+    settings = get_settings()
+    return bool(settings.value("chime_muted", False, type=bool))
+
+
+def set_chime_muted(value):
+    settings = get_settings()
+    settings.setValue("chime_muted", bool(value))
+    settings.sync()
+
+
+def current_tokens():
+    """The active theme's tokens: high-contrast when that
+    setting is on, the dark theme otherwise."""
+    return THEMES["high-contrast" if get_high_contrast()
+                  else "dark"]
+
+
+def current_stylesheet():
+    """The active theme's stylesheet."""
+    return build_stylesheet(current_tokens())
 
 HOW_TO_USE_SECTIONS = {
     "First steps": (
@@ -512,6 +435,12 @@ class PullWorker(QThread):
         self.cancel_event = threading.Event()
 
     def run(self):
+        # The pull module is imported here, not at module level:
+        # it costs ~0.4 s of cold start, and nothing needs it
+        # until a pull actually runs.
+        from .pull import (DownloadError, PullCancelled,
+                           download_file, fetch_hf_sha256,
+                           parse_hf_url)
         try:
             # A Hugging Face pull is checked against the checksum
             # the site publishes, so a corrupt download never
@@ -647,6 +576,10 @@ class SingleInstance:
 
     def start_server(self, on_raise) -> bool:
         """Listen for raise requests from later launches."""
+        # QtNetwork is imported here, not at module level: it is
+        # only needed once the window exists, and importing it
+        # with the module costs cold-start time for every launch.
+        from PySide6.QtNetwork import QLocalServer
         self._on_raise = on_raise
         # A crashed run leaves its socket behind; remove it first or
         # listen fails with "Address in use".
@@ -686,6 +619,7 @@ class SingleInstance:
         instance that has taken the lock but not yet started its
         server answers once it is up.
         """
+        from PySide6.QtNetwork import QLocalSocket
         for _ in range(10):
             sock = QLocalSocket()
             sock.connectToServer(self.server_name)
@@ -697,6 +631,57 @@ class SingleInstance:
                 return True
             time.sleep(0.2)
         return False
+
+
+class RaiseListener(QThread):
+    """Listens on ~/.fyrn/raise.sock for the pre-Qt fast path
+    (fyrn/__main__.py): a second launch sends b"raise" here,
+    and this thread emits raise_requested, which the main
+    window connects to bring_to_front. A QThread, so the signal
+    crosses to the GUI thread safely. Only the first instance
+    runs one: it holds the fcntl lock, so a stale socket file
+    from a crashed run is safe to remove here."""
+
+    raise_requested = Signal()
+
+    def __init__(self, sock_path, parent=None):
+        super().__init__(parent)
+        self._sock_path = Path(sock_path)
+        self._server = None
+
+    def run(self):
+        import socket
+        try:
+            self._sock_path.unlink()
+        except OSError:
+            pass  # no stale socket, or it went away on its own
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server = server
+        try:
+            server.bind(str(self._sock_path))
+        except OSError:
+            return  # another listener won the race; nothing to do
+        server.listen(1)
+        server.settimeout(0.5)
+        while not self.isInterruptionRequested():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                if conn.recv(16):
+                    self.raise_requested.emit()
+            except OSError:
+                pass
+            finally:
+                conn.close()
+        try:
+            server.close()
+            self._sock_path.unlink()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------- windows
@@ -844,6 +829,8 @@ class PullWindow(QDialog):
 
         suggest_row = QHBoxLayout()
         self.suggest_button = QPushButton("Try Qwen2.5 0.5B first")
+        self.suggest_button.setToolTip(
+            "Fill in a small model that fits this PC easily")
         self.suggest_button.clicked.connect(self._fill_suggestion)
         suggest_row.addWidget(self.suggest_button)
         suggest_row.addStretch(1)
@@ -851,16 +838,27 @@ class PullWindow(QDialog):
 
         buttons = QHBoxLayout()
         self.pull_button = PressDipButton("Pull")
+        self.pull_button.setToolTip(
+            "Download the model in the field")
         self.pull_button.clicked.connect(self._start_pull)
         self.queue_add_button = QPushButton("Add to queue")
+        self.queue_add_button.setToolTip(
+            "Add the model in the field to the queue, to pull "
+            "later")
         self.queue_add_button.clicked.connect(self._add_to_queue)
         self.queue_pull_button = QPushButton("Pull queue")
+        self.queue_pull_button.setToolTip(
+            "Download every model in the queue, in order")
         self.queue_pull_button.clicked.connect(self._start_queue)
         self.queue_pull_button.setEnabled(False)
         self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setToolTip(
+            "Stop this download (it can be resumed later)")
         self.cancel_button.clicked.connect(self._cancel_pull)
         self.cancel_button.setEnabled(False)
         self.close_button = QPushButton("Close")
+        self.close_button.setToolTip(
+            "Close this window (a download keeps running)")
         self.close_button.clicked.connect(self.close)
         buttons.addWidget(self.pull_button)
         buttons.addWidget(self.queue_add_button)
@@ -870,20 +868,34 @@ class PullWindow(QDialog):
         buttons.addWidget(self.close_button)
         layout.addLayout(buttons)
 
+        # The progress row: bar, busy dot, and the numbers in one
+        # tidy block (percent, MB, speed, ETA). The bar itself
+        # carries no text: the numbers live in the stats line,
+        # where they are always readable whatever the bar's fill
+        # is doing underneath them.
+        progress_row = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
+        self.progress_bar.setTextVisible(False)
+        progress_row.addWidget(self.progress_bar, 1)
+        self.busy_dot = QLabel("\u25cf")
+        self.busy_dot.setObjectName("busy_dot")
+        self.busy_dot.setStyleSheet(
+            "color: %s;" % current_tokens()["accent"])
+        self.busy_dot.setVisible(False)
+        progress_row.addWidget(self.busy_dot)
+        layout.addLayout(progress_row)
+
+        self.progress_stats = QLabel("")
+        self.progress_stats.setObjectName("progress_stats")
+        self.progress_stats.setWordWrap(True)
+        self.progress_stats.setVisible(False)
+        layout.addWidget(self.progress_stats)
 
         self.status_label = QLabel("Nothing pulling yet.")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
-
-        self.busy_dot = QLabel("\u25cf")
-        self.busy_dot.setObjectName("busy_dot")
-        self.busy_dot.setStyleSheet("color: #f2c14e;")
-        self.busy_dot.setVisible(False)
-        layout.addWidget(self.busy_dot)
 
         # The pull queue: models waiting their turn, each with its
         # state (Waiting, Downloading, Done, Failed). Hidden when
@@ -899,6 +911,8 @@ class PullWindow(QDialog):
         layout.addWidget(self.queue_list)
         queue_buttons = QHBoxLayout()
         self.queue_remove_button = QPushButton("Remove from queue")
+        self.queue_remove_button.setToolTip(
+            "Take the selected model out of the queue")
         self.queue_remove_button.clicked.connect(self._remove_queued)
         queue_buttons.addWidget(self.queue_remove_button)
         queue_buttons.addStretch(1)
@@ -921,8 +935,12 @@ class PullWindow(QDialog):
         layout.addWidget(self.parts_list)
         parts_buttons = QHBoxLayout()
         self.part_resume_button = QPushButton("Resume")
+        self.part_resume_button.setToolTip(
+            "Pick up this unfinished download where it stopped")
         self.part_resume_button.clicked.connect(self._resume_part)
         self.part_delete_button = QPushButton("Delete")
+        self.part_delete_button.setToolTip(
+            "Throw this unfinished download away")
         self.part_delete_button.clicked.connect(self._delete_part)
         parts_buttons.addWidget(self.part_resume_button)
         parts_buttons.addWidget(self.part_delete_button)
@@ -935,6 +953,11 @@ class PullWindow(QDialog):
         """Fill the field with the suggested first model."""
         self.input.setText(FIRST_PULL_SUGGESTION)
         self.input.setFocus()
+
+    def apply_theme(self, tokens):
+        """Re-skin the pull window's busy dot for a theme change
+        (the rest of the window follows the app stylesheet)."""
+        self.busy_dot.setStyleSheet("color: %s;" % tokens["accent"])
 
     def _set_busy(self, busy):
         self.busy_dot.setVisible(busy)
@@ -950,6 +973,7 @@ class PullWindow(QDialog):
         status line belongs to the pull then)."""
         if self.worker is not None:
             return
+        from .pull import parse_model_input
         text = self.input.text().strip()
         if not text:
             if self._validation_error:
@@ -991,6 +1015,7 @@ class PullWindow(QDialog):
     def _start_pull(self):
         if self.worker is not None:
             return
+        from .pull import parse_model_input
         try:
             target = parse_model_input(self.input.text())
         except ValueError as exc:
@@ -1029,6 +1054,7 @@ class PullWindow(QDialog):
         The field clears so the next one can be typed straight
         away. A model already in the folder asks about replacing
         it, the same as Pull does."""
+        from .pull import parse_model_input
         try:
             target = parse_model_input(self.input.text())
         except ValueError as exc:
@@ -1093,6 +1119,7 @@ class PullWindow(QDialog):
             self.status_label.setText(
                 "Queue done. %d models pulled." % done)
         self._celebrate()
+        self._play_chime()
         self._refresh_part_list()
         self._maybe_close_pending()
 
@@ -1212,6 +1239,7 @@ class PullWindow(QDialog):
         part_path = self._selected_part_path()
         if part_path is None:
             return
+        from .pull import read_part_url
         url = read_part_url(part_path)
         if url is None:
             self.status_label.setText(
@@ -1252,11 +1280,15 @@ class PullWindow(QDialog):
         self._refresh_part_list()
 
     def _on_progress(self, downloaded, total, speed):
-        # Where this pull sits in the queue: "2 of 3: ...".
+        # Where this pull sits in the queue: "2 of 3: ...". The
+        # status line carries the state; the numbers live in the
+        # stats line, one tidy block: percent, MB, speed, ETA.
         prefix = ""
         position = self._queue_position()
         if position is not None:
             prefix = "%d of %d: " % position
+        self.status_label.setText("%sDownloading..." % prefix)
+        self.progress_stats.setVisible(True)
         if total and total > 0:
             self.progress_bar.setRange(0, 100)
             pct = int(downloaded * 100 / total)
@@ -1272,12 +1304,13 @@ class PullWindow(QDialog):
                 else:
                     self._eta_smoothed = (
                         0.7 * self._eta_smoothed + 0.3 * raw_eta)
+                from .pull import format_eta
                 eta = format_eta(self._eta_smoothed)
                 if eta is not None:
-                    eta_text = ", %s" % eta
-            self.status_label.setText(
-                "%s%s of %s downloaded, %s per second%s"
-                % (prefix, format_size(downloaded),
+                    eta_text = " · %s" % eta
+            self.progress_stats.setText(
+                "%d%% · %s of %s · %s per second%s"
+                % (pct, format_size(downloaded),
                    format_size(total), format_size(int(speed)),
                    eta_text))
             if self._queue_item is not None:
@@ -1287,13 +1320,14 @@ class PullWindow(QDialog):
                 self._queue_item["status"] = "downloading"
         else:
             self.progress_bar.setRange(0, 0)  # unknown total: busy bar
-            self.status_label.setText(
-                "%s%s downloaded, %s per second"
-                % (prefix, format_size(downloaded),
+            self.progress_stats.setText(
+                "%s downloaded · %s per second"
+                % (format_size(downloaded),
                    format_size(int(speed))))
 
     def _on_finished(self, path):
         self._drop_worker()
+        self.progress_stats.setVisible(False)
         self._refresh_part_list()
         if self.log is not None:
             self.log.action("pull finished: %s" % path)
@@ -1310,6 +1344,7 @@ class PullWindow(QDialog):
         self.status_label.setText("Done. The model is in your models "
                                   "folder.")
         self._celebrate()
+        self._play_chime()
         self._set_busy(False)
         self._maybe_close_pending()
 
@@ -1319,6 +1354,18 @@ class PullWindow(QDialog):
         if self._close_pending and self.worker is None:
             self._close_pending = False
             self.close()
+
+    def _play_chime(self):
+        """The pull-complete chime (two soft notes), unless muted
+        in Settings. The sound is generated in code and played
+        through QtMultimedia; when the machine has no sound
+        backend, play_chime returns False and the visual signal
+        (the status fade + tray message) is the whole signal —
+        never a fake chime."""
+        if get_chime_muted():
+            return
+        from .chime import play_chime
+        play_chime()
 
     def _celebrate(self):
         """A small quiet celebration when a pull finishes: one
@@ -1353,6 +1400,7 @@ class PullWindow(QDialog):
         self._queue_running = False
         self._queue_item = None
         self.progress_bar.setRange(0, 100)
+        self.progress_stats.setVisible(False)
         self.status_label.setText(message)
         self._set_busy(False)
         self._drop_worker()
@@ -1371,6 +1419,7 @@ class PullWindow(QDialog):
         self._queue_running = False
         self._queue_item = None
         self.progress_bar.setRange(0, 100)
+        self.progress_stats.setVisible(False)
         self.status_label.setText(
             "Pull stopped. The part already downloaded stays, and "
             "pulling again picks up where it stopped.")
@@ -1446,12 +1495,14 @@ class PullWindow(QDialog):
 class SettingsWindow(QDialog):
     """Settings: its own resizable pop-up window (U1).
 
-    Two settings, both ones the user would change for a real
-    reason (U36): the models folder, and Reduce motion. The
-    window is resizable and maximizable; nothing pins its size.
+    The models folder, Reduce motion, and the display and sound
+    settings: compact list, high-contrast mode, and the
+    pull-complete chime mute. The window is resizable and
+    maximizable; nothing pins its size.
     """
 
     folder_changed = Signal(str)
+    settings_saved = Signal()
 
     def __init__(self, current_folder, parent=None):
         super().__init__(parent)
@@ -1470,6 +1521,8 @@ class SettingsWindow(QDialog):
         self.folder_edit = QLineEdit(str(current_folder))
         self.folder_edit.setReadOnly(True)
         browse_button = QPushButton("Browse")
+        browse_button.setToolTip(
+            "Pick a different folder for your models")
         browse_button.clicked.connect(self._browse)
         row.addWidget(self.folder_edit)
         row.addWidget(browse_button)
@@ -1503,12 +1556,47 @@ class SettingsWindow(QDialog):
         ollama_help.setWordWrap(True)
         layout.addWidget(ollama_help)
 
+        self.compact_check = QCheckBox("Compact model list")
+        self.compact_check.setChecked(get_compact_list())
+        layout.addWidget(self.compact_check)
+
+        compact_help = QLabel(
+            "Smaller cards, more models on screen at once. The "
+            "description and facts stay in each card's tooltip.")
+        compact_help.setWordWrap(True)
+        layout.addWidget(compact_help)
+
+        self.contrast_check = QCheckBox("High-contrast mode")
+        self.contrast_check.setChecked(get_high_contrast())
+        layout.addWidget(self.contrast_check)
+
+        contrast_help = QLabel(
+            "Black and white with yellow highlights. Every bit of "
+            "text is at least 7 to 1 against its background.")
+        contrast_help.setWordWrap(True)
+        layout.addWidget(contrast_help)
+
+        self.chime_check = QCheckBox(
+            "Mute the pull-complete chime")
+        self.chime_check.setChecked(get_chime_muted())
+        layout.addWidget(self.chime_check)
+
+        chime_help = QLabel(
+            "A short chime plays when a pull finishes. Check this "
+            "to turn it off.")
+        chime_help.setWordWrap(True)
+        layout.addWidget(chime_help)
+
         layout.addStretch(1)
 
         buttons = QHBoxLayout()
         self.save_button = QPushButton("Save")
+        self.save_button.setToolTip(
+            "Save these settings")
         self.save_button.clicked.connect(self._save)
         cancel_button = QPushButton("Cancel")
+        cancel_button.setToolTip(
+            "Close without saving")
         cancel_button.clicked.connect(self.reject)
         buttons.addStretch(1)
         buttons.addWidget(self.save_button)
@@ -1545,7 +1633,11 @@ class SettingsWindow(QDialog):
         set_models_folder(folder)
         set_reduce_motion(self.motion_check.isChecked())
         set_show_ollama_models(self.ollama_check.isChecked())
+        set_compact_list(self.compact_check.isChecked())
+        set_high_contrast(self.contrast_check.isChecked())
+        set_chime_muted(self.chime_check.isChecked())
         self.folder_changed.emit(str(folder))
+        self.settings_saved.emit()
         self.accept()
 
 
@@ -1588,21 +1680,110 @@ class HowToUseWindow(QDialog):
             HOW_TO_USE_SECTIONS.get(title, ""))
 
 
+class CommandPalette(QDialog):
+    """Every command in one searchable list (entry 025): type a
+    few letters, press Enter. One keystroke opens it (Ctrl+K),
+    and the list narrows as you type, so nothing in the app is
+    more than a few keystrokes away. Commands are (title,
+    shortcut text, callable) triples, supplied by the main
+    window; the palette itself knows nothing about what they
+    do."""
+
+    def __init__(self, commands, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Commands")
+        self.setMinimumSize(480, 300)
+        self.resize(520, 340)
+        self._commands = list(commands)
+        self._filtered = list(commands)
+
+        layout = QVBoxLayout(self)
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Type a command")
+        self.input.setClearButtonEnabled(True)
+        self.input.textChanged.connect(self._filter)
+        self.input.installEventFilter(self)
+        layout.addWidget(self.input)
+
+        self.list = QListWidget()
+        self.list.itemActivated.connect(self._run_current)
+        layout.addWidget(self.list)
+        self._rebuild_list()
+
+    def _rebuild_list(self):
+        self.list.clear()
+        for title, shortcut, _action in self._filtered:
+            text = title if not shortcut else "%s  (%s)" % (
+                title, shortcut)
+            self.list.addItem(QListWidgetItem(text))
+        if self._filtered:
+            self.list.setCurrentRow(0)
+
+    def _filter(self, text):
+        needle = text.strip().lower()
+        if not needle:
+            self._filtered = list(self._commands)
+        else:
+            self._filtered = [
+                command for command in self._commands
+                if needle in command[0].lower()]
+        self._rebuild_list()
+
+    def _run_current(self):
+        row = self.list.currentRow()
+        if 0 <= row < len(self._filtered):
+            _title, _shortcut, action = self._filtered[row]
+            self.accept()
+            action()
+
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt naming
+        # Arrow keys move through the list while the input keeps
+        # focus, so typing and choosing never need the mouse.
+        if watched is self.input and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key == Qt.Key.Key_Down:
+                row = min(self.list.currentRow() + 1,
+                          self.list.count() - 1)
+                self.list.setCurrentRow(row)
+                return True
+            if key == Qt.Key.Key_Up:
+                row = max(self.list.currentRow() - 1, 0)
+                self.list.setCurrentRow(row)
+                return True
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._run_current()
+                return True
+        return super().eventFilter(watched, event)
+
+
 # ---------------------------------------------------------------- tiles
 
 # Bento grid numbers (entry 005): 3 columns at this window width,
 # 16 px gaps, 12 px corners. Cards size to their content; the hero
-# tile spans the full width and earns it with live stats.
+# tile spans the full width and earns it with live stats. Compact
+# mode (Settings) packs more in: 4 columns, 10 px gaps, shorter
+# cards with the description and facts hidden (they stay in the
+# tooltip).
 GRID_COLUMNS = 3
 GRID_SPACING = 16
+GRID_COLUMNS_COMPACT = 4
+GRID_SPACING_COMPACT = 10
 
 
-FIT_BADGES = {
-    "fits": ("Fits", "#2e7d32"),
-    "tight": ("Tight", "#b7791f"),
-    "too big": ("Too big", "#b3261e"),
-    "unknown": ("Unknown", "#666666"),
-}
+def grid_columns():
+    """The grid's column count for the current density."""
+    return (GRID_COLUMNS_COMPACT if get_compact_list()
+            else GRID_COLUMNS)
+
+
+def grid_spacing():
+    """The grid's gap for the current density."""
+    return GRID_SPACING_COMPACT if get_compact_list() else GRID_SPACING
+
+
+# The fit badges for the dark theme, kept under this name for the
+# tests; a card under another theme uses fit_badges(tokens).
+FIT_BADGES = fit_badges(DARK)
 
 
 class ModelCard(QFrame):
@@ -1621,8 +1802,17 @@ class ModelCard(QFrame):
     remove_requested = Signal(str)  # path
 
     def __init__(self, model, status, loaded=False, hero=False,
-                 free_bytes=None, parent=None):
+                 free_bytes=None, parent=None, tokens=None,
+                 compact=None):
         super().__init__(parent)
+        # The theme this card draws with: passed in by the main
+        # window, or the active theme when a test builds a card
+        # on its own. apply_theme swaps it live.
+        self._tokens = tokens or current_tokens()
+        # Compact mode (Settings): shorter cards, description and
+        # facts hidden (they stay in the tooltip).
+        self._compact = (get_compact_list() if compact is None
+                         else compact)
         self.path = str(model["path"])
         # The display name (an Ollama model's name, or the file
         # name) and where the model came from: "folder" for a file
@@ -1666,79 +1856,51 @@ class ModelCard(QFrame):
         # ("2B · Q4_K_M · 32K context"): absent entirely when the
         # header carries nothing to show.
         self.facts_text = format_facts(model.get("facts") or {})
-        # Content height, not a fixed box: a card holds three lines
-        # (name, size, badge), so ~100 px is enough; the old
-        # 110-150 px box left each card ~60% empty inside. A card
-        # with a description or a facts line gets room for it.
-        self.setMinimumHeight(120 if hero else 96)
-        # Cap the height: the grid's expanding spacer takes the
-        # leftover space, but without a cap the tiles still grow
-        # past their content (250 px tall with 2 models).
-        if hero:
-            self.setMaximumHeight(170)
-        elif self.description or self.facts_text:
-            self.setMaximumHeight(150)
-        else:
-            self.setMaximumHeight(120)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(12, 10, 12, 10)
+        self._layout.setSpacing(4)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(4)
+        # No fixed point sizes on any label: the application font
+        # (and the user's system text size) shows through, and the
+        # name's weight, not a bigger size, marks it as the title.
+        self._name_label = QLabel(model["name"])
+        self._name_label.setWordWrap(True)
+        self._layout.addWidget(self._name_label)
 
-        name = QLabel(model["name"])
-        name.setWordWrap(True)
-        name.setStyleSheet("font-size: %dpt; font-weight: bold;"
-                           % (16 if hero else 13))
-        layout.addWidget(name)
+        self._size_label = QLabel(format_size(model["size"]))
+        self._layout.addWidget(self._size_label)
 
-        size = QLabel(format_size(model["size"]))
-        size.setStyleSheet("font-size: 11pt; color: #999999;")
-        layout.addWidget(size)
-
+        self._desc_label = None
         if self.description:
-            desc_label = QLabel(self.description)
-            desc_label.setObjectName("model_description")
-            desc_label.setWordWrap(True)
-            desc_label.setStyleSheet(
-                "font-size: 11pt; color: #999999;")
-            layout.addWidget(desc_label)
+            self._desc_label = QLabel(self.description)
+            self._desc_label.setObjectName("model_description")
+            self._desc_label.setWordWrap(True)
+            self._layout.addWidget(self._desc_label)
 
+        self._facts_label = None
         if self.facts_text:
-            facts_label = QLabel(self.facts_text)
-            facts_label.setObjectName("model_facts")
-            facts_label.setWordWrap(True)
-            facts_label.setStyleSheet(
-                "font-size: 11pt; color: #999999;")
-            layout.addWidget(facts_label)
+            self._facts_label = QLabel(self.facts_text)
+            self._facts_label.setObjectName("model_facts")
+            self._facts_label.setWordWrap(True)
+            self._layout.addWidget(self._facts_label)
 
-        badge_text, badge_color = FIT_BADGES[status]
         badge_row = QHBoxLayout()
-        self._badge_label = QLabel(badge_text)
+        self._badge_label = QLabel("")
         self._badge_label.setObjectName("fit_badge")
-        self._badge_label.setStyleSheet(
-            "background-color: %s; color: white; font-size: 11pt; "
-            "font-weight: bold; padding: 3px 10px; border-radius: 8px;"
-            % badge_color)
         badge_row.addWidget(self._badge_label)
+        self._loaded_label = None
         if loaded:
-            loaded_label = QLabel("Loaded")
-            loaded_label.setStyleSheet(
-                "color: #f2c14e; font-size: 11pt; font-weight: bold; "
-                "border: 1px solid #f2c14e; padding: 2px 9px; "
-                "border-radius: 8px;")
-            badge_row.addWidget(loaded_label)
+            self._loaded_label = QLabel("Loaded")
+            badge_row.addWidget(self._loaded_label)
+        self._ollama_label = None
         if self.source == "ollama":
             # A quiet marker: this model came from Ollama's store,
             # so Fyrn can load it but not remove it.
-            ollama_label = QLabel("Ollama")
-            ollama_label.setObjectName("ollama_tag")
-            ollama_label.setStyleSheet(
-                "color: #999999; font-size: 11pt; "
-                "border: 1px solid #555555; padding: 2px 9px; "
-                "border-radius: 8px;")
-            badge_row.addWidget(ollama_label)
+            self._ollama_label = QLabel("Ollama")
+            self._ollama_label.setObjectName("ollama_tag")
+            badge_row.addWidget(self._ollama_label)
         badge_row.addStretch(1)
-        layout.addLayout(badge_row)
+        self._layout.addLayout(badge_row)
         # The hero tile earns its size with live stats (load time,
         # then speed once a reply exists), updated by the main
         # window's stats refresh. Plain cards have no stats line.
@@ -1746,17 +1908,102 @@ class ModelCard(QFrame):
         if hero:
             self.stats_label = QLabel("")
             self.stats_label.setObjectName("hero_stats")
-            self.stats_label.setStyleSheet(
-                "font-size: 11pt; color: #999999;")
             self.stats_label.setWordWrap(True)
-            layout.addWidget(self.stats_label)
-        layout.addStretch(1)
+            self._layout.addWidget(self.stats_label)
+        self._layout.addStretch(1)
+
+        self._apply_label_styles()
+        self._apply_compact()
+        self._apply_heights()
 
         # Clicks on the labels must reach the card, not stop at the
         # label: the whole tile is the thing you tap.
         for child in self.findChildren(QLabel):
             child.setAttribute(
                 Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._apply_frame()
+
+    def _apply_label_styles(self):
+        """Every label's style, from this card's theme tokens.
+        Re-run by apply_theme when the theme changes live."""
+        tokens = self._tokens
+        self._name_label.setStyleSheet("font-weight: bold;")
+        muted = "color: %s;" % tokens["text_muted"]
+        self._size_label.setStyleSheet(muted)
+        if self._desc_label is not None:
+            self._desc_label.setStyleSheet(muted)
+        if self._facts_label is not None:
+            self._facts_label.setStyleSheet(muted)
+        if self.stats_label is not None:
+            self.stats_label.setStyleSheet(muted)
+        self._apply_badge_style()
+        if self._loaded_label is not None:
+            self._loaded_label.setStyleSheet(
+                "color: %s; font-weight: bold; border: 1px solid %s; "
+                "padding: 2px 9px; border-radius: 8px;"
+                % (tokens["accent"], tokens["accent"]))
+        if self._ollama_label is not None:
+            self._ollama_label.setStyleSheet(
+                "color: %s; border: 1px solid %s; padding: 2px 9px; "
+                "border-radius: 8px;"
+                % (tokens["text_muted"], tokens["border_dim"]))
+
+    def _apply_badge_style(self):
+        """The fit badge's text and background, from this card's
+        theme tokens and current fit status."""
+        badge_text, badge_color = fit_badges(self._tokens)[self._status]
+        self._badge_label.setText(badge_text)
+        self._badge_label.setStyleSheet(
+            "background-color: %s; color: %s; font-weight: bold; "
+            "padding: 3px 10px; border-radius: 8px;"
+            % (badge_color, self._tokens["badge_text"]))
+
+    def _apply_heights(self):
+        """Card height from the font's line height, not fixed
+        pixels: a card holds name, size, and badge (four lines
+        with room for a wrapped name), plus description, facts,
+        and stats lines when it has them. The cap is still there
+        (the grid's expanding spacer takes the leftover space,
+        but without a cap the tiles grow past their content),
+        only now it grows with the font instead of clipping a
+        larger one. Compact cards are shorter: no description or
+        facts, tighter margins."""
+        line = self.fontMetrics().lineSpacing()
+        if self._compact:
+            self.setMinimumHeight(3 * line + 16)
+            self.setMaximumHeight(4 * line + 16)
+            return
+        self.setMinimumHeight(4 * line + 32)
+        if self._hero or self.description or self.facts_text:
+            self.setMaximumHeight(8 * line + 32)
+        else:
+            self.setMaximumHeight(5 * line + 32)
+
+    def _apply_compact(self):
+        """Compact mode on this card: description and facts
+        hidden (they stay in the tooltip), tighter margins and
+        spacing. Full mode restores them."""
+        if self._desc_label is not None:
+            self._desc_label.setVisible(not self._compact)
+        if self._facts_label is not None:
+            self._facts_label.setVisible(not self._compact)
+        if self._compact:
+            self._layout.setContentsMargins(8, 5, 8, 5)
+            self._layout.setSpacing(2)
+        else:
+            self._layout.setContentsMargins(12, 10, 12, 10)
+            self._layout.setSpacing(4)
+
+    def set_compact(self, compact):
+        """Switch this card's density live (Settings)."""
+        self._compact = bool(compact)
+        self._apply_compact()
+        self._apply_heights()
+
+    def apply_theme(self, tokens):
+        """Swap this card's theme live (Settings)."""
+        self._tokens = tokens
+        self._apply_label_styles()
         self._apply_frame()
 
     def set_stats(self, text):
@@ -1786,12 +2033,7 @@ class ModelCard(QFrame):
         free RAM moves between refreshes, and the badge follows
         it without rebuilding the card."""
         self._status = status
-        badge_text, badge_color = FIT_BADGES[status]
-        self._badge_label.setText(badge_text)
-        self._badge_label.setStyleSheet(
-            "background-color: %s; color: white; font-size: 11pt; "
-            "font-weight: bold; padding: 3px 10px; border-radius: 8px;"
-            % badge_color)
+        self._apply_badge_style()
         self.setToolTip(
             self._build_tooltip(model, status, free_bytes))
 
@@ -1809,6 +2051,12 @@ class ModelCard(QFrame):
         architecture = (model.get("facts") or {}).get("architecture")
         if architecture:
             lines.append("Architecture: %s" % architecture)
+        # The facts line (params, quant, context): compact mode
+        # hides the facts label, so the tooltip is the only place
+        # left to read it. Present in both modes, for one tooltip.
+        facts_text = format_facts(model.get("facts") or {})
+        if facts_text:
+            lines.append(facts_text)
         headroom = model.get("headroom_bytes", HEADROOM_BYTES)
         needed = model["size"] + headroom
         if free_bytes is None:
@@ -1836,22 +2084,29 @@ class ModelCard(QFrame):
         self._apply_frame()
 
     def _apply_frame(self):
-        # Selected and keyboard-focused cards both get the amber
-        # border, so focus is visible at a glance. Labels inside
-        # the card are transparent: the global widget background
-        # (#14202e) is darker than the card (#1c2836), so an
-        # opaque label shows a darker band behind its text. The
-        # badge keeps its own background (its own stylesheet wins
-        # over this descendant rule).
-        if self._selected or self.hasFocus():
-            border = "2px solid #f2c14e"
+        # Selected and keyboard-focused are two different states
+        # and must never look the same: Load acts on the
+        # selection, so a card that only has focus must not read
+        # as selected. Selected is a solid amber border; focused
+        # but not selected is a dashed blue ring; selected and
+        # focused is solid amber (the selection wins, because it
+        # is the one Load will act on). Labels inside the card
+        # are transparent: the global widget background is darker
+        # than the card, so an opaque label shows a darker band
+        # behind its text. The badge keeps its own background
+        # (its own stylesheet wins over this descendant rule).
+        tokens = self._tokens
+        if self._selected:
+            border = "2px solid %s" % tokens["accent"]
+        elif self.hasFocus():
+            border = "2px dashed %s" % tokens["focus_ring"]
         else:
-            border = "1px solid #555555"
+            border = "1px solid %s" % tokens["border_dim"]
         self.setStyleSheet(
             "ModelCard { border: %s; border-radius: 12px; "
-            "background-color: #1c2836; } "
+            "background-color: %s; } "
             "ModelCard QLabel { background-color: transparent; }"
-            % border)
+            % (border, tokens["bg_raised"]))
 
     def focusInEvent(self, event):  # noqa: N802 - Qt naming
         self._apply_frame()
@@ -1977,18 +2232,26 @@ class SkeletonCard(QFrame):
     # name, size, and fit badge.
     BAR_SIZES = ((160, 16), (70, 12), (60, 20))
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, tokens=None):
         super().__init__(parent)
+        self._tokens = tokens or current_tokens()
         self.setFrameShape(QFrame.Shape.StyledPanel)
         # Same height as a regular card, so the list does not jump
-        # when the skeletons are replaced by real cards.
-        self.setMinimumHeight(96)
-        self.setMaximumHeight(120)
+        # when the skeletons are replaced by real cards. Font
+        # derived, like the real card's, so a larger system text
+        # size does not make the skeletons shorter than the cards
+        # that replace them.
+        line = self.fontMetrics().lineSpacing()
+        self.setMinimumHeight(4 * line + 32)
+        self.setMaximumHeight(5 * line + 32)
+        tokens = self._tokens
         self.setStyleSheet(
-            "SkeletonCard { border: 1px solid #444444; "
-            "border-radius: 12px; background-color: #1a2531; } "
-            "QFrame#skeleton_bar { background-color: #2a3644; "
-            "border: none; border-radius: 4px; }")
+            "SkeletonCard { border: 1px solid %s; "
+            "border-radius: 12px; background-color: %s; } "
+            "QFrame#skeleton_bar { background-color: %s; "
+            "border: none; border-radius: 4px; }"
+            % (tokens["skeleton_border"], tokens["skeleton_bg"],
+               tokens["skeleton_bar"]))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
@@ -2068,16 +2331,20 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(ICON_PATH)))
 
         home = ensure_home()
-        self.log = log or DebugLogger(
-            "fyrn", __version__, log_dir=str(home / "logs"))
-        self.log.register_dependency("PySide6")
-        self.log.register_dependency("llama-cpp-python")
-        self.log.install_crash_handler()
+        self._home = home
+        # The debug logger is created lazily (see the log
+        # property): importing its module costs ~0.5 s, and
+        # nothing needs the logger before the window is shown.
+        # main() warms it on the first event-loop turn after the
+        # window appears, so it is ready before the user can do
+        # anything; any earlier access creates it on the spot.
+        # A logger passed in (tests) is used as-is.
+        self._log = log
+        self._log_ready = log is not None
 
         self.runner = runner if runner is not None else LlamaRunner()
         self.controller = ModelController(self.runner)
         self.models_folder = ensure_models_folder(get_models_folder())
-        self.log.set_setting("models_folder", str(self.models_folder))
 
         self.load_worker = None
         self.chat_worker = None
@@ -2118,6 +2385,13 @@ class MainWindow(QMainWindow):
         self._visible_paths = set()
         self._pulse_path = None
         self._pulse_anim = None
+        # List-motion animations in flight: stagger fades and
+        # FLIP ghosts. Kept alive here (an animation that is
+        # garbage-collected stops dead) and dropped when each
+        # one finishes.
+        self._stagger_anims = []
+        self._flip_anims = []
+        self._overscroll_anims = {}
         # Files dropped on the window, waiting their turn to
         # import: one import runs at a time, the rest queue.
         self._import_pending = []
@@ -2142,7 +2416,8 @@ class MainWindow(QMainWindow):
 
         self.busy_dot = QLabel("\u25cf")
         self.busy_dot.setObjectName("busy_dot")
-        self.busy_dot.setStyleSheet("color: #f2c14e;")
+        self.busy_dot.setStyleSheet(
+            "color: %s;" % current_tokens()["accent"])
         self.busy_dot.setVisible(False)
         self.statusBar().addPermanentWidget(self.busy_dot)
         # Transient status messages fall back to the neutral line
@@ -2161,39 +2436,134 @@ class MainWindow(QMainWindow):
         self._stats_timer.timeout.connect(self._refresh_stats)
         self._stats_timer.start()
 
+        # The first scan starts here, in the constructor, not
+        # deferred: it runs on its own thread, so it costs the
+        # first paint nothing but the skeleton layout (~10 ms),
+        # and starting it here keeps the invariant the tests and
+        # closeEvent rely on — _scan_worker is set from the
+        # moment the window exists, so a close always waits for
+        # it. (A singleShot deferral was tried and reverted: the
+        # scan could then start after closeEvent had already run,
+        # and the orphaned worker aborted the process.)
         self._refresh_model_list()
         self._refresh_stats()
         self._setup_tray()
 
     # ------------------------------------------------------------ menus
 
+    @property
+    def log(self):
+        """The debug logger, created on first use (its module
+        import costs ~0.5 s, which is why it is not paid during
+        construction)."""
+        if not self._log_ready:
+            self._init_logger()
+        return self._log
+
+    def _init_logger(self):
+        """Create the debug logger: dependencies, crash handler,
+        and the models-folder setting. Called by main() once the
+        window is visible, or by the log property on first use —
+        whichever comes first."""
+        if self._log_ready:
+            return
+        from .debug_log import DebugLogger
+        self._log = DebugLogger(
+            "fyrn", __version__, log_dir=str(self._home / "logs"))
+        self._log.register_dependency("PySide6")
+        self._log.register_dependency("llama-cpp-python")
+        self._log.install_crash_handler()
+        self._log.set_setting("models_folder",
+                              str(self.models_folder))
+        self._log_ready = True
+
     def _build_menus(self):
+        # Every action that has a shortcut shows it in the menu,
+        # and the same shortcuts are listed on the buttons and in
+        # the command palette, so there is one set to learn.
         file_menu = self.menuBar().addMenu("File")
         settings_action = file_menu.addAction("Settings")
+        settings_action.setShortcut(QKeySequence("Ctrl+,"))
         settings_action.triggered.connect(self.show_settings)
         report_action = file_menu.addAction("Debug report")
         report_action.triggered.connect(self.make_debug_report)
         file_menu.addSeparator()
         quit_action = file_menu.addAction("Quit")
+        quit_action.setShortcut(QKeySequence("Ctrl+Q"))
         quit_action.triggered.connect(self.close)
 
         models_menu = self.menuBar().addMenu("Models")
+        load_action = models_menu.addAction("Load selected model")
+        load_action.setShortcut(QKeySequence("Ctrl+L"))
+        load_action.triggered.connect(self.load_selected_model)
         pull_action = models_menu.addAction("Pull models")
+        pull_action.setShortcut(QKeySequence("Ctrl+P"))
         pull_action.triggered.connect(self.show_pull_window)
         import_action = models_menu.addAction("Import a GGUF file")
+        import_action.setShortcut(QKeySequence("Ctrl+I"))
         import_action.triggered.connect(self.import_model)
         remove_action = models_menu.addAction("Remove model")
+        remove_action.setShortcut(QKeySequence("Del"))
         remove_action.triggered.connect(self.remove_selected_model)
         refresh_action = models_menu.addAction("Refresh list")
+        refresh_action.setShortcut(QKeySequence("F5"))
         refresh_action.triggered.connect(self._refresh_model_list)
         unload_action = models_menu.addAction("Unload model")
+        unload_action.setShortcut(QKeySequence("Ctrl+U"))
         unload_action.triggered.connect(self.unload_model)
 
         help_menu = self.menuBar().addMenu("Help")
+        palette_action = help_menu.addAction("Command palette")
+        palette_action.setShortcut(QKeySequence("Ctrl+K"))
+        palette_action.triggered.connect(self.show_command_palette)
         howto_action = help_menu.addAction("How to Use")
+        howto_action.setShortcut(QKeySequence("F1"))
         howto_action.triggered.connect(self.show_how_to_use)
         about_action = help_menu.addAction("About")
         about_action.triggered.connect(self.show_about)
+
+        # Shortcuts with no menu entry: focusing the search box.
+        focus_search = QShortcut(QKeySequence("Ctrl+F"), self)
+        focus_search.activated.connect(self._focus_search)
+
+    def _focus_search(self):
+        """Jump to the model search box (Ctrl+F), on the Models
+        tab, with the current search selected so typing replaces
+        it."""
+        self.tabs.setCurrentIndex(0)
+        self.search_box.setFocus()
+        self.search_box.selectAll()
+
+    def _commands(self):
+        """Every command the palette offers: (title, shortcut,
+        callable). The titles are the menu and button words, so
+        the palette reads the same as the rest of the app."""
+        return [
+            ("Load selected model", "Ctrl+L",
+             self.load_selected_model),
+            ("Unload model", "Ctrl+U", self.unload_model),
+            ("Pull models", "Ctrl+P", self.show_pull_window),
+            ("Import a GGUF file", "Ctrl+I", self.import_model),
+            ("Remove selected model", "Delete",
+             self.remove_selected_model),
+            ("Refresh list", "F5", self._refresh_model_list),
+            ("Focus search", "Ctrl+F", self._focus_search),
+            ("Settings", "Ctrl+,", self.show_settings),
+            ("How to Use", "F1", self.show_how_to_use),
+            ("Debug report", "", self.make_debug_report),
+            ("Clear chat", "", self._clear_chat),
+            ("Go to Models tab", "",
+             lambda: self.tabs.setCurrentIndex(0)),
+            ("Go to Chat tab", "",
+             lambda: self.tabs.setCurrentIndex(1)),
+            ("Quit", "Ctrl+Q", self.close),
+        ]
+
+    def show_command_palette(self):
+        """Open the command palette (Ctrl+K). Modal: it takes
+        the keyboard until a command is picked or Esc is hit."""
+        palette = CommandPalette(self._commands(), parent=self)
+        palette.exec()
 
     # ------------------------------------------------------------ tabs
 
@@ -2240,6 +2610,21 @@ class MainWindow(QMainWindow):
         self._cards_scroll.setWidget(self._cards_widget)
         layout.addWidget(self._cards_scroll)
 
+        # Overscroll glow (entry 031): a subtle edge glow when
+        # the list is scrolled past its top or bottom. Two
+        # overlays on the viewport, hidden until a wheel event
+        # pushes past an edge. They never take mouse events, so
+        # scrolling and clicking pass straight through them.
+        viewport = self._cards_scroll.viewport()
+        self._overscroll_top = QLabel(viewport)
+        self._overscroll_bottom = QLabel(viewport)
+        for glow in (self._overscroll_top, self._overscroll_bottom):
+            glow.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            glow.setVisible(False)
+        self._apply_overscroll_style()
+        viewport.installEventFilter(self)
+
         # The filter found nothing, but models exist: say so in
         # plain words, in place of the empty grid, instead of
         # leaving a blank tab that looks broken.
@@ -2264,24 +2649,45 @@ class MainWindow(QMainWindow):
         self.load_progress = QProgressBar()
         self.load_progress.setRange(0, 100)
         self.load_progress.setValue(0)
+        # No text on the bar itself: the load stage is in the
+        # status line, and bar text is unreadable where the fill
+        # passes under it.
+        self.load_progress.setTextVisible(False)
         self.load_progress.setVisible(False)
         layout.addWidget(self.load_progress)
 
         buttons = QHBoxLayout()
+        # Every button carries a tooltip: what it does, and its
+        # shortcut when it has one. No button is left bare.
         self.load_button = PressDipButton("Load")
+        self.load_button.setToolTip(
+            "Load the selected model (Ctrl+L)")
         self.load_button.clicked.connect(self.load_selected_model)
         self.unload_button = QPushButton("Unload")
+        self.unload_button.setToolTip(
+            "Unload the loaded model, freeing its RAM (Ctrl+U)")
         self.unload_button.clicked.connect(self.unload_model)
         self.import_button = QPushButton("Import")
+        self.import_button.setToolTip(
+            "Copy a .gguf file you already have into the models "
+            "folder (Ctrl+I)")
         self.import_button.clicked.connect(self.import_model)
         self.pull_button = PressDipButton("Pull")
+        self.pull_button.setToolTip(
+            "Download a model from Hugging Face (Ctrl+P)")
         self.pull_button.clicked.connect(self.show_pull_window)
         self.remove_button = QPushButton("Remove")
+        self.remove_button.setToolTip(
+            "Move the selected model to the trash (Delete)")
         self.remove_button.clicked.connect(self.remove_selected_model)
         self.load_cancel_button = QPushButton("Cancel load")
+        self.load_cancel_button.setToolTip(
+            "Stop loading this model")
         self.load_cancel_button.clicked.connect(self._cancel_load)
         self.load_cancel_button.setVisible(False)
         self.import_cancel_button = QPushButton("Cancel import")
+        self.import_cancel_button.setToolTip(
+            "Stop copying this file")
         self.import_cancel_button.clicked.connect(self._cancel_import)
         self.import_cancel_button.setVisible(False)
         buttons.addWidget(self.load_button)
@@ -2305,23 +2711,31 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(tab, "Models")
 
+    def _apply_empty_state_style(self):
+        """The empty-state panel's frame, from the active theme's
+        tokens. Re-run when the theme changes live."""
+        tokens = current_tokens()
+        self._empty_state_frame.setStyleSheet(
+            "QFrame#empty_state { border: 1px solid %s; "
+            "border-radius: 12px; background-color: %s; } "
+            "QFrame#empty_state QLabel { "
+            "background-color: transparent; }"
+            % (tokens["border_dim"], tokens["bg_raised"]))
+
     def _build_empty_state(self):
         """The no-models-yet panel: plain words, a short setup
         checklist, and working Pull and Import buttons wired to
         the same actions as the buttons below."""
         frame = QFrame()
         frame.setObjectName("empty_state")
-        frame.setStyleSheet(
-            "QFrame#empty_state { border: 1px solid #555555; "
-            "border-radius: 12px; background-color: #1c2836; } "
-            "QFrame#empty_state QLabel { "
-            "background-color: transparent; }")
+        self._empty_state_frame = frame
+        self._apply_empty_state_style()
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(8)
 
         title = QLabel("No models yet")
-        title.setStyleSheet("font-size: 16pt; font-weight: bold;")
+        title.setStyleSheet("font-weight: bold;")
         layout.addWidget(title)
 
         what = QLabel(
@@ -2339,8 +2753,13 @@ class MainWindow(QMainWindow):
 
         buttons = QHBoxLayout()
         pull_button = QPushButton("Pull")
+        pull_button.setToolTip(
+            "Download a model from Hugging Face (Ctrl+P)")
         pull_button.clicked.connect(self.show_pull_window)
         import_button = QPushButton("Import")
+        import_button.setToolTip(
+            "Copy a .gguf file you already have into the models "
+            "folder (Ctrl+I)")
         import_button.clicked.connect(self.import_model)
         buttons.addWidget(pull_button)
         buttons.addWidget(import_button)
@@ -2391,7 +2810,8 @@ class MainWindow(QMainWindow):
         # text. They inform at a glance, they never shout.
         self.stats_label = QLabel("No model loaded.")
         self.stats_label.setWordWrap(True)
-        self.stats_label.setStyleSheet("color: #999999;")
+        self.stats_label.setStyleSheet(
+            "color: %s;" % current_tokens()["text_muted"])
         layout.addWidget(self.stats_label)
 
         # The attached picture, for the next message to a vision
@@ -2401,6 +2821,8 @@ class MainWindow(QMainWindow):
         self.attachment_label.setWordWrap(True)
         attach_row.addWidget(self.attachment_label)
         self.attachment_remove_button = QPushButton("Remove")
+        self.attachment_remove_button.setToolTip(
+            "Take this picture off the next message")
         self.attachment_remove_button.clicked.connect(
             self._remove_attachment)
         attach_row.addWidget(self.attachment_remove_button)
@@ -2414,13 +2836,22 @@ class MainWindow(QMainWindow):
         self.chat_input.send_requested.connect(self.send_message)
         self.chat_input.setAcceptDrops(False)
         self.attach_button = QPushButton("Attach image")
+        self.attach_button.setToolTip(
+            "Attach a picture to your next message (vision "
+            "models only)")
         self.attach_button.clicked.connect(self._attach_image)
         self.send_button = PressDipButton("Send")
+        self.send_button.setToolTip(
+            "Send your message (Enter)")
         self.send_button.clicked.connect(self.send_message)
         self.stop_button = QPushButton("Stop")
+        self.stop_button.setToolTip(
+            "Stop the reply in progress")
         self.stop_button.clicked.connect(self._stop_reply)
         self.stop_button.setEnabled(False)
         self.clear_button = QPushButton("Clear")
+        self.clear_button.setToolTip(
+            "Clear the chat and forget the conversation so far")
         self.clear_button.clicked.connect(self._clear_chat)
         row.addWidget(self.chat_input)
         row.addWidget(self.attach_button)
@@ -2505,15 +2936,16 @@ class MainWindow(QMainWindow):
         the list appears first, the models fill it in."""
         self._set_empty_state(False)
         self._clear_cards()
+        columns = grid_columns()
         for index in range(3):
             self._cards_layout.addWidget(
-                SkeletonCard(), index // GRID_COLUMNS,
-                index % GRID_COLUMNS, Qt.AlignmentFlag.AlignTop)
-        rows = (3 + GRID_COLUMNS - 1) // GRID_COLUMNS
+                SkeletonCard(), index // columns,
+                index % columns, Qt.AlignmentFlag.AlignTop)
+        rows = (3 + columns - 1) // columns
         self._cards_layout.addItem(
             QSpacerItem(0, 0, QSizePolicy.Policy.Minimum,
                         QSizePolicy.Policy.Expanding),
-            rows, 0, 1, GRID_COLUMNS)
+            rows, 0, 1, columns)
 
     def _refresh_model_list(self):
         """Scan the folder off the UI thread. A refresh asked for
@@ -2565,6 +2997,9 @@ class MainWindow(QMainWindow):
                 card.deleteLater()
         self._card_order = []
         self._hero_card = None
+        # Cards built fresh by this scan (not reused): they
+        # stagger in below, instead of appearing all at once.
+        new_cards = []
         for model in ordered:
             # The fit badge uses this model's real RAM need: the
             # KV cache for the context length the runner will use,
@@ -2599,6 +3034,7 @@ class MainWindow(QMainWindow):
                 card.remove_requested.connect(
                     self._on_remove_requested)
                 self.model_cards[key] = card
+                new_cards.append(card)
             self._card_order.append(key)
             if is_loaded:
                 self._hero_card = card
@@ -2628,11 +3064,18 @@ class MainWindow(QMainWindow):
             self.skipped_label.setVisible(True)
         else:
             self.skipped_label.setVisible(False)
-        if self._pulse_path is not None:
-            card = self.model_cards.get(self._pulse_path)
+        pulsed_path = self._pulse_path
+        if pulsed_path is not None:
+            card = self.model_cards.get(pulsed_path)
             self._pulse_path = None
             if card is not None:
                 self._pulse_card(card)
+        # New cards stagger in — except the pulsed one, which has
+        # its own entrance already (two opacity effects on one
+        # card would fight).
+        pulsed = self.model_cards.get(pulsed_path or "")
+        self._stagger_cards([card for card in new_cards
+                             if card is not pulsed])
         # No models at all: the empty state replaces the grid. It
         # disappears the moment a model appears (the next scan).
         self._set_empty_state(not models)
@@ -2720,6 +3163,14 @@ class MainWindow(QMainWindow):
         back to the top."""
         scroll_bar = self._cards_scroll.verticalScrollBar()
         saved_scroll = scroll_bar.value()
+        columns = grid_columns()
+        # FLIP: remember where each visible card sits now, so the
+        # ones that move can be flown to their new spot below.
+        old_positions = {}
+        if not reduced_motion():
+            for key, card in self.model_cards.items():
+                if card.isVisible() and key in visible_paths:
+                    old_positions[key] = QRect(card.geometry())
         while self._cards_layout.count():
             item = self._cards_layout.takeAt(0)
             widget = item.widget()
@@ -2750,7 +3201,7 @@ class MainWindow(QMainWindow):
             # sat above its neighbours and the row looked ragged.
             if card is self._hero_card:
                 self._cards_layout.addWidget(
-                    card, row, 0, 1, GRID_COLUMNS,
+                    card, row, 0, 1, columns,
                     Qt.AlignmentFlag.AlignTop)
                 row += 1
                 col = 0
@@ -2758,7 +3209,7 @@ class MainWindow(QMainWindow):
                 self._cards_layout.addWidget(
                     card, row, col, Qt.AlignmentFlag.AlignTop)
                 col += 1
-                if col >= GRID_COLUMNS:
+                if col >= columns:
                     col = 0
                     row += 1
             card.setVisible(True)
@@ -2768,8 +3219,13 @@ class MainWindow(QMainWindow):
         self._cards_layout.addItem(
             QSpacerItem(0, 0, QSizePolicy.Policy.Minimum,
                         QSizePolicy.Policy.Expanding),
-            spacer_row, 0, 1, GRID_COLUMNS)
+            spacer_row, 0, 1, columns)
         scroll_bar.setValue(saved_scroll)
+        # Settle the new geometry now, so FLIP can measure it:
+        # without this the cards still report their old spots
+        # until the next layout pass.
+        self._cards_layout.activate()
+        self._flip_cards(old_positions)
 
     def _pulse_card(self, card):
         """One quiet 200 ms fade-in on a newly pulled model, opacity
@@ -2786,6 +3242,165 @@ class MainWindow(QMainWindow):
         anim.finished.connect(lambda: card.setGraphicsEffect(None))
         self._pulse_anim = anim
         anim.start()
+
+    def _stagger_cards(self, cards):
+        """New cards fade in one after another, 40 ms apart
+        (entry 031): the list arrives instead of appearing. Only
+        the first twelve stagger; the rest appear at once, so a
+        big folder never takes seconds to settle. Skipped under
+        reduced motion. One opacity fade per card, 200 ms: cheap
+        enough for a 2-core CPU with no GPU."""
+        if reduced_motion():
+            return
+        for index, card in enumerate(cards[:12]):
+            effect = QGraphicsOpacityEffect(card)
+            effect.setOpacity(0.0)
+            card.setGraphicsEffect(effect)
+            anim = QPropertyAnimation(effect, b"opacity", self)
+            anim.setDuration(200)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.finished.connect(
+                lambda c=card, a=anim: self._on_stagger_done(c, a))
+            self._stagger_anims.append(anim)
+            # The delayed start must not touch a dead animation:
+            # the window can close before the timer fires, and
+            # the animation (a child of the window) dies with it.
+            # The lambda holds only the animation, never self, and
+            # checks the C++ object is still alive before starting.
+            QTimer.singleShot(
+                index * 40,
+                lambda a=anim: a.start() if isValid(a) else None)
+
+    def _on_stagger_done(self, card, anim):
+        if anim in self._stagger_anims:
+            self._stagger_anims.remove(anim)
+        # The card can be rebuilt (a refresh) while its fade is
+        # still running; a deleted card takes no effect.
+        if isValid(card):
+            card.setGraphicsEffect(None)
+
+    def _flip_cards(self, old_positions):
+        """Animate cards that moved in a re-sort from where they
+        were to where they are (entry 031, FLIP: First, Last,
+        Invert, Play). Each moved card gets a snapshot ghost that
+        slides 200 ms from its old spot to its new one; the real
+        card is already at the new spot underneath, identical to
+        the ghost, so the flight reads as the card moving. At most
+        twelve ghosts, opacity and geometry only: cheap enough
+        for a 2-core CPU with no GPU. Skipped under reduced
+        motion."""
+        if reduced_motion():
+            return
+        moved = 0
+        for key, old in old_positions.items():
+            card = self.model_cards.get(key)
+            if card is None or not card.isVisible():
+                continue
+            new = card.geometry()
+            if old == new:
+                continue
+            moved += 1
+            if moved > 12:
+                break
+            ghost = QLabel(self._cards_widget)
+            ghost.setPixmap(card.grab())
+            ghost.setGeometry(old)
+            ghost.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            ghost.show()
+            ghost.raise_()
+            anim = QPropertyAnimation(ghost, b"geometry", self)
+            anim.setDuration(200)
+            anim.setStartValue(QRect(old))
+            anim.setEndValue(QRect(new))
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.finished.connect(
+                lambda g=ghost, a=anim: self._on_flip_done(g, a))
+            self._flip_anims.append(anim)
+            anim.start()
+
+    def _on_flip_done(self, ghost, anim):
+        if anim in self._flip_anims:
+            self._flip_anims.remove(anim)
+        if isValid(ghost):
+            ghost.deleteLater()
+
+    def _apply_overscroll_style(self):
+        """The overscroll glows' gradients, from the active
+        theme's accent: strong at the edge, fading to nothing
+        24 px in. Re-run when the theme changes live."""
+        accent = current_tokens()["accent"]
+        strong = rgba_string(accent, 140)
+        clear = rgba_string(accent, 0)
+        self._overscroll_top.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
+            "stop:0 %s, stop:1 %s);" % (strong, clear))
+        self._overscroll_bottom.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
+            "stop:0 %s, stop:1 %s);" % (clear, strong))
+
+    def _position_overscroll(self):
+        """Pin the glows to the viewport's top and bottom edges."""
+        viewport = self._cards_scroll.viewport()
+        width = viewport.width()
+        height = viewport.height()
+        self._overscroll_top.setGeometry(0, 0, width, 24)
+        self._overscroll_bottom.setGeometry(
+            0, height - 24, width, 24)
+
+    def _flash_overscroll(self, edge):
+        """Show one edge glow, fading out over 300 ms. A second
+        push while it is still showing restarts the fade instead
+        of stacking a second animation on it."""
+        if reduced_motion():
+            return
+        glow = (self._overscroll_top if edge == "top"
+                else self._overscroll_bottom)
+        old = self._overscroll_anims.get(edge)
+        if old is not None:
+            old.stop()
+        self._position_overscroll()
+        effect = QGraphicsOpacityEffect(glow)
+        effect.setOpacity(0.9)
+        glow.setGraphicsEffect(effect)
+        glow.setVisible(True)
+        glow.raise_()
+        anim = QPropertyAnimation(effect, b"opacity", self)
+        anim.setDuration(300)
+        anim.setStartValue(0.9)
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.finished.connect(
+            lambda g=glow, a=anim, e=edge:
+            self._on_overscroll_done(g, a, e))
+        self._overscroll_anims[edge] = anim
+        anim.start()
+
+    def _on_overscroll_done(self, glow, anim, edge):
+        if self._overscroll_anims.get(edge) is anim:
+            del self._overscroll_anims[edge]
+        if isValid(glow):
+            glow.setVisible(False)
+            glow.setGraphicsEffect(None)
+
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt naming
+        # The model list's viewport: keep the overscroll glows
+        # pinned to its edges on resize, and flash the edge the
+        # user pushes past on a wheel event. Wheel events are
+        # never consumed here: normal scrolling still works.
+        if watched is self._cards_scroll.viewport():
+            if event.type() == QEvent.Type.Resize:
+                self._position_overscroll()
+            elif event.type() == QEvent.Type.Wheel:
+                bar = self._cards_scroll.verticalScrollBar()
+                delta = event.angleDelta().y()
+                if delta > 0 and bar.value() <= bar.minimum():
+                    self._flash_overscroll("top")
+                elif delta < 0 and bar.value() >= bar.maximum():
+                    self._flash_overscroll("bottom")
+        return super().eventFilter(watched, event)
 
     def _update_buttons(self):
         selected = self._selected_model_path()
@@ -3484,6 +4099,8 @@ class MainWindow(QMainWindow):
                 self._settings_closed)
             self.settings_window.folder_changed.connect(
                 self._on_folder_changed)
+            self.settings_window.settings_saved.connect(
+                self._on_settings_saved)
         self.settings_window.show()
         self.settings_window.raise_()
         self.settings_window.activateWindow()
@@ -3498,6 +4115,41 @@ class MainWindow(QMainWindow):
         self._refresh_model_list()
         self._show_status(
             "Models folder is now %s." % folder)
+
+    def _on_settings_saved(self):
+        """Settings were saved: apply the theme and the density
+        live, so the window changes without a restart."""
+        self._apply_theme()
+        self._apply_density()
+
+    def _apply_theme(self):
+        """Re-skin the window from the active theme's tokens:
+        the app stylesheet, every card, the busy dot, and the
+        empty-state panel. The Pull window, when open, re-skins
+        its own busy dot too."""
+        tokens = current_tokens()
+        QApplication.instance().setStyleSheet(
+            build_stylesheet(tokens))
+        for card in self.model_cards.values():
+            card.apply_theme(tokens)
+        self.busy_dot.setStyleSheet(
+            "color: %s;" % tokens["accent"])
+        if hasattr(self, "_empty_state_frame"):
+            self._apply_empty_state_style()
+        self._apply_overscroll_style()
+        if self.pull_window is not None:
+            self.pull_window.apply_theme(tokens)
+
+    def _apply_density(self):
+        """Apply the current list density: the grid's column
+        count and gap, and every card's compact state. A relayout
+        puts the cards back in the new shape (scroll and focus
+        survive, as on any refresh)."""
+        compact = get_compact_list()
+        self._cards_layout.setSpacing(grid_spacing())
+        for card in self.model_cards.values():
+            card.set_compact(compact)
+        self._relayout_cards(self._visible_paths)
 
     def show_how_to_use(self):
         if self.howto_window is None:
@@ -3590,8 +4242,8 @@ def main(argv=None):
     app.setApplicationName("fyrn")
     app.setOrganizationName("BrokeNBored")
     app.setApplicationVersion(__version__)
-    # One dark stylesheet across every window, drawn from the icon.
-    app.setStyleSheet(DARK_STYLESHEET)
+    # One stylesheet across every window, from the active theme.
+    app.setStyleSheet(current_stylesheet())
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
 
@@ -3602,10 +4254,23 @@ def main(argv=None):
         return 0
     window = MainWindow()
     guard.start_server(window.bring_to_front)
+    # The pre-Qt fast path's listener: a second launch sends
+    # b"raise" to this socket without importing Qt. Started
+    # after the window exists, so a raise always has a window
+    # to raise.
+    listener = RaiseListener(home / "raise.sock")
+    listener.raise_requested.connect(window.bring_to_front)
+    listener.start()
     window.show()
+    # Warm the debug logger now that the window is visible: its
+    # import costs ~0.5 s, which is why it is not paid during
+    # construction. It is ready before the user can do anything.
+    QTimer.singleShot(0, window._init_logger)
     try:
         return app.exec()
     finally:
+        listener.requestInterruption()
+        listener.wait(2000)
         guard.release()
 
 

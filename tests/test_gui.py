@@ -14,7 +14,8 @@ from unittest import mock
 
 from PySide6.QtCore import (QBuffer, QEvent, QIODevice, QMimeData,
                              QPoint, QRect, QTimer, Qt, QUrl)
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import (QColor, QDragEnterEvent, QDropEvent, QFont,
+                           QShortcut, QWheelEvent)
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (QApplication, QLabel, QLineEdit,
                                QMessageBox, QPushButton, QSystemTrayIcon,
@@ -25,16 +26,23 @@ from helpers import start_range_server, write_gguf_file
 from fyrn.core import (HEADROOM_BYTES, ImportCancelled, fit_status,
                        read_ram_bytes)
 from fyrn.gui import (DARK_STYLESHEET, FIRST_PULL_SUGGESTION,
-                            FIT_BADGES, HOW_TO_USE_SECTIONS, ChatInput,
-                            HowToUseWindow, MainWindow, ModelCard,
-                            PressDipButton, PullWindow, PullWorker,
-                            SettingsWindow, SingleInstance, SkeletonCard,
-                            TURN_DIVIDER, get_models_folder,
-                            get_reduce_motion, get_show_ollama_models,
-                            reduced_motion, set_models_folder,
-                            set_reduce_motion, set_show_ollama_models)
+                            FIT_BADGES, HIGH_CONTRAST_STYLESHEET,
+                            HOW_TO_USE_SECTIONS, ChatInput,
+                            CommandPalette, HowToUseWindow, MainWindow,
+                            ModelCard, PressDipButton, PullWindow,
+                            PullWorker, RaiseListener, SettingsWindow,
+                            SingleInstance, SkeletonCard, TURN_DIVIDER,
+                            current_tokens, get_chime_muted,
+                            get_compact_list, get_high_contrast,
+                            get_models_folder, get_reduce_motion,
+                            get_show_ollama_models, grid_columns,
+                            reduced_motion, set_chime_muted,
+                            set_compact_list, set_high_contrast,
+                            set_models_folder, set_reduce_motion,
+                            set_show_ollama_models)
 from fyrn.pull import parse_model_input
 from fyrn.runner import FakeRunner, RunnerError
+from fyrn.theme import DARK, HIGH_CONTRAST
 
 GB = 1024 ** 3
 PAYLOAD = bytes(range(256)) * 256  # 64 KiB deterministic bytes
@@ -263,11 +271,12 @@ class MainWindowTests(GuiTestCase):
                          ["Settings", "Debug report", "Quit"])
         models_items = [a.text() for a in menus["Models"].actions()]
         self.assertEqual(models_items,
-                         ["Pull models", "Import a GGUF file",
-                          "Remove model", "Refresh list",
-                          "Unload model"])
+                         ["Load selected model", "Pull models",
+                          "Import a GGUF file", "Remove model",
+                          "Refresh list", "Unload model"])
         help_items = [a.text() for a in menus["Help"].actions()]
-        self.assertEqual(help_items, ["How to Use", "About"])
+        self.assertEqual(help_items,
+                         ["Command palette", "How to Use", "About"])
 
     def test_cards_populate_and_nothing_selected(self):
         make_fake_gguf(self.models / "alpha.gguf", 2048)
@@ -296,20 +305,26 @@ class MainWindowTests(GuiTestCase):
         self.assertEqual(len(window.model_cards), 1)
 
     def test_fit_badges(self):
-        # Expected badges come from the core's own fit check against
-        # free RAM read just before the scan: a 2 KB file is "Fits"
-        # on a roomy machine but genuinely "Tight" when free RAM is
-        # under ~683 MB, and the test must not pretend otherwise.
+        # The scan reads free RAM when it runs, so the test pins
+        # the reading: without the pin, free RAM can cross the
+        # fits/tight boundary between the test's read and the
+        # scan's, and the badge disagrees with the expectation
+        # for no product reason (a flake seen under sandbox load,
+        # 2026-11-16). A 2 KB file is "Fits" at 4 GB free; the
+        # huge file (real free + 4 GB) is always "Too big" there.
         make_fake_gguf(self.models / "small.gguf", 2048)
         _total, free = read_ram_bytes()
         make_sparse_gguf(self.models / "huge.gguf", free + 4 * GB)
-        window = self.make_window()
-        self.wait_scan(window)
+        pinned = (8 * GB, 4 * GB)
+        with mock.patch("fyrn.gui.read_ram_bytes",
+                        return_value=pinned):
+            window = self.make_window()
+            self.wait_scan(window)
         small = window.model_cards[str(self.models / "small.gguf")]
         huge = window.model_cards[str(self.models / "huge.gguf")]
         self.assertEqual(
             small.findChild(QLabel, "fit_badge").text(),
-            FIT_BADGES[fit_status(2048, free)][0])
+            FIT_BADGES[fit_status(2048, pinned[1])][0])
         self.assertEqual(
             huge.findChild(QLabel, "fit_badge").text(), "Too big")
 
@@ -395,7 +410,8 @@ class MainWindowTests(GuiTestCase):
         # The loaded model is the hero tile, first in the list.
         self.wait_scan(window)
         hero = window.model_cards[beta]
-        self.assertEqual(hero.minimumHeight(), 120)
+        line = hero.fontMetrics().lineSpacing()
+        self.assertEqual(hero.minimumHeight(), 4 * line + 32)
 
     def test_refuse_too_big_model(self):
         _total, free = read_ram_bytes()
@@ -868,9 +884,14 @@ class BentoTests(GuiTestCase):
         window = self.make_window()
         self.wait_scan(window)
         card = window.model_cards[str(self.models / "alpha.gguf")]
-        self.assertEqual(card.minimumHeight(), 96)
-        self.assertEqual(card.maximumHeight(), 120)
-        self.assertLess(card.height(), 130)
+        # Heights come from the font's line height, not fixed
+        # pixels: a plain card holds four lines at minimum, five
+        # at most, plus margins.
+        line = card.fontMetrics().lineSpacing()
+        self.assertEqual(card.minimumHeight(), 4 * line + 32)
+        self.assertEqual(card.maximumHeight(), 5 * line + 32)
+        self.assertGreaterEqual(card.height(), card.minimumHeight())
+        self.assertLessEqual(card.height(), card.maximumHeight())
 
     def test_hero_spans_all_columns(self):
         make_fake_gguf(self.models / "alpha.gguf", 2048)
@@ -916,6 +937,33 @@ class HoverDetailTests(GuiTestCase):
         # 2 KB file + 512 MB headroom, rounded by format_size.
         self.assertIn("Needs 512 MB of RAM, 8.0 GB free", tip)
         self.assertIn("Fits: needs less than 3/4 of free RAM.", tip)
+        card.deleteLater()
+
+    def test_card_tooltip_carries_the_facts_line(self):
+        model = {"name": "alpha.gguf",
+                 "path": self.models / "alpha.gguf",
+                 "size": 2048,
+                 "facts": {"params_text": "2B",
+                           "quantization": "Q4_K_M",
+                           "context_text": "32K context"}}
+        card = ModelCard(model, "fits", free_bytes=8 * GB)
+        self.assertIn("2B · Q4_K_M · 32K context", card.toolTip())
+        card.deleteLater()
+
+    def test_compact_card_hides_facts_label_keeps_tooltip(self):
+        model = {"name": "alpha.gguf",
+                 "path": self.models / "alpha.gguf",
+                 "size": 2048,
+                 "facts": {"params_text": "2B",
+                           "quantization": "Q4_K_M",
+                           "context_text": "32K context"}}
+        card = ModelCard(model, "fits", free_bytes=8 * GB)
+        card.set_compact(True)
+        facts = [label for label in card.findChildren(QLabel)
+                 if label.objectName() == "model_facts"]
+        self.assertEqual(len(facts), 1)
+        self.assertTrue(facts[0].isHidden())
+        self.assertIn("2B · Q4_K_M · 32K context", card.toolTip())
         card.deleteLater()
 
     def test_card_tooltip_too_big_and_unknown_ram(self):
@@ -1095,7 +1143,12 @@ class LabelBandTests(GuiTestCase):
         window = self.make_window()
         self.wait_scan(window)
         card = window.model_cards[str(self.models / "alpha.gguf")]
-        QTest.qWait(100)
+        # Wait for the stagger fade to settle: a grab mid-fade
+        # reads the right colour at slightly less than full
+        # opacity, and this test is about the colour.
+        settled = pump_until(
+            lambda: card.graphicsEffect() is None, 2000)
+        self.assertTrue(settled, "the card never settled")
         name = [label for label in card.findChildren(QLabel)
                 if label.text() == "alpha.gguf"][0]
         # The label's right end, past the text: card background.
@@ -1695,8 +1748,10 @@ class WindowHeightTests(GuiTestCase):
         QTest.qWait(200)
         bottom = settings.save_button.geometry().bottom()
         self.assertLess(settings.height() - bottom, 30)
+        # The last help line is the chime's: the stretch between
+        # it and the buttons must stay small.
         helps = [label for label in settings.findChildren(QLabel)
-                 if label.text().startswith("Fyrn also lists")]
+                 if label.text().startswith("A short chime")]
         self.assertEqual(len(helps), 1)
         gap = (settings.save_button.geometry().top()
                - helps[0].geometry().bottom())
@@ -2420,24 +2475,24 @@ class PullEtaTests(GuiTestCase):
         pull = self.make_pull_window()
         pull._on_progress(0, 600 * 1024 * 1024, 1024 * 1024)
         self.assertIn("about 10 min left",
-                      pull.status_label.text())
+                      pull.progress_stats.text())
 
     def test_eta_is_smoothed(self):
         pull = self.make_pull_window()
         pull._on_progress(0, 600 * 1024 * 1024, 1024 * 1024)
         self.assertIn("about 10 min left",
-                      pull.status_label.text())
+                      pull.progress_stats.text())
         # The raw figure is now 1 minute, but the smoothed figure
         # is 0.7 * 600 + 0.3 * 60 = 438 s: about 7 min.
         pull._on_progress(540 * 1024 * 1024, 600 * 1024 * 1024,
                           1024 * 1024)
         self.assertIn("about 7 min left",
-                      pull.status_label.text())
+                      pull.progress_stats.text())
 
     def test_no_eta_without_speed(self):
         pull = self.make_pull_window()
         pull._on_progress(50 * 1024 * 1024, 100 * 1024 * 1024, 0)
-        self.assertNotIn("left", pull.status_label.text())
+        self.assertNotIn("left", pull.progress_stats.text())
 
 
 class BlurValidationTests(GuiTestCase):
@@ -2842,6 +2897,505 @@ class DragDropTests(GuiTestCase):
             and not window._import_pending,
             10000)
         self.assertTrue(ok, "both dropped files did not import")
+
+
+# ------------------------------------------------------- v0.5: polish
+
+
+class FocusVsSelectionTests(GuiTestCase):
+    def _two_cards(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        make_fake_gguf(self.models / "beta.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        return window
+
+    def test_focused_card_differs_from_selected(self):
+        window = self._two_cards()
+        alpha = window.model_cards[str(self.models / "alpha.gguf")]
+        beta = window.model_cards[str(self.models / "beta.gguf")]
+        alpha.clicked.emit(alpha.path)
+        beta.setFocus()
+        QTest.qWait(100)
+        self.assertTrue(beta.hasFocus())
+        tokens = current_tokens()
+        self.assertIn("2px solid %s" % tokens["accent"],
+                      alpha.styleSheet())
+        self.assertIn("2px dashed %s" % tokens["focus_ring"],
+                      beta.styleSheet())
+        self.assertNotEqual(alpha.styleSheet(), beta.styleSheet())
+
+    def test_selected_and_focused_is_solid(self):
+        # Selection wins when a card has both: Load acts on the
+        # selection, so the selection is the signal that matters.
+        window = self._two_cards()
+        alpha = window.model_cards[str(self.models / "alpha.gguf")]
+        alpha.clicked.emit(alpha.path)
+        alpha.setFocus()
+        QTest.qWait(100)
+        self.assertTrue(alpha.hasFocus())
+        self.assertIn("2px solid %s" % current_tokens()["accent"],
+                      alpha.styleSheet())
+        self.assertNotIn("dashed", alpha.styleSheet())
+
+
+class SystemTextSizeTests(GuiTestCase):
+    def test_large_system_font_scales_the_cards(self):
+        app = QApplication.instance()
+        old_font = app.font()
+        try:
+            app.setFont(QFont(app.font().family(), 22))
+            make_fake_gguf(self.models / "alpha.gguf", 2048)
+            window = self.make_window()
+            self.wait_scan(window)
+            card = window.model_cards[
+                str(self.models / "alpha.gguf")]
+            # The name label inherits the application font: no
+            # fixed size overrides it.
+            self.assertEqual(
+                card._name_label.font().pointSize(), 22)
+            # And the card grows with the font instead of
+            # clipping: four lines at 22 pt is taller than four
+            # lines at the default size.
+            line = card.fontMetrics().lineSpacing()
+            self.assertEqual(card.minimumHeight(), 4 * line + 32)
+            self.assertGreater(card.minimumHeight(), 120)
+        finally:
+            app.setFont(old_font)
+
+    def test_no_fixed_sizes_in_card_styles(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "alpha.gguf")]
+        for label in card.findChildren(QLabel):
+            self.assertNotIn("font-size", label.styleSheet())
+        self.assertNotIn("font-size", card.styleSheet())
+        self.assertNotIn("font-size",
+                         QApplication.instance().styleSheet())
+
+
+class ShortcutTests(GuiTestCase):
+    def test_menu_shortcuts_are_set(self):
+        window = self.make_window()
+        by_text = {}
+        for menu_action in window.menuBar().actions():
+            menu = menu_action.menu()
+            for action in menu.actions():
+                by_text[action.text()] = action.shortcut().toString()
+        expected = {
+            "Settings": "Ctrl+,",
+            "Quit": "Ctrl+Q",
+            "Load selected model": "Ctrl+L",
+            "Pull models": "Ctrl+P",
+            "Import a GGUF file": "Ctrl+I",
+            "Remove model": "Del",
+            "Refresh list": "F5",
+            "Unload model": "Ctrl+U",
+            "Command palette": "Ctrl+K",
+            "How to Use": "F1",
+        }
+        for text, shortcut in expected.items():
+            self.assertEqual(by_text.get(text), shortcut, text)
+
+    def test_ctrl_f_focuses_search(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        window.activateWindow()
+        QTest.qWait(100)
+        QTest.keyClick(window, Qt.Key.Key_F,
+                       Qt.KeyboardModifier.ControlModifier)
+        QTest.qWait(100)
+        self.assertTrue(window.search_box.hasFocus())
+
+    def test_ctrl_l_loads_selected_model(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "alpha.gguf")]
+        card.clicked.emit(card.path)
+        window.activateWindow()
+        QTest.qWait(100)
+        QTest.keyClick(window, Qt.Key.Key_L,
+                       Qt.KeyboardModifier.ControlModifier)
+        self.wait_load(window)
+        self.assertTrue(window.controller.is_loaded)
+        self.assertEqual(window.controller.current_name,
+                         "alpha.gguf")
+
+
+class TooltipTests(GuiTestCase):
+    def _assert_all_buttons_have_tooltips(self, window):
+        bare = [button.text() for button in
+                window.findChildren(QPushButton)
+                if not button.toolTip().strip()]
+        self.assertEqual(bare, [])
+
+    def test_main_window_buttons_all_have_tooltips(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        self._assert_all_buttons_have_tooltips(window)
+
+    def test_pull_window_buttons_all_have_tooltips(self):
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        self._assert_all_buttons_have_tooltips(pull)
+
+    def test_settings_window_buttons_all_have_tooltips(self):
+        settings = SettingsWindow(self.models)
+        self.windows.append(settings)
+        settings.show()
+        self._assert_all_buttons_have_tooltips(settings)
+
+
+class PullProgressTests(GuiTestCase):
+    def make_pull_window(self):
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        QTest.qWait(100)
+        return pull
+
+    def test_stats_line_holds_all_four_numbers(self):
+        pull = self.make_pull_window()
+        pull._on_progress(25 * 1024 * 1024, 100 * 1024 * 1024,
+                          1024 * 1024)
+        stats = pull.progress_stats.text()
+        self.assertIn("25%", stats)
+        self.assertIn("25.0 MB", stats)
+        self.assertIn("100 MB", stats)
+        self.assertIn("1.0 MB per second", stats)
+        self.assertIn("left", stats)
+        self.assertTrue(pull.progress_stats.isVisible())
+        self.assertIn("Downloading", pull.status_label.text())
+
+    def test_busy_dot_shares_the_progress_row(self):
+        pull = self.make_pull_window()
+        # The dot only takes its place in the row when it is
+        # shown (a hidden widget has no layout position).
+        pull._set_busy(True)
+        QTest.qWait(100)
+        bar = pull.progress_bar.geometry()
+        dot = pull.busy_dot.geometry()
+        center = dot.center().y()
+        self.assertGreaterEqual(center, bar.top())
+        self.assertLessEqual(center, bar.bottom())
+
+    def test_progress_bars_carry_no_text(self):
+        pull = self.make_pull_window()
+        self.assertFalse(pull.progress_bar.isTextVisible())
+        window = self.make_window()
+        self.assertFalse(window.load_progress.isTextVisible())
+
+    def test_stats_line_hides_when_the_pull_ends(self):
+        pull = self.make_pull_window()
+        pull._on_progress(25 * 1024 * 1024, 100 * 1024 * 1024,
+                          1024 * 1024)
+        self.assertTrue(pull.progress_stats.isVisible())
+        pull._on_finished(str(self.models / "done.gguf"))
+        self.assertFalse(pull.progress_stats.isVisible())
+
+
+class CommandPaletteTests(GuiTestCase):
+    def _palette(self, window=None):
+        window = window or self.make_window()
+        palette = CommandPalette(window._commands(), parent=window)
+        self.windows.append(palette)
+        palette.show()
+        QTest.qWait(100)
+        return palette
+
+    def test_commands_cover_the_app(self):
+        window = self.make_window()
+        titles = [title for title, _s, _a in window._commands()]
+        for wanted in ("Load selected model", "Unload model",
+                       "Pull models", "Import a GGUF file",
+                       "Remove selected model", "Refresh list",
+                       "Focus search", "Settings", "How to Use",
+                       "Clear chat", "Quit"):
+            self.assertIn(wanted, titles)
+        self.assertEqual(len(titles), len(set(titles)))
+
+    def test_filter_narrows_the_list(self):
+        palette = self._palette()
+        self.assertGreater(palette.list.count(), 5)
+        palette.input.setText("load")
+        QTest.qWait(100)
+        texts = [palette.list.item(row).text()
+                 for row in range(palette.list.count())]
+        self.assertEqual(len(texts), 2)
+        joined = " ".join(texts)
+        self.assertIn("Load selected model", joined)
+        self.assertIn("Unload model", joined)
+
+    def test_enter_runs_the_selected_command(self):
+        called = []
+        window = self.make_window()
+        commands = [("Do the thing", "", lambda: called.append(1)),
+                    ("Do another thing", "",
+                     lambda: called.append(2))]
+        palette = CommandPalette(commands, parent=window)
+        self.windows.append(palette)
+        palette.show()
+        QTest.qWait(100)
+        palette.input.setText("another")
+        QTest.qWait(100)
+        QTest.keyClick(palette.input, Qt.Key.Key_Return)
+        QTest.qWait(100)
+        self.assertEqual(called, [2])
+
+    def test_arrow_keys_move_through_the_list(self):
+        palette = self._palette()
+        self.assertEqual(palette.list.currentRow(), 0)
+        QTest.keyClick(palette.input, Qt.Key.Key_Down)
+        self.assertEqual(palette.list.currentRow(), 1)
+        QTest.keyClick(palette.input, Qt.Key.Key_Up)
+        self.assertEqual(palette.list.currentRow(), 0)
+
+
+class ChimeMuteTests(GuiTestCase):
+    def make_pull_window(self):
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        return pull
+
+    def test_muted_chime_does_not_play(self):
+        set_chime_muted(True)
+        pull = self.make_pull_window()
+        with mock.patch("fyrn.chime.play_chime") as play:
+            pull._play_chime()
+            play.assert_not_called()
+
+    def test_unmuted_chime_plays_on_finish(self):
+        set_chime_muted(False)
+        pull = self.make_pull_window()
+        with mock.patch("fyrn.chime.play_chime") as play:
+            pull._on_finished(str(self.models / "done.gguf"))
+            play.assert_called_once()
+
+    def test_settings_window_saves_the_mute(self):
+        settings = SettingsWindow(self.models)
+        self.windows.append(settings)
+        settings.show()
+        settings.chime_check.setChecked(True)
+        settings.save_button.click()
+        self.assertTrue(get_chime_muted())
+
+
+class ListMotionTests(GuiTestCase):
+    def test_new_cards_stagger_in_then_settle(self):
+        for name in ("alpha.gguf", "beta.gguf", "gamma.gguf"):
+            make_fake_gguf(self.models / name, 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        cards = list(window.model_cards.values())
+        self.assertEqual(len(cards), 3)
+        # At least one card is mid-fade (the stagger sets the
+        # effect the moment the scan lands)...
+        saw_effect = pump_until(
+            lambda: any(card.graphicsEffect() is not None
+                        for card in cards),
+            2000)
+        self.assertTrue(saw_effect, "no card ever had a fade")
+        # ...and every effect is gone once the stagger settles.
+        settled = pump_until(
+            lambda: all(card.graphicsEffect() is None
+                        for card in cards),
+            5000)
+        self.assertTrue(settled, "a card kept its fade effect")
+
+    def test_stagger_skipped_under_reduced_motion(self):
+        set_reduce_motion(True)
+        for name in ("alpha.gguf", "beta.gguf"):
+            make_fake_gguf(self.models / name, 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        QTest.qWait(500)
+        for card in window.model_cards.values():
+            self.assertIsNone(card.graphicsEffect())
+
+    def test_flip_flies_a_moved_card(self):
+        for name in ("alpha.gguf", "beta.gguf"):
+            make_fake_gguf(self.models / name, 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        QTest.qWait(300)
+        key = str(self.models / "alpha.gguf")
+        card = window.model_cards[key]
+        old = QRect(card.geometry())
+        old.translate(0, -100)
+        window._flip_cards({key: old})
+        self.assertEqual(len(window._flip_anims), 1)
+        ghosts = [child for child in window._cards_widget.children()
+                  if isinstance(child, QLabel)
+                  and child.pixmap() is not None]
+        self.assertEqual(len(ghosts), 1)
+        self.assertEqual(ghosts[0].geometry(), old)
+        done = pump_until(lambda: not window._flip_anims, 2000)
+        self.assertTrue(done, "the FLIP never finished")
+        ghosts = [child for child in window._cards_widget.children()
+                  if isinstance(child, QLabel)
+                  and child.pixmap() is not None]
+        self.assertEqual(ghosts, [])
+
+    def test_flip_skipped_under_reduced_motion(self):
+        set_reduce_motion(True)
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        key = str(self.models / "alpha.gguf")
+        card = window.model_cards[key]
+        old = QRect(card.geometry())
+        old.translate(0, -100)
+        window._flip_cards({key: old})
+        self.assertEqual(window._flip_anims, [])
+
+    def test_overscroll_glow_flashes_and_fades(self):
+        # Models in the folder, so the grid (and its viewport,
+        # the glow's parent) is visible at all.
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        window._flash_overscroll("top")
+        self.assertTrue(window._overscroll_top.isVisible())
+        done = pump_until(
+            lambda: not window._overscroll_top.isVisible(), 2000)
+        self.assertTrue(done, "the glow never faded")
+
+    def test_wheel_past_the_top_flashes_the_top_glow(self):
+        for name in ("a.gguf", "b.gguf", "c.gguf", "d.gguf",
+                     "e.gguf", "f.gguf"):
+            make_fake_gguf(self.models / name, 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        QTest.qWait(200)
+        viewport = window._cards_scroll.viewport()
+        bar = window._cards_scroll.verticalScrollBar()
+        bar.setValue(bar.minimum())
+        event = QWheelEvent(
+            QPoint(10, 10), QPoint(10, 10), QPoint(0, 0),
+            QPoint(0, 120), Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase, False)
+        QApplication.sendEvent(viewport, event)
+        QTest.qWait(100)
+        self.assertTrue(window._overscroll_top.isVisible())
+
+
+class DensityTests(GuiTestCase):
+    def _twelve_models(self):
+        for index in range(12):
+            make_fake_gguf(self.models / ("m%02d.gguf" % index),
+                           2048)
+
+    def test_compact_cards_are_shorter_and_hide_detail(self):
+        write_gguf_file(
+            self.models / "alpha.gguf",
+            {"general.description": "A model with a description."})
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "alpha.gguf")]
+        normal_height = card.height()
+        self.assertFalse(card._desc_label.isHidden())
+        card.set_compact(True)
+        QTest.qWait(100)
+        self.assertTrue(card._desc_label.isHidden())
+        self.assertLess(card.height(), normal_height)
+
+    def test_compact_grid_has_four_columns(self):
+        set_compact_list(False)
+        self.assertEqual(grid_columns(), 3)
+        set_compact_list(True)
+        self.assertEqual(grid_columns(), 4)
+
+    def test_compact_fits_half_again_as_many_cards(self):
+        # The bar: at least 50% more cards in the same window
+        # height. Measured from real card heights and row counts:
+        # 12 models are 4 rows of 3 normally, 3 rows of 4 in
+        # compact, and each compact row is shorter too.
+        self._twelve_models()
+        set_compact_list(False)
+        window = self.make_window()
+        self.wait_scan(window)
+        QTest.qWait(200)
+        normal_height = next(
+            iter(window.model_cards.values())).height()
+        set_compact_list(True)
+        window._apply_density()
+        QTest.qWait(200)
+        compact_height = next(
+            iter(window.model_cards.values())).height()
+        normal_rows = 4
+        compact_rows = 3
+        normal_total = normal_rows * (normal_height + 16)
+        compact_total = compact_rows * (compact_height + 10)
+        ratio = normal_total / compact_total
+        self.assertGreaterEqual(
+            ratio, 1.5,
+            "compact fits only %.2fx as many cards" % ratio)
+
+    def test_settings_window_saves_compact(self):
+        settings = SettingsWindow(self.models)
+        self.windows.append(settings)
+        settings.show()
+        settings.compact_check.setChecked(True)
+        settings.save_button.click()
+        self.assertTrue(get_compact_list())
+
+
+class HighContrastTests(GuiTestCase):
+    def test_high_contrast_theme_applies_live(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "alpha.gguf")]
+        card.clicked.emit(card.path)
+        set_high_contrast(True)
+        window._apply_theme()
+        self.assertEqual(QApplication.instance().styleSheet(),
+                         HIGH_CONTRAST_STYLESHEET)
+        self.assertIn("2px solid %s" % HIGH_CONTRAST["accent"],
+                      card.styleSheet())
+        set_high_contrast(False)
+        window._apply_theme()
+        self.assertEqual(QApplication.instance().styleSheet(),
+                         DARK_STYLESHEET)
+        self.assertIn("2px solid %s" % DARK["accent"],
+                      card.styleSheet())
+
+    def test_settings_window_saves_high_contrast(self):
+        settings = SettingsWindow(self.models)
+        self.windows.append(settings)
+        settings.show()
+        settings.contrast_check.setChecked(True)
+        settings.save_button.click()
+        self.assertTrue(get_high_contrast())
+
+
+class RaiseListenerTests(GuiTestCase):
+    def test_raise_socket_signals_the_window(self):
+        import socket as stdlib_socket
+        sock_path = self.base / "raise.sock"
+        listener = RaiseListener(sock_path)
+        raised = []
+        listener.raise_requested.connect(lambda: raised.append(1))
+        listener.start()
+        try:
+            ok = pump_until(
+                lambda: sock_path.exists(), 2000)
+            self.assertTrue(ok, "the listener never bound")
+            client = stdlib_socket.socket(
+                stdlib_socket.AF_UNIX, stdlib_socket.SOCK_STREAM)
+            client.connect(str(sock_path))
+            client.sendall(b"raise")
+            client.close()
+            done = pump_until(lambda: bool(raised), 2000)
+            self.assertTrue(done, "no raise signal arrived")
+        finally:
+            listener.requestInterruption()
+            listener.wait(2000)
 
 
 if __name__ == "__main__":

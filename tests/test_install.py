@@ -183,10 +183,16 @@ class ProjectFileTests(unittest.TestCase):
 
     def test_stylesheet_applied_by_main(self):
         gui = read("fyrn/gui.py")
+        theme = read("fyrn/theme.py")
         self.assertIn("DARK_STYLESHEET", gui)
-        self.assertIn("app.setStyleSheet(DARK_STYLESHEET)", gui)
-        self.assertIn("#14202e", gui)  # icon tile colour
-        self.assertIn("#f2c14e", gui)  # ember accent
+        # main() applies the active theme's stylesheet (dark by
+        # default, high-contrast when that setting is on).
+        self.assertIn("app.setStyleSheet(current_stylesheet())", gui)
+        # The colours live in the theme tokens, not in gui.py.
+        self.assertIn("#14202e", theme)  # icon tile colour
+        self.assertIn("#f2c14e", theme)  # ember accent
+        self.assertNotIn("#14202e", gui)
+        self.assertNotIn("#f2c14e", gui)
 
     def test_icon_files_exist(self):
         # A fresh clone holds only the SVG (the push path cannot

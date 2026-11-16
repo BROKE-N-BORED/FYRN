@@ -45,10 +45,9 @@ import traceback
 from collections import deque
 from datetime import datetime
 
-try:
-    from importlib import metadata as importlib_metadata
-except ImportError:  # Python < 3.8, not expected on his PC
-    importlib_metadata = None
+# importlib.metadata is NOT imported at module level: it costs
+# ~0.6 s of cold start, and the only caller is _package_version,
+# which imports it on first use.
 
 # ---------------------------------------------------------------- scrubbing
 
@@ -164,7 +163,9 @@ def _disk_usage(path):
 
 
 def _package_version(name):
-    if importlib_metadata is None:
+    try:
+        from importlib import metadata as importlib_metadata
+    except ImportError:  # Python < 3.8, not expected on his PC
         return "unknown"
     try:
         return importlib_metadata.version(name)
