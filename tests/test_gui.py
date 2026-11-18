@@ -2,29 +2,37 @@
 fake .gguf files. No real model, no network (pulls use a local
 fake HTTP server)."""
 
+import hashlib
+import io
 import json
 import os
 import re
+import sys
 import tempfile
+import threading
 import time
+import types
 import unittest
 import warnings
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from PySide6.QtCore import (QBuffer, QEvent, QIODevice, QMimeData,
-                             QPoint, QRect, QTimer, Qt, QUrl)
+from PySide6.QtCore import (QAbstractAnimation, QBuffer, QEvent,
+                             QIODevice, QMimeData, QPoint, QRect,
+                             QTimer, Qt, QUrl)
 from PySide6.QtGui import (QColor, QDragEnterEvent, QDropEvent, QFont,
                            QShortcut, QWheelEvent)
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (QApplication, QLabel, QLineEdit,
                                QMessageBox, QPushButton, QSystemTrayIcon,
-                               QTextEdit, QWidget)
+                               QTextEdit, QToolTip, QWidget)
 
 from helpers import ModalWatcher, file_bytes, make_fake_gguf
 from helpers import start_range_server, write_gguf_file
 from fyrn.core import (HEADROOM_BYTES, ImportCancelled, fit_status,
-                       read_ram_bytes)
+                       format_chat_export, read_ram_bytes)
 from fyrn.gui import (DARK_STYLESHEET, FIRST_PULL_SUGGESTION,
                             FIT_BADGES, HIGH_CONTRAST_STYLESHEET,
                             HOW_TO_USE_SECTIONS, ChatInput,
@@ -35,14 +43,16 @@ from fyrn.gui import (DARK_STYLESHEET, FIRST_PULL_SUGGESTION,
                             current_tokens, get_chime_muted,
                             get_compact_list, get_high_contrast,
                             get_models_folder, get_reduce_motion,
-                            get_show_ollama_models, grid_columns,
-                            reduced_motion, set_chime_muted,
-                            set_compact_list, set_high_contrast,
-                            set_models_folder, set_reduce_motion,
-                            set_show_ollama_models)
-from fyrn.pull import parse_model_input
-from fyrn.runner import FakeRunner, RunnerError
+                            get_show_ollama_models, get_update_check,
+                            grid_columns, reduced_motion,
+                            set_chime_muted, set_compact_list,
+                            set_high_contrast, set_models_folder,
+                            set_reduce_motion, set_show_ollama_models,
+                            set_update_check)
+from fyrn.pull import PullCancelled, parse_model_input
+from fyrn.runner import FakeRunner, LlamaRunner, RunnerError
 from fyrn.theme import DARK, HIGH_CONTRAST
+from fyrn.updates import pending_update
 
 GB = 1024 ** 3
 PAYLOAD = bytes(range(256)) * 256  # 64 KiB deterministic bytes
@@ -83,7 +93,8 @@ class IndeterminateRunner(FakeRunner):
     """A runner that reports no percent while loading, like the
     real backend: -1 with stage text, a pause, then 100."""
 
-    def load(self, path, progress_cb=None, cancel_event=None):
+    def load(self, path, progress_cb=None, cancel_event=None,
+             display_name=None):
         if progress_cb is not None:
             progress_cb(-1, "Loading into RAM...")
         if self.load_delay_s > 0:
@@ -268,7 +279,8 @@ class MainWindowTests(GuiTestCase):
         file_items = [a.text() for a in menus["File"].actions()
                       if not a.isSeparator()]
         self.assertEqual(file_items,
-                         ["Settings", "Debug report", "Quit"])
+                         ["Settings", "Save chat", "Debug report",
+                          "Quit"])
         models_items = [a.text() for a in menus["Models"].actions()]
         self.assertEqual(models_items,
                          ["Load selected model", "Pull models",
@@ -276,7 +288,8 @@ class MainWindowTests(GuiTestCase):
                           "Refresh list", "Unload model"])
         help_items = [a.text() for a in menus["Help"].actions()]
         self.assertEqual(help_items,
-                         ["Command palette", "How to Use", "About"])
+                         ["Command palette", "How to Use",
+                          "Check for updates", "About"])
 
     def test_cards_populate_and_nothing_selected(self):
         make_fake_gguf(self.models / "alpha.gguf", 2048)
@@ -989,14 +1002,18 @@ class HoverDetailTests(GuiTestCase):
         with mock.patch("fyrn.gui.QToolTip.showText") as show, \
                 mock.patch("fyrn.gui.QToolTip.hideText") as hide:
             alpha.setFocus()
-            QTest.qWait(100)
-            self.assertTrue(show.called,
+            # The focus tooltip is deferred 100 ms (task 7:
+            # showText from inside focusInEvent never renders),
+            # so a fixed 100 ms wait is exactly on the boundary
+            # and races under load: wait for the call instead.
+            shown_ok = pump_until(lambda: show.called, 2000)
+            self.assertTrue(shown_ok,
                             "focusing a card did not show its detail")
             shown = show.call_args[0][1]
             self.assertIn("Full path:", shown)
             beta.setFocus()
-            QTest.qWait(100)
-            self.assertTrue(hide.called,
+            hidden_ok = pump_until(lambda: hide.called, 2000)
+            self.assertTrue(hidden_ok,
                             "leaving a card did not hide its detail")
 
 
@@ -1748,10 +1765,11 @@ class WindowHeightTests(GuiTestCase):
         QTest.qWait(200)
         bottom = settings.save_button.geometry().bottom()
         self.assertLess(settings.height() - bottom, 30)
-        # The last help line is the chime's: the stretch between
-        # it and the buttons must stay small.
+        # The last help line is the update check's: the stretch
+        # between it and the buttons must stay small.
         helps = [label for label in settings.findChildren(QLabel)
-                 if label.text().startswith("A short chime")]
+                 if label.text().startswith(
+                     "Fyrn quietly asks GitHub")]
         self.assertEqual(len(helps), 1)
         gap = (settings.save_button.geometry().top()
                - helps[0].geometry().bottom())
@@ -1968,11 +1986,13 @@ class FailingRunner(FakeRunner):
         super().__init__()
         self.fail_next = False
 
-    def load(self, path, progress_cb=None, cancel_event=None):
+    def load(self, path, progress_cb=None, cancel_event=None,
+             display_name=None):
         if self.fail_next:
             raise RunnerError(
                 "The model could not be loaded (fake bad file).")
-        return super().load(path, progress_cb, cancel_event)
+        return super().load(path, progress_cb, cancel_event,
+                            display_name)
 
 
 class FailedLoadTests(GuiTestCase):
@@ -2222,9 +2242,11 @@ class BlockingRunner(FakeRunner):
     """A load that blocks 8 s without checking cancel, like the
     real backend's constructor: longer than the 5 s close wait."""
 
-    def load(self, path, progress_cb=None, cancel_event=None):
+    def load(self, path, progress_cb=None, cancel_event=None,
+             display_name=None):
         time.sleep(8)
-        return super().load(path, progress_cb, cancel_event)
+        return super().load(path, progress_cb, cancel_event,
+                            display_name)
 
 
 class CloseDuringLoadTests(GuiTestCase):
@@ -2265,7 +2287,12 @@ class NonCancellableLoadTests(GuiTestCase):
         window.model_cards[path].clicked.emit(path)
         window.load_button.click()
         pump_until(lambda: window.load_worker is not None, 5000)
-        QTest.qWait(300)
+        # Wait for the state, not a fixed sleep: the first
+        # progress signal (which carries the "cannot be stopped"
+        # line) arrives when the worker thread starts emitting,
+        # and a fixed 300 ms wait was marginal under suite load.
+        pump_until(lambda: "cannot be stopped" in
+                   window.statusBar().currentMessage(), 5000)
         self.assertTrue(window.load_cancel_button.isVisible())
         self.assertFalse(window.load_cancel_button.isEnabled())
         self.assertIn("cannot be stopped",
@@ -2807,9 +2834,9 @@ class AttachTests(GuiTestCase):
     def test_vision_warning_in_load_status(self):
         class WarningRunner(FakeRunner):
             def load(self, path, progress_cb=None,
-                     cancel_event=None):
+                     cancel_event=None, display_name=None):
                 result = super().load(path, progress_cb,
-                                      cancel_event)
+                                      cancel_event, display_name)
                 result["vision_warning"] = (
                     "This is a vision model, but its projector "
                     "file is not next to it.")
@@ -3113,7 +3140,8 @@ class CommandPaletteTests(GuiTestCase):
                        "Pull models", "Import a GGUF file",
                        "Remove selected model", "Refresh list",
                        "Focus search", "Settings", "How to Use",
-                       "Clear chat", "Quit"):
+                       "Clear chat", "Save chat",
+                       "Check for updates", "Quit"):
             self.assertIn(wanted, titles)
         self.assertEqual(len(titles), len(set(titles)))
 
@@ -3386,9 +3414,28 @@ class RaiseListenerTests(GuiTestCase):
             ok = pump_until(
                 lambda: sock_path.exists(), 2000)
             self.assertTrue(ok, "the listener never bound")
-            client = stdlib_socket.socket(
-                stdlib_socket.AF_UNIX, stdlib_socket.SOCK_STREAM)
-            client.connect(str(sock_path))
+            # The socket file appearing does not mean the
+            # listener is accepting yet: a connect in that
+            # window is refused (a flake seen under suite
+            # load). Retry the connect instead of connecting
+            # once.
+            client = None
+            connected = False
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    client = stdlib_socket.socket(
+                        stdlib_socket.AF_UNIX,
+                        stdlib_socket.SOCK_STREAM)
+                    client.connect(str(sock_path))
+                    connected = True
+                    break
+                except ConnectionRefusedError:
+                    client.close()
+                    client = None
+                    QTest.qWait(100)
+            self.assertTrue(connected,
+                            "could not connect to the raise socket")
             client.sendall(b"raise")
             client.close()
             done = pump_until(lambda: bool(raised), 2000)
@@ -3396,6 +3443,871 @@ class RaiseListenerTests(GuiTestCase):
         finally:
             listener.requestInterruption()
             listener.wait(2000)
+
+
+# ------------------------------------------------------------ v0.6
+# The hands-on audit fixes (tasks 1-17) and the update check.
+
+
+class SettingsDialogSizeTests(GuiTestCase):
+    """Task 1: the Settings dialog opens at its full content
+    size, not crushed to 560x220 with clipped labels and
+    9 px slivers for buttons."""
+
+    def test_settings_opens_at_full_content_size(self):
+        settings = SettingsWindow(self.models)
+        self.windows.append(settings)
+        settings.show()
+        QTest.qWait(200)
+        self.assertGreaterEqual(
+            settings.height(), settings.minimumSizeHint().height())
+
+    def test_settings_labels_and_buttons_are_not_clipped(self):
+        settings = SettingsWindow(self.models)
+        self.windows.append(settings)
+        settings.show()
+        QTest.qWait(200)
+        for label in settings.findChildren(QLabel):
+            if not label.isVisible():
+                continue
+            # A word-wrapped label's sizeHint height assumes its
+            # sizeHint width; at the dialog's real (wider) width
+            # the text fits on fewer lines, so the height to beat
+            # is heightForWidth at the actual width.
+            if label.wordWrap():
+                needed = label.heightForWidth(label.width())
+            else:
+                needed = label.sizeHint().height()
+            self.assertGreaterEqual(
+                label.height(), needed - 1,
+                "clipped label: %r" % label.text()[:40])
+        buttons = {button.text(): button for button in
+                   settings.findChildren(QPushButton)}
+        for name in ("Save", "Cancel"):
+            self.assertIn(name, buttons)
+            self.assertGreaterEqual(
+                buttons[name].height(),
+                buttons[name].sizeHint().height())
+            self.assertLess(
+                settings.height()
+                - buttons[name].geometry().bottom(), 30)
+
+
+class GridLayoutTests(GuiTestCase):
+    """Task 3: at 56 models three cards piled on one spot, two
+    hidden, one 8 rows out of place. The cause was the hover
+    lift capturing a collapsed geometry mid-relayout and parking
+    the card there forever."""
+
+    def _settled_window(self, count):
+        for index in range(count):
+            make_fake_gguf(self.models / ("m%02d.gguf" % index),
+                           2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        # Stagger (12 cards x 40 ms + 200 ms) and FLIP settle.
+        QTest.qWait(1000)
+        return window
+
+    def test_56_cards_never_overlap(self):
+        window = self._settled_window(56)
+        cards = list(window.model_cards.values())
+        self.assertEqual(len(cards), 56)
+        rects = [card.geometry() for card in cards]
+        for index, first in enumerate(rects):
+            for second in rects[index + 1:]:
+                self.assertFalse(
+                    first.intersects(second),
+                    "cards overlap: %s vs %s"
+                    % (first, second))
+
+    def test_56_cards_stay_in_row_major_order(self):
+        window = self._settled_window(56)
+        cards = list(window.model_cards.values())
+        ordered = sorted(
+            cards,
+            key=lambda c: (c.geometry().y(), c.geometry().x()))
+        names = [card.model_name for card in ordered]
+        self.assertEqual(names, sorted(names, key=str.lower))
+
+    def test_lift_re_syncs_to_the_true_cell(self):
+        window = self._settled_window(3)
+        cards = sorted(window.model_cards.values(),
+                       key=lambda c: c.model_name)
+        card = cards[1]
+        true_cell = QRect(card.geometry())
+        # The card sits at a stale spot (the collapsed geometry
+        # the audit caught), and the lift starts from there.
+        wrong = QRect(true_cell)
+        wrong.translate(0, 50)
+        card.setGeometry(wrong)
+        card._start_lift()
+        done = pump_until(
+            lambda: (card._lift_anim is not None
+                     and card._lift_anim.state()
+                     == QAbstractAnimation.State.Stopped),
+            5000)
+        self.assertTrue(done, "the lift never finished")
+        expected = QRect(true_cell)
+        expected.translate(0, -4)
+        self.assertEqual(card.geometry(), expected)
+
+    def test_relayout_cancels_a_lift_in_flight(self):
+        window = self._settled_window(3)
+        card = sorted(window.model_cards.values(),
+                      key=lambda c: c.model_name)[1]
+        card._start_lift()
+        self.assertIsNotNone(card._lift_anim)
+        window._relayout_cards(window._visible_paths)
+        self.assertIsNone(card._lift_anim)
+        self.assertIsNone(card._lift_rest)
+
+
+class PullWindowGrowthTests(GuiTestCase):
+    """Task 4: the Pull window grows when the queue list
+    appears, instead of crushing the lists into the space the
+    empty window had."""
+
+    def test_window_grows_when_the_queue_appears(self):
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        QTest.qWait(200)
+        before = pull.height()
+        self.assertFalse(pull.queue_list.isVisible())
+        pull.input.setText("https://example.invalid/one.gguf")
+        pull.queue_add_button.click()
+        QTest.qWait(200)
+        self.assertTrue(pull.queue_list.isVisible())
+        self.assertEqual(pull.queue_list.count(), 1)
+        self.assertGreater(pull.height(), before)
+        # The queue list itself is full height (its 120 px cap),
+        # not crushed, and the window hugs its content: the
+        # bottom-most visible widget ends near the window bottom.
+        # (The status line sits above the queue list, so it is
+        # not the bottom widget once the queue is showing.)
+        self.assertEqual(pull.queue_list.height(), 120)
+        bottom = max(
+            widget.geometry().bottom()
+            for widget in pull.findChildren(QWidget)
+            if widget.parentWidget() is pull
+            and widget.isVisibleTo(pull))
+        self.assertLess(pull.height() - bottom, 30)
+
+
+class HiddenModelLoadTests(GuiTestCase):
+    """Task 5: Ctrl+L on a model the search is hiding refuses
+    in plain words, the way Remove already did."""
+
+    def test_ctrl_l_on_a_hidden_model_refuses(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        make_fake_gguf(self.models / "beta.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        window.controller._free_ram_fn = lambda: 8 * GB
+        beta = str(self.models / "beta.gguf")
+        window.model_cards[beta].clicked.emit(beta)
+        window.search_box.setText("alpha")
+        QTest.qWait(200)
+        self.assertNotIn(beta, window._visible_paths)
+        # The menu action (and its Ctrl+L shortcut) stays
+        # enabled so the guard below is reached (task 6).
+        self.assertTrue(window._load_action.isEnabled())
+        window.load_selected_model()
+        self.assertIn("hidden by the search",
+                      window.statusBar().currentMessage())
+        self.assertFalse(window.controller.is_loaded)
+        self.assertIsNone(window.load_worker)
+
+
+class MenuActionStateTests(GuiTestCase):
+    """Task 6: the Models menu actions enable and disable with
+    the state, the way the buttons already do."""
+
+    def setUp(self):
+        super().setUp()
+        self._old_ollama = os.environ.get("OLLAMA_MODELS")
+        self.store = make_ollama_store(
+            self.base / "ollama-store", "tiny", "1b", "ab" * 32)
+        os.environ["OLLAMA_MODELS"] = str(self.store)
+        set_show_ollama_models(True)
+
+    def tearDown(self):
+        if self._old_ollama is None:
+            os.environ.pop("OLLAMA_MODELS", None)
+        else:
+            os.environ["OLLAMA_MODELS"] = self._old_ollama
+        super().tearDown()
+
+    def test_no_selection_disables_load_remove_unload(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        self.assertFalse(window._load_action.isEnabled())
+        self.assertFalse(window._remove_action.isEnabled())
+        self.assertFalse(window._unload_action.isEnabled())
+        self.assertTrue(window._pull_action.isEnabled())
+        self.assertTrue(window._refresh_action.isEnabled())
+        self.assertTrue(window._import_action.isEnabled())
+
+    def test_selection_enables_load_and_remove(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        path = str(self.models / "alpha.gguf")
+        window.model_cards[path].clicked.emit(path)
+        self.assertTrue(window._load_action.isEnabled())
+        self.assertTrue(window._remove_action.isEnabled())
+        self.assertFalse(window._unload_action.isEnabled())
+
+    def test_loaded_model_disables_load_enables_unload(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.load_first_model(window)
+        self.assertFalse(window._load_action.isEnabled())
+        self.assertTrue(window._unload_action.isEnabled())
+
+    def test_ollama_selection_keeps_remove_enabled(self):
+        # The button greys out for an Ollama model (it cannot be
+        # removed), but the menu action — and its Del shortcut —
+        # stays enabled so the user is told why in plain words.
+        window = self.make_window()
+        self.wait_scan(window)
+        path = [key for key, card in window.model_cards.items()
+                if card.model_name == "tiny:1b"][0]
+        window.model_cards[path].clicked.emit(path)
+        self.assertTrue(window._remove_action.isEnabled())
+        self.assertFalse(window.remove_button.isEnabled())
+
+
+class FocusTooltipTests(GuiTestCase):
+    """Task 7: keyboard focus on a card shows its tooltip.
+    showText from inside focusInEvent never renders (the event
+    is still being delivered); the fix defers it by 100 ms."""
+
+    def test_focus_shows_the_card_tooltip(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "alpha.gguf")]
+        window.activateWindow()
+        QTest.qWait(100)
+        card.setFocus()
+        shown = pump_until(QToolTip.isVisible, 2000)
+        self.assertTrue(shown, "no tooltip appeared on focus")
+
+    def test_focus_away_hides_the_tooltip(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        card = window.model_cards[str(self.models / "alpha.gguf")]
+        window.activateWindow()
+        QTest.qWait(100)
+        card.setFocus()
+        self.assertTrue(pump_until(QToolTip.isVisible, 2000))
+        window.search_box.setFocus()
+        QTest.qWait(300)
+        self.assertFalse(QToolTip.isVisible())
+
+
+class UnsupportedArchitectureGuiTests(GuiTestCase):
+    """Task 8, through the window: loading LFM3 fails with a
+    modal that names the design, not the file."""
+
+    def test_lfm3_load_modal_names_the_design(self):
+        write_gguf_file(
+            self.models / "lfm3.gguf",
+            {"general.architecture": "lfm3"})
+
+        class FailingLlama:
+            def __init__(self, model_path, n_threads, n_ctx,
+                         verbose, chat_handler=None):
+                raise ValueError(
+                    "Failed to load model from file: %s"
+                    % model_path)
+
+        module = types.ModuleType("llama_cpp")
+        module.Llama = FailingLlama
+        window = self.make_window(runner=LlamaRunner())
+        window.controller._free_ram_fn = lambda: 8 * GB
+        with mock.patch.dict(sys.modules, {"llama_cpp": module}):
+            self.wait_scan(window)
+            path = str(self.models / "lfm3.gguf")
+            window.model_cards[path].clicked.emit(path)
+            window.load_button.click()
+            self.wait_load(window)
+        self.assertFalse(window.controller.is_loaded)
+        texts = [text for title, text in self.watcher.seen
+                 if title == "Load model"]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("LFM3", texts[0])
+        self.assertIn("does not support yet", texts[0])
+        self.assertIn("file itself is fine", texts[0])
+        self.assertNotIn("may be broken", texts[0])
+        # No filesystem path in the message (a local card's name
+        # is its filename, "lfm3.gguf" included, but the folder
+        # path never appears).
+        self.assertNotIn(str(self.models), texts[0])
+
+
+class PullCloseTooltipTests(GuiTestCase):
+    """Task 9: the Pull window's Close button says what closing
+    does to a running download."""
+
+    def test_close_tooltip_names_the_part_file(self):
+        pull = PullWindow(self.models)
+        self.windows.append(pull)
+        pull.show()
+        self.assertEqual(
+            pull.close_button.toolTip(),
+            "Close this window (a running download stops, "
+            "keeping its part file)")
+
+
+class SettingsSavedMessageTests(GuiTestCase):
+    """Task 10: a settings-only save says "Settings saved."; a
+    save that changed the folder says so once, and the
+    settings message never clobbers it."""
+
+    def test_settings_only_save_says_settings_saved(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        window.show_settings()
+        settings = window.settings_window
+        self.windows.append(settings)
+        settings.save_button.click()
+        QTest.qWait(100)
+        self.assertEqual(window.statusBar().currentMessage(),
+                         "Settings saved.")
+
+    def test_folder_change_message_is_not_clobbered(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        new_folder = self.base / "elsewhere"
+        new_folder.mkdir()
+        make_fake_gguf(new_folder / "new.gguf", 1024)
+        window.show_settings()
+        settings = window.settings_window
+        self.windows.append(settings)
+        settings.folder_edit.setText(str(new_folder))
+        settings.save_button.click()
+        QTest.qWait(100)
+        self.assertEqual(
+            window.statusBar().currentMessage(),
+            "Models folder is now %s." % new_folder)
+
+
+class LoadStatusNameTests(GuiTestCase):
+    """Task 11, through the window: the loading status names
+    the Ollama model, never its blob hash."""
+
+    def setUp(self):
+        super().setUp()
+        self._old_ollama = os.environ.get("OLLAMA_MODELS")
+        self.store = make_ollama_store(
+            self.base / "ollama-store", "tiny", "1b", "ab" * 32)
+        os.environ["OLLAMA_MODELS"] = str(self.store)
+        set_show_ollama_models(True)
+
+    def tearDown(self):
+        if self._old_ollama is None:
+            os.environ.pop("OLLAMA_MODELS", None)
+        else:
+            os.environ["OLLAMA_MODELS"] = self._old_ollama
+        super().tearDown()
+
+    def test_loading_status_names_the_ollama_model(self):
+        runner = GatedRunner()
+        window = self.make_window(runner=runner)
+        self.wait_scan(window)
+        window.controller._free_ram_fn = lambda: 8 * GB
+        # The sandbox's real Ollama store is also discovered, so
+        # pick the test model by name, not by position.
+        path = [key for key, card in window.model_cards.items()
+                if card.model_name == "tiny:1b"][0]
+        window.model_cards[path].clicked.emit(path)
+        window.load_button.click()
+        started = pump_until(runner.started.is_set, 5000)
+        self.assertTrue(started, "the load never started")
+        message = window.statusBar().currentMessage()
+        self.assertIn("tiny:1b", message)
+        self.assertNotIn("sha256", message)
+        runner.release.set()
+        self.wait_load(window)
+        self.assertTrue(window.controller.is_loaded)
+
+
+class GatedRunner(FakeRunner):
+    """A load that waits to be released, so a test can read the
+    loading status mid-load."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def load(self, path, progress_cb=None, cancel_event=None,
+             display_name=None):
+        self.started.set()
+        self.release.wait(timeout=10)
+        return super().load(path, progress_cb, cancel_event,
+                            display_name)
+
+
+class HowToUseSettingsTests(GuiTestCase):
+    """Task 12: the How to Use Settings section names all seven
+    settings (it used to say three, then six)."""
+
+    def test_settings_section_names_all_seven_settings(self):
+        text = HOW_TO_USE_SECTIONS["Settings"]
+        for name in ("models folder", "Ollama", "Reduce motion",
+                     "Compact model list", "High-contrast",
+                     "chime", "checks for a newer release"):
+            self.assertIn(name, text)
+
+
+class ChatExportTests(GuiTestCase):
+    """Task 13 (minimum scope): save the chat to a file the
+    user picks. No cross-session history."""
+
+    def test_format_chat_export(self):
+        text = format_chat_export(
+            "You: hi\nQwen: hello", model_name="Qwen",
+            when="2026-11-18 20:00")
+        self.assertTrue(text.startswith(
+            "Fyrn chat with Qwen\nSaved 2026-11-18 20:00\n\n"))
+        self.assertLess(text.index("You: hi"),
+                        text.index("Qwen: hello"))
+        self.assertTrue(text.endswith("\n"))
+
+    def test_format_chat_export_without_a_model(self):
+        text = format_chat_export("You: hi", when="2026-11-18 20:00")
+        self.assertIn("Fyrn chat with no model", text)
+
+    def test_save_chat_writes_the_transcript_in_order(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.load_first_model(window)
+        window.transcript.setPlainText(
+            "You: hello there\nAlpha: hi back")
+        dest = self.base / "chat.txt"
+        with mock.patch(
+                "fyrn.gui.QFileDialog.getSaveFileName",
+                return_value=(str(dest), "")):
+            window.save_chat_button.click()
+        QTest.qWait(100)
+        content = dest.read_text(encoding="utf-8")
+        self.assertIn("Fyrn chat with alpha", content)
+        self.assertLess(content.index("You: hello there"),
+                        content.index("Alpha: hi back"))
+        self.assertIn("Chat saved to",
+                      window.statusBar().currentMessage())
+
+    def test_save_chat_with_no_chat_says_so(self):
+        window = self.make_window()
+        with mock.patch(
+                "fyrn.gui.QFileDialog.getSaveFileName",
+                side_effect=AssertionError(
+                    "the dialog must not open for an empty chat")):
+            window._save_chat()
+        self.assertIn("no chat to save yet",
+                      window.statusBar().currentMessage())
+
+    def test_save_chat_cancel_writes_nothing(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.load_first_model(window)
+        window.transcript.setPlainText("You: hello")
+        with mock.patch(
+                "fyrn.gui.QFileDialog.getSaveFileName",
+                return_value=("", "")):
+            window._save_chat()
+        self.assertEqual(list(self.base.glob("*.txt")), [])
+
+
+class HintWordingTests(GuiTestCase):
+    """Task 14: the folder hint reads as a sentence."""
+
+    def test_folder_hint_wording(self):
+        window = self.make_window()
+        labels = [label for label in window.findChildren(QLabel)
+                  if label.text().startswith("Models live")]
+        self.assertEqual(len(labels), 1)
+        self.assertEqual(
+            labels[0].text(),
+            "Models live in the folder set in the File menu, "
+            "under Settings.")
+
+
+class TabOrderTests(GuiTestCase):
+    """Task 15: Tab never lands on the bare scroll area."""
+
+    def test_scroll_area_is_out_of_the_tab_order(self):
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        self.assertEqual(window._cards_scroll.focusPolicy(),
+                         Qt.FocusPolicy.NoFocus)
+        window.activateWindow()
+        QTest.qWait(100)
+        window.search_box.setFocus()
+        QTest.qWait(50)
+        for _ in range(12):
+            focused = QApplication.focusWidget() or window
+            QTest.keyClick(focused, Qt.Key.Key_Tab)
+            QTest.qWait(50)
+            self.assertIsNot(QApplication.focusWidget(),
+                             window._cards_scroll)
+
+
+class EmptyStateHintTests(GuiTestCase):
+    """Task 16: the double-click hint hides with the empty
+    state and returns with the models."""
+
+    def test_hint_hidden_with_no_models_returns_with_models(self):
+        window = self.make_window()
+        self.wait_scan(window)
+        self.assertFalse(window._hint_label.isVisible())
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        window._refresh_model_list()
+        self.wait_scan(window)
+        self.assertTrue(window._hint_label.isVisible())
+
+
+class CardWidthTests(GuiTestCase):
+    """Task 17: one card is a third of the row, not the full
+    width — the hero tile's full width stays meaningful."""
+
+    def _first_card_width(self, count):
+        for index in range(count):
+            make_fake_gguf(
+                self.models / ("model%d.gguf" % index), 2048)
+        window = self.make_window()
+        self.wait_scan(window)
+        QTest.qWait(500)
+        widths = [card.width()
+                  for card in window.model_cards.values()]
+        return window, widths
+
+    def test_one_card_is_a_third_wide(self):
+        _window, widths = self._first_card_width(1)
+        self.assertEqual(len(widths), 1)
+        self.assertLess(widths[0], 500)
+        self.assertGreater(widths[0], 250)
+
+    def test_card_width_does_not_depend_on_count(self):
+        _one, one_width = self._first_card_width(1)
+        _one.close()
+        _three, three_widths = self._first_card_width(3)
+        self.assertEqual(len(three_widths), 3)
+        for width in three_widths:
+            self.assertLessEqual(abs(width - one_width[0]), 5)
+
+    def test_two_cards_share_the_row_equally(self):
+        _window, widths = self._first_card_width(2)
+        self.assertEqual(len(widths), 2)
+        # Equal up to a pixel of rounding in the column split.
+        self.assertLessEqual(abs(widths[0] - widths[1]), 1)
+
+
+class UpdateCheckGuiTests(GuiTestCase):
+    """The update check through the window: silent when it
+    should be, plain when it should speak."""
+
+    def _result(self, state, latest="0.7", reason=None):
+        result = {"state": state, "latest": latest,
+                  "url": "https://example.invalid/releases",
+                  "zip_url": "https://example.invalid/f.zip",
+                  "zip_name": "f.zip",
+                  "sha256_url":
+                      "https://example.invalid/f.zip.sha256"}
+        if reason is not None:
+            result["reason"] = reason
+        return result
+
+    def _check_and_wait(self, window, result, manual):
+        with mock.patch("fyrn.updates.check_for_update",
+                        return_value=result):
+            window.check_for_updates(manual=manual)
+            done = pump_until(
+                lambda: window._update_check_worker is None, 5000)
+        self.assertTrue(done, "the check never finished")
+
+    def test_manual_check_current_reports_up_to_date(self):
+        window = self.make_window()
+        self._check_and_wait(
+            window, self._result("current", "0.6"), manual=True)
+        texts = [text for title, text in self.watcher.seen
+                 if title == "Check for updates"]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("up to date", texts[0])
+        self.assertIn("0.6", texts[0])
+
+    def test_manual_check_unknown_reports_the_reason(self):
+        window = self.make_window()
+        self._check_and_wait(
+            window,
+            self._result("unknown", None,
+                         reason="could not reach GitHub: offline"),
+            manual=True)
+        texts = [text for title, text in self.watcher.seen
+                 if title == "Check for updates"]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("Could not check for updates", texts[0])
+        self.assertIn("offline", texts[0])
+
+    def test_manual_check_newer_asks_and_no_means_no_download(self):
+        window = self.make_window()
+        self._check_and_wait(
+            window, self._result("newer"), manual=True)
+        texts = [text for title, text in self.watcher.seen
+                 if title == "Update available"]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("Fyrn 0.7 is out", texts[0])
+        self.assertIn("You have 0.6", texts[0])
+        # The watcher clicks the default (No): nothing downloads.
+        QTest.qWait(200)
+        self.assertIsNone(window._update_download_worker)
+
+    def test_silent_check_current_is_silent(self):
+        window = self.make_window()
+        self._check_and_wait(
+            window, self._result("current", "0.6"), manual=False)
+        self.assertEqual(self.watcher.seen, [])
+
+    def test_silent_check_unknown_is_silent(self):
+        window = self.make_window()
+        self._check_and_wait(
+            window,
+            self._result("unknown", None,
+                         reason="could not reach GitHub: offline"),
+            manual=False)
+        self.assertEqual(self.watcher.seen, [])
+
+    def test_silent_check_newer_still_asks(self):
+        window = self.make_window()
+        self._check_and_wait(
+            window, self._result("newer"), manual=False)
+        self.assertTrue(any(title == "Update available"
+                            for title, _text in self.watcher.seen))
+
+    def test_second_check_while_checking_says_so(self):
+        window = self.make_window()
+
+        def slow_check(_version):
+            time.sleep(1.0)
+            return self._result("current", "0.6")
+
+        with mock.patch("fyrn.updates.check_for_update",
+                        side_effect=slow_check):
+            window.check_for_updates(manual=True)
+            started = pump_until(
+                lambda: window._update_check_worker is not None,
+                2000)
+            self.assertTrue(started)
+            window.check_for_updates(manual=True)
+            self.assertIn("Already checking for updates",
+                          window.statusBar().currentMessage())
+            done = pump_until(
+                lambda: window._update_check_worker is None, 5000)
+        self.assertTrue(done, "the check never finished")
+
+    def test_update_check_setting_defaults_on_and_saves(self):
+        self.assertTrue(get_update_check())
+        settings = SettingsWindow(self.models)
+        self.windows.append(settings)
+        settings.show()
+        self.assertTrue(settings.update_check.isChecked())
+        settings.update_check.setChecked(False)
+        settings.save_button.click()
+        QTest.qWait(100)
+        self.assertFalse(get_update_check())
+        second = SettingsWindow(self.models)
+        self.windows.append(second)
+        second.show()
+        self.assertFalse(second.update_check.isChecked())
+
+
+def _make_update_zip():
+    """A small fake release zip, shaped like Fyrn's."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        info = zipfile.ZipInfo("fyrn/fyrn/__init__.py")
+        info.external_attr = 0o100644 << 16
+        zf.writestr(info, '__version__ = "0.7"\n')
+        info = zipfile.ZipInfo("fyrn/fyrn/gui.py")
+        info.external_attr = 0o100644 << 16
+        zf.writestr(info, "# new gui\n")
+    return buffer.getvalue()
+
+
+class UpdateDownloadGuiTests(GuiTestCase):
+    """The download half, end to end against local servers:
+    the zip from a range server, the sidecar from a plain one."""
+
+    def _serve_text(self, text):
+        """A plain local server answering every GET with text."""
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                data = text.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever,
+                                  daemon=True)
+        thread.start()
+        self.servers.append(server)
+        return ("http://127.0.0.1:%d/sidecar"
+                % server.server_address[1])
+
+    def _release(self, zip_bytes, sidecar_text):
+        zip_server, zip_url = start_range_server(zip_bytes)
+        self.servers.append(zip_server)
+        return {"state": "newer", "latest": "0.7",
+                "url": "https://example.invalid/releases",
+                "zip_url": zip_url.replace("model.gguf",
+                                           "fyrn-v0.7.zip"),
+                "zip_name": "fyrn-v0.7.zip",
+                "sha256_url": self._serve_text(sidecar_text)}
+
+    def test_download_verifies_stages_and_asks_to_restart(self):
+        zip_bytes = _make_update_zip()
+        digest = hashlib.sha256(zip_bytes).hexdigest()
+        release = self._release(
+            zip_bytes, "%s  fyrn-v0.7.zip\n" % digest)
+        window = self.make_window()
+        window._start_update_download(release)
+        asked = pump_until(
+            lambda: any(title == "Update ready"
+                        for title, _text in self.watcher.seen),
+            10000)
+        self.assertTrue(asked, "no restart question appeared")
+        # The watcher clicks the default (No): the update waits
+        # for the next restart, staged and verified.
+        self.assertIn("will install when Fyrn restarts",
+                      window.statusBar().currentMessage())
+        record = pending_update(window._home)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["version"], "0.7")
+        self.assertEqual(record["zip_sha256"], digest)
+
+    def test_yes_at_restart_applies_and_restarts(self):
+        zip_bytes = _make_update_zip()
+        digest = hashlib.sha256(zip_bytes).hexdigest()
+        release = self._release(
+            zip_bytes, "%s  fyrn-v0.7.zip\n" % digest)
+        window = self.make_window()
+        app = QApplication.instance()
+        quit_calls = []
+        app.quit = lambda: quit_calls.append(True)
+        try:
+            with mock.patch(
+                    "fyrn.updates.apply_pending_update",
+                    return_value=(True, "0.7")) as apply_mock, \
+                    mock.patch(
+                        "fyrn.updates.restart_after_exit") \
+                    as restart_mock:
+                timer = self._answer_yes()
+                try:
+                    window._start_update_download(release)
+                    done = pump_until(
+                        lambda: restart_mock.called, 10000)
+                finally:
+                    timer.stop()
+                    self.watcher.enabled = True
+        finally:
+            del app.quit
+        self.assertTrue(done, "no restart was requested")
+        apply_mock.assert_called_once_with(window._home)
+        restart_mock.assert_called_once()
+        self.assertEqual(restart_mock.call_args[0][0],
+                         [sys.executable, "-m", "fyrn"])
+        self.assertEqual(quit_calls, [True])
+
+    def test_checksum_mismatch_is_refused(self):
+        zip_bytes = _make_update_zip()
+        release = self._release(
+            zip_bytes, "%s  fyrn-v0.7.zip\n" % ("0" * 64))
+        window = self.make_window()
+        window._start_update_download(release)
+        warned = pump_until(
+            lambda: any(title == "Update"
+                        for title, _text in self.watcher.seen),
+            10000)
+        self.assertTrue(warned, "no failure warning appeared")
+        texts = [text for title, text in self.watcher.seen
+                 if title == "Update"]
+        self.assertIn("checksum", texts[0].lower())
+        # Update words, not pull words: the download helper's
+        # message says "not saved as a model. Try pulling it
+        # again", which is wrong for an update.
+        self.assertNotIn("pulling", texts[0].lower())
+        self.assertNotIn("as a model", texts[0])
+        self.assertIsNone(pending_update(window._home))
+
+    def test_release_without_a_sidecar_is_refused(self):
+        zip_bytes = _make_update_zip()
+        digest = hashlib.sha256(zip_bytes).hexdigest()
+        release = self._release(
+            zip_bytes, "%s  fyrn-v0.7.zip\n" % digest)
+        release["sha256_url"] = None
+        window = self.make_window()
+        window._start_update_download(release)
+        warned = pump_until(
+            lambda: any(title == "Update"
+                        for title, _text in self.watcher.seen),
+            10000)
+        self.assertTrue(warned, "no failure warning appeared")
+        texts = [text for title, text in self.watcher.seen
+                 if title == "Update"]
+        self.assertIn("no checksum", texts[0])
+        self.assertIsNone(pending_update(window._home))
+
+    def test_cancel_stops_the_download(self):
+        zip_bytes = _make_update_zip()
+        digest = hashlib.sha256(zip_bytes).hexdigest()
+        release = self._release(
+            zip_bytes, "%s  fyrn-v0.7.zip\n" % digest)
+
+        def blocking_download(url, dest, progress_cb=None,
+                              cancel_event=None,
+                              expected_sha256=None):
+            cancel_event.wait(timeout=10)
+            raise PullCancelled("cancelled")
+
+        window = self.make_window()
+        with mock.patch("fyrn.pull.download_file",
+                        side_effect=blocking_download):
+            window._start_update_download(release)
+            QTest.qWait(500)
+            window._cancel_update_download()
+            done = pump_until(
+                lambda: window._update_download_worker is None,
+                5000)
+        self.assertTrue(done, "the download never cancelled")
+        self.assertIn("cancelled",
+                      window.statusBar().currentMessage())
+        self.assertIsNone(pending_update(window._home))
+
+    def test_restart_waits_when_a_model_is_busy(self):
+        window = self.make_window()
+        window.load_worker = mock.Mock()
+        try:
+            with mock.patch(
+                    "fyrn.updates.apply_pending_update") \
+                    as apply_mock:
+                window._apply_update_and_restart("0.7")
+                apply_mock.assert_not_called()
+        finally:
+            window.load_worker = None
+        self.assertIn("will install when Fyrn restarts",
+                      window.statusBar().currentMessage())
 
 
 if __name__ == "__main__":

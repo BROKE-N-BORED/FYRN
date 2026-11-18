@@ -15,7 +15,8 @@ from fyrn.runner import (MAX_GENERATION_TOKENS, FakeRunner,
                                GenerationCancelled, LoadCancelled,
                                LlamaRunner, RunnerError,
                                auto_context_tokens, auto_threads,
-                               compute_tokens_per_sec, trim_history)
+                               compute_tokens_per_sec, trim_history,
+                               warm_engine)
 
 GB = 1024 ** 3
 
@@ -175,6 +176,278 @@ class LlamaRunnerTests(unittest.TestCase):
             self.assertIn("small.gguf", seen[0][1])
             self.assertIn("2 KB", seen[0][1])
             self.assertEqual(seen[-1], (100, "Loaded"))
+
+
+class WarmEngineTests(unittest.TestCase):
+    def test_warm_engine_imports_the_engine(self):
+        if importlib.util.find_spec("llama_cpp") is None:
+            self.skipTest("llama_cpp is not installed here")
+        self.assertTrue(warm_engine())
+        self.assertIn("llama_cpp", sys.modules)
+        # Warming twice is harmless.
+        self.assertTrue(warm_engine())
+
+    def test_warm_engine_reports_a_missing_engine(self):
+        saved = sys.modules.pop("llama_cpp", None)
+        real_import = __import__
+
+        def failing_import(name, *args, **kwargs):
+            if name == "llama_cpp" or name.startswith("llama_cpp."):
+                raise ImportError("No module named 'llama_cpp'")
+            return real_import(name, *args, **kwargs)
+
+        try:
+            with mock.patch("builtins.__import__",
+                            side_effect=failing_import):
+                self.assertFalse(warm_engine())
+        finally:
+            if saved is not None:
+                sys.modules["llama_cpp"] = saved
+
+    def test_warm_engine_is_safe_from_a_thread(self):
+        # The startup warm-up runs on a daemon thread: warming
+        # from two threads at once must not raise or deadlock.
+        if importlib.util.find_spec("llama_cpp") is None:
+            self.skipTest("llama_cpp is not installed here")
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(
+            warm_engine())) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [True, True])
+
+
+class EngineStartMessageTests(unittest.TestCase):
+    """Task 2: the first load of a session says the engine is
+    starting while the import runs, instead of claiming the
+    model is loading."""
+
+    def _fake_llama_module(self):
+        class FakeLlama:
+            def __init__(self, model_path, n_threads, n_ctx,
+                         verbose, chat_handler=None):
+                pass
+
+        module = types.ModuleType("llama_cpp")
+        module.Llama = FakeLlama
+        return module
+
+    def test_first_load_names_the_engine_start(self):
+        saved = sys.modules.pop("llama_cpp", None)
+        module = self._fake_llama_module()
+        real_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "llama_cpp" or name.startswith("llama_cpp."):
+                return module
+            return real_import(name, *args, **kwargs)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "small.gguf"
+                path.write_bytes(b"x" * 2048)
+                seen = []
+                runner = LlamaRunner()
+                with mock.patch("builtins.__import__",
+                                side_effect=fake_import):
+                    runner.load(
+                        str(path),
+                        progress_cb=lambda pct, msg: seen.append(
+                            (pct, msg)))
+        finally:
+            if saved is not None:
+                sys.modules["llama_cpp"] = saved
+            else:
+                sys.modules.pop("llama_cpp", None)
+        self.assertTrue(runner.is_loaded)
+        self.assertEqual(seen[0],
+                         (-1, "Starting the model engine..."))
+        self.assertIn("Loading small.gguf (2 KB) into RAM...",
+                      [msg for _pct, msg in seen])
+
+    def test_warmed_load_skips_the_engine_start(self):
+        # When the engine is already imported (the startup
+        # warm-up ran), the load goes straight to loading.
+        module = self._fake_llama_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "small.gguf"
+            path.write_bytes(b"x" * 2048)
+            seen = []
+            runner = LlamaRunner()
+            with mock.patch.dict(sys.modules,
+                                 {"llama_cpp": module}):
+                runner.load(
+                    str(path),
+                    progress_cb=lambda pct, msg: seen.append(
+                        (pct, msg)))
+        self.assertNotIn("Starting the model engine...",
+                         [msg for _pct, msg in seen])
+        self.assertIn("Loading small.gguf (2 KB) into RAM...",
+                      [msg for _pct, msg in seen])
+
+
+class UnsupportedArchitectureTests(unittest.TestCase):
+    """Task 8: an architecture the engine does not know is not
+    a broken file. The LFM3 case is the real one: the engine
+    fails with a bare "Failed to load model from file", and the
+    architecture text only ever reaches C++ stderr."""
+
+    def _lfm3_file(self, tmp):
+        from helpers import write_gguf_file
+        path = Path(tmp) / "lfm3.gguf"
+        write_gguf_file(path, {"general.architecture": "lfm3"})
+        return path
+
+    def _raising_module(self, message):
+        class FailingLlama:
+            def __init__(self, model_path, n_threads, n_ctx,
+                         verbose, chat_handler=None):
+                raise ValueError(message)
+
+        module = types.ModuleType("llama_cpp")
+        module.Llama = FailingLlama
+        return module
+
+    def test_lfm3_failure_names_the_design_not_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._lfm3_file(tmp)
+            module = self._raising_module(
+                "Failed to load model from file: %s" % path)
+            runner = LlamaRunner()
+            with mock.patch.dict(sys.modules,
+                                 {"llama_cpp": module}):
+                with self.assertRaises(RunnerError) as ctx:
+                    runner.load(str(path), display_name="LFM3 1.7B")
+            text = str(ctx.exception)
+            self.assertIn("LFM3", text)
+            self.assertIn("does not support yet", text)
+            self.assertIn("file itself is fine", text)
+            self.assertNotIn("may be broken", text)
+            self.assertNotIn(str(path), text)
+            self.assertIn("LFM3 1.7B", text)
+            self.assertFalse(runner.is_loaded)
+
+    def test_unknown_architecture_text_is_matched_too(self):
+        # When the exception does carry the architecture text,
+        # it is matched even for an architecture outside the
+        # known-unsupported set.
+        with tempfile.TemporaryDirectory() as tmp:
+            from helpers import write_gguf_file
+            path = Path(tmp) / "newarch.gguf"
+            write_gguf_file(
+                path, {"general.architecture": "qwen9"})
+            module = self._raising_module(
+                "unknown model architecture: 'qwen9'")
+            runner = LlamaRunner()
+            with mock.patch.dict(sys.modules,
+                                 {"llama_cpp": module}):
+                with self.assertRaises(RunnerError) as ctx:
+                    runner.load(str(path))
+            text = str(ctx.exception)
+            self.assertIn("QWEN9", text)
+            self.assertIn("does not support yet", text)
+            self.assertNotIn("may be broken", text)
+
+    def test_generic_failure_still_says_may_be_broken(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from helpers import write_gguf_file
+            path = Path(tmp) / "plain.gguf"
+            write_gguf_file(
+                path, {"general.architecture": "llama"})
+            module = self._raising_module("out of memory")
+            runner = LlamaRunner()
+            with mock.patch.dict(sys.modules,
+                                 {"llama_cpp": module}):
+                with self.assertRaises(RunnerError) as ctx:
+                    runner.load(str(path))
+            self.assertIn("may be broken", str(ctx.exception))
+
+    def test_generic_failure_never_shows_the_blob_path(self):
+        # Task 11: the exception's path is the blob filename for
+        # an Ollama model, so it is replaced by the display name.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sha256-abcdef0123456789"
+            path.write_bytes(b"x" * 2048)
+            module = self._raising_module(
+                "Failed to load model from file: %s" % path)
+            runner = LlamaRunner()
+            with mock.patch.dict(sys.modules,
+                                 {"llama_cpp": module}):
+                with self.assertRaises(RunnerError) as ctx:
+                    runner.load(str(path), display_name="Tiny 1B")
+            text = str(ctx.exception)
+            self.assertNotIn("sha256-abcdef", text)
+            self.assertIn("Tiny 1B", text)
+
+
+class DisplayNameTests(unittest.TestCase):
+    """Task 11: progress and errors name the model, never the
+    blob filename."""
+
+    def test_fake_runner_progress_uses_the_display_name(self):
+        runner = FakeRunner()
+        seen = []
+        runner.load("/tmp/sha256-abcdef0123456789",
+                    progress_cb=lambda pct, msg: seen.append(msg),
+                    display_name="Tiny 1B")
+        self.assertTrue(seen)
+        self.assertTrue(all("Tiny 1B" in msg for msg in seen))
+        self.assertFalse(any("sha256" in msg for msg in seen))
+
+    def test_fake_runner_falls_back_to_the_file_name(self):
+        runner = FakeRunner()
+        seen = []
+        runner.load("/tmp/plain.gguf",
+                    progress_cb=lambda pct, msg: seen.append(msg))
+        self.assertTrue(all("plain.gguf" in msg for msg in seen))
+
+    def test_real_runner_progress_uses_the_display_name(self):
+        class FakeLlama:
+            def __init__(self, model_path, n_threads, n_ctx,
+                         verbose, chat_handler=None):
+                pass
+
+        module = types.ModuleType("llama_cpp")
+        module.Llama = FakeLlama
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sha256-abcdef0123456789"
+            path.write_bytes(b"x" * 2048)
+            seen = []
+            runner = LlamaRunner()
+            with mock.patch.dict(sys.modules,
+                                 {"llama_cpp": module}):
+                runner.load(
+                    str(path),
+                    progress_cb=lambda pct, msg: seen.append(msg),
+                    display_name="Tiny 1B")
+        self.assertTrue(any("Tiny 1B" in msg for msg in seen))
+        self.assertFalse(any("sha256" in msg for msg in seen))
+
+    def test_controller_passes_the_display_name_through(self):
+        from fyrn.core import ModelController
+
+        class RecordingRunner(FakeRunner):
+            def __init__(self):
+                super().__init__()
+                self.seen_name = None
+
+            def load(self, path, progress_cb=None,
+                     cancel_event=None, display_name=None):
+                self.seen_name = display_name
+                return super().load(path, progress_cb,
+                                    cancel_event, display_name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plain.gguf"
+            path.write_bytes(b"x" * 2048)
+            runner = RecordingRunner()
+            controller = ModelController(runner)
+            controller._free_ram_fn = lambda: 8 * GB
+            controller.load(path, display_name="Tiny 1B")
+            self.assertEqual(runner.seen_name, "Tiny 1B")
 
 
 class TrimHistoryTests(unittest.TestCase):

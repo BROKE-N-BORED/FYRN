@@ -480,6 +480,22 @@ def format_facts(facts):
     return " · ".join(parts)
 
 
+def format_chat_export(transcript, model_name=None, when=None):
+    """A chat transcript as the text of a saved file (task 13):
+    a short header naming the model and when it was saved, then
+    the transcript itself, in order, unchanged. The transcript
+    is the Chat tab's text ("You: ...", "<model>: ...", turns
+    divided), so what is saved is exactly what was on screen.
+    when is a "YYYY-MM-DD HH:MM" stamp (now, when not given)."""
+    if when is None:
+        import time
+        when = time.strftime("%Y-%m-%d %H:%M")
+    model = model_name or "no model"
+    header = ("Fyrn chat with %s\nSaved %s\n\n"
+              % (model, when))
+    return header + transcript.rstrip("\n") + "\n"
+
+
 def find_projector(model_path):
     """The vision projector (mmproj) file for a model, if one sits
     next to it in the same folder: a .gguf file starting with
@@ -881,7 +897,8 @@ class ModelController:
         if self.is_loaded:
             self.unload()
         result = self.runner.load(
-            path, progress_cb=progress_cb, cancel_event=cancel_event)
+            path, progress_cb=progress_cb, cancel_event=cancel_event,
+            display_name=display_name)
         self.current_path = path
         self.current_name = display_name or path.name
         self.load_warning = message if verdict == "warn" else ""

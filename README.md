@@ -62,17 +62,27 @@ stops — it never runs apt itself.
   progress and a cancel while it runs. Or drop `.gguf` files on
   the window: they import the same way, one after another.
 - **Settings** (File menu): the models folder — pick any folder you
-  like — a Reduce motion switch, and whether Ollama's already-
-  downloaded models are listed. Everything else (threads,
+  like — whether Ollama's already-downloaded models are listed,
+  a Reduce motion switch, Compact model list, High-contrast mode,
+  the pull-complete chime mute, and whether Fyrn checks for a
+  newer release when it starts. Everything else (threads,
   context size) is set by the program itself to fit this PC.
 - **Chat tab:** load a model, type a message (Enter sends, Shift+Enter
   starts a new line), press Send. The reply streams in, and the
   model remembers the conversation: each message carries the
-  earlier turns with it. Clear empties the transcript. Live numbers
+  earlier turns with it. Clear empties the transcript; Save chat
+  writes it to a file you pick. Live numbers
   show RAM used and free, speed in tokens per second, time to first
   token, and load time. A vision model (one with its projector
   file next to it) gains an Attach image button: pick a PNG or
   JPEG picture and ask about it.
+- **Updates:** Fyrn quietly checks GitHub for a newer release when
+  it starts, and says so only when one is out. Nothing downloads
+  until you tap to update; the download is checked against the
+  release's checksum before anything is installed, and you choose
+  whether to restart now or let it wait until the next restart.
+  Help menu, Check for updates, checks by hand; Settings turns
+  the startup check off.
 - **Tray icon:** when your desktop has a system tray, Fyrn shows
   the loaded model and free RAM there; click it to bring Fyrn
   forward.
@@ -96,7 +106,9 @@ stops — it never runs apt itself.
 - Logs live in `~/.fyrn/logs/`.
 - The model engine is llama.cpp (CPU only), through
   `llama-cpp-python`. No network is needed except when pulling a
-  model.
+  model or checking for an update (the update check is one small
+  request to GitHub's public releases page, and sends nothing
+  about you or this PC).
 - If motion on screen bothers you, turn on Reduce motion in
   Settings (File menu): the short fades and lifts are skipped
   and everything changes instantly instead.

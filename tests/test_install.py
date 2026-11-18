@@ -2,6 +2,7 @@
 zip builder. No venv is created here; the install simulation is a
 separate verification step (see the build report)."""
 
+import hashlib
 import os
 import re
 import shutil
@@ -270,16 +271,18 @@ class ZipBuilderTests(unittest.TestCase):
                 # exclusions: a new file forgotten from the
                 # builder's hand-maintained list fails here, not
                 # on the user's PC. Excluded: caches and build
-                # artifacts (__pycache__, *.pyc, *.zip), the venv
-                # and git, and CI-STATUS.md (the CI verdict file
-                # rides in the push, not in the zip).
+                # artifacts (__pycache__, *.pyc, *.zip, the
+                # checksum sidecar), the venv and git, and
+                # CI-STATUS.md (the CI verdict file rides in
+                # the push, not in the zip).
                 expected = set()
                 for dirpath, dirnames, filenames in os.walk(copy):
                     dirnames[:] = [
                         d for d in dirnames
                         if d not in ("__pycache__", ".venv", ".git")]
                     for name in filenames:
-                        if name.endswith((".pyc", ".zip")):
+                        if name.endswith((".pyc", ".zip",
+                                          ".sha256")):
                             continue
                         rel = os.path.relpath(
                             os.path.join(dirpath, name), copy)
@@ -288,6 +291,18 @@ class ZipBuilderTests(unittest.TestCase):
                         expected.add("fyrn/" + rel)
                 self.assertEqual(set(names), expected)
             self.assertIn("modes ok: True", result.stdout)
+            # The checksum sidecar (v0.6): the updater verifies a
+            # release zip against it, so it ships alongside the
+            # zip (never inside it), in sha256sum format, and
+            # names the zip's real hash.
+            sidecar_path = Path(str(zip_path) + ".sha256")
+            self.assertTrue(sidecar_path.is_file())
+            digest = hashlib.sha256()
+            with open(zip_path, "rb") as fh:
+                digest.update(fh.read())
+            self.assertEqual(
+                sidecar_path.read_text(encoding="utf-8"),
+                "%s  %s\n" % (digest.hexdigest(), zip_path.name))
 
 
 class DiskSpaceTests(unittest.TestCase):

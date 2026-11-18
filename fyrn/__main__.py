@@ -76,6 +76,29 @@ def main_entry():
     fast-path check without launching the GUI."""
     if _try_raise_running():
         return 0
+    # A staged update from the last run applies now, before Qt
+    # (or anything else) is imported, so the new version is what
+    # actually launches. A failed apply leaves the old version
+    # in place and is noted for the debug log, never fatal: the
+    # next launch's update check will offer the update again.
+    # updates.py is stdlib-only, so this import costs the fast
+    # path nothing (and the fast path already returned above).
+    try:
+        from .updates import apply_pending_update, pending_update
+        if pending_update(_home_dir()) is not None:
+            ok, message = apply_pending_update(_home_dir())
+            if not ok:
+                error_path = _home_dir() / "updates" / "last-error.txt"
+                try:
+                    error_path.parent.mkdir(parents=True,
+                                            exist_ok=True)
+                    error_path.write_text(
+                        "Staged update did not apply: %s\n" % message,
+                        encoding="utf-8")
+                except OSError:
+                    pass
+    except Exception:
+        pass
     # First instance: only now import Qt (the slow part).
     from .gui import main
     return main()

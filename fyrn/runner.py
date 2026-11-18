@@ -10,6 +10,7 @@ from the machine, never from a settings screen.
 """
 
 import os
+import sys
 import time
 
 # A reply never runs past this many tokens: a model that never
@@ -47,6 +48,35 @@ class LoadCancelled(Exception):
 
 class GenerationCancelled(Exception):
     """The user stopped a reply."""
+
+
+# Architectures the pinned engine (llama-cpp-python 0.3.36) is
+# KNOWN not to support, proven by a failed load, not guessed:
+# LFM3 raises "Failed to load model from file" because the
+# bundled llama.cpp predates the architecture (the C++ error
+# names it, but only on stderr, so the Python exception never
+# carries it). When a load of one of these fails, the user is
+# told the engine does not know the design yet, instead of being
+# told the file may be broken (task 8). The engine bump that
+# adds support (F1) is Joshua's call on timing; when it lands,
+# this set shrinks.
+UNSUPPORTED_ARCHITECTURES = frozenset({"lfm3"})
+
+
+def warm_engine():
+    """Import the model engine now, off the load path, so the
+    first load of a session starts loading at once instead of
+    paying the engine import (70-90 s inside the app) inside
+    the load worker (task 2). Safe to call from any thread:
+    Python's import lock serializes it with a load that imports
+    at the same moment, and a missing engine is not an error
+    here (load() reports it when a load is attempted). Returns
+    True when the engine imported."""
+    try:
+        from llama_cpp import Llama  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def compute_tokens_per_sec(tokens, elapsed_s):
@@ -100,7 +130,8 @@ class Runner:
             return ""
         return os.path.basename(str(self.model_path))
 
-    def load(self, path, progress_cb=None, cancel_event=None):
+    def load(self, path, progress_cb=None, cancel_event=None,
+             display_name=None):
         """Load a model file. Returns {"load_time_s": float}.
 
         progress_cb(pct, msg) reports real progress only: pct is
@@ -108,7 +139,10 @@ class Runner:
         when it cannot (the real backend loads in one long opaque
         step, so it reports -1 with honest stage text instead of a
         percent that measures nothing). The UI shows -1 as an
-        indeterminate bar.
+        indeterminate bar. display_name is the name the UI shows
+        for the model (an Ollama model's name, for example);
+        progress and errors use it, never the file name, so an
+        Ollama blob hash never reaches the user (task 11).
         """
         raise NotImplementedError
 
@@ -160,15 +194,17 @@ class FakeRunner(Runner):
         # The images the last generate() call received, same idea.
         self.last_images = None
 
-    def load(self, path, progress_cb=None, cancel_event=None):
+    def load(self, path, progress_cb=None, cancel_event=None,
+             display_name=None):
         started = time.monotonic()
+        name = display_name or os.path.basename(str(path))
         steps = 10
         for step in range(steps + 1):
             if cancel_event is not None and cancel_event.is_set():
                 raise LoadCancelled("Load cancelled.")
             if progress_cb is not None:
                 progress_cb(int(step * 100 / steps),
-                            "Loading %s" % os.path.basename(str(path)))
+                            "Loading %s" % name)
             if step < steps and self.load_delay_s > 0:
                 time.sleep(self.load_delay_s / steps)
         self.model_path = str(path)
@@ -266,7 +302,21 @@ class LlamaRunner(Runner):
         from .core import read_ram_bytes
         return read_ram_bytes()[1]
 
-    def load(self, path, progress_cb=None, cancel_event=None):
+    def load(self, path, progress_cb=None, cancel_event=None,
+             display_name=None):
+        # The name the user sees: an Ollama model's name, or the
+        # file name. Progress and errors use it, never the blob
+        # filename (task 11).
+        name = display_name or os.path.basename(str(path))
+        # The engine import is the slow part of a first load
+        # (task 2): say so honestly while it runs, instead of
+        # claiming the model is loading. When the startup warm-up
+        # already imported it, this step is instant and the
+        # message never shows. If the warm-up is still importing,
+        # this blocks on the import lock with the honest text
+        # showing, which is still correct.
+        if "llama_cpp" not in sys.modules and progress_cb is not None:
+            progress_cb(-1, "Starting the model engine...")
         try:
             from llama_cpp import Llama
         except ImportError:
@@ -289,18 +339,22 @@ class LlamaRunner(Runner):
             except OSError:
                 size_text = "unknown size"
             progress_cb(-1, "Loading %s (%s) into RAM..."
-                        % (os.path.basename(str(path)), size_text))
+                        % (name, size_text))
         if cancel_event is not None and cancel_event.is_set():
             raise LoadCancelled("Load cancelled.")
         threads = auto_threads()
         context = auto_context_tokens(self._free_ram())
+        # The architecture, read once: the vision check below and
+        # the unsupported-design error both need it (task 8).
+        from .core import (VISION_ARCHITECTURES, find_projector,
+                           read_gguf_metadata)
+        architecture = read_gguf_metadata(path).get(
+            "general.architecture")
         # Vision: a projector file next to the model means the
         # model can see. It loads through the engine's mtmd
         # handler (CPU only). A projector that cannot be used
         # never blocks the load: the model still loads, as text
         # only, and the warning says why it cannot see.
-        from .core import (VISION_ARCHITECTURES, find_projector,
-                           read_gguf_metadata)
         projector = find_projector(path)
         chat_handler = None
         vision_warning = ""
@@ -315,8 +369,7 @@ class LlamaRunner(Runner):
                 vision_warning = (
                     "Its projector file could not be used (%s), so "
                     "it loads as text only." % exc)
-        elif (read_gguf_metadata(path).get("general.architecture")
-                in VISION_ARCHITECTURES):
+        elif architecture in VISION_ARCHITECTURES:
             vision_warning = (
                 "This is a vision model, but its projector file "
                 "is not next to it, so it loads as text only. "
@@ -332,9 +385,28 @@ class LlamaRunner(Runner):
             )
         except Exception as exc:
             self._llm = None
+            text = str(exc)
+            # An architecture the engine does not know is not a
+            # broken file: say so plainly (task 8). The C++ error
+            # names the architecture, but only on stderr, so the
+            # Python exception never carries it: match the text
+            # when it is there, and fall back on the header's
+            # architecture against the known-unsupported set.
+            if ("unknown model architecture" in text.lower()
+                    or (architecture is not None
+                        and architecture.lower()
+                        in UNSUPPORTED_ARCHITECTURES)):
+                arch = (architecture or "unknown").upper()
+                raise RunnerError(
+                    "%s uses the %s design, which Fyrn's engine "
+                    "does not support yet. The file itself is "
+                    "fine." % (name, arch))
+            # Never show the file's path in the message: an
+            # Ollama model is a blob hash, not a name (task 11).
+            safe = text.replace(str(path), name)
             raise RunnerError(
                 "The model could not be loaded (%s). The file may "
-                "be broken or not a GGUF model." % exc)
+                "be broken or not a GGUF model." % safe)
         if cancel_event is not None and cancel_event.is_set():
             self._llm = None
             raise LoadCancelled("Load cancelled.")

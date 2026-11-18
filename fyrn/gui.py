@@ -10,6 +10,7 @@ label, button, or menu text. The suite sweeps for both.
 
 import hashlib
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -26,24 +27,26 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
                                QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMainWindow,
                                QMenu, QMessageBox, QProgressBar,
-                               QPushButton, QScrollArea, QSizePolicy,
-                               QSpacerItem, QSystemTrayIcon, QTabWidget,
-                               QTextEdit, QToolTip, QVBoxLayout, QWidget)
+                               QProgressDialog, QPushButton, QScrollArea,
+                               QSizePolicy, QSpacerItem, QSystemTrayIcon,
+                               QTabWidget, QTextEdit, QToolTip,
+                               QVBoxLayout, QWidget)
 
 from . import __version__
 from . import core
 from .core import (HEADROOM_BYTES, ImportCancelled, ModelController,
                    ModelNotFoundError, ModelTooBigError, ensure_home,
-                   ensure_models_folder, fit_status, format_facts,
-                   format_size, list_part_files, model_headroom_bytes,
-                   move_to_trash, projector_size_bytes, read_ram_bytes,
-                   scan_models)
+                   ensure_models_folder, fit_status, format_chat_export,
+                   format_facts, format_size, list_part_files,
+                   model_headroom_bytes, move_to_trash,
+                   projector_size_bytes, read_ram_bytes, scan_models)
 from .discover import discover_ollama_models
 # The pull module is imported lazily, inside the methods that use
 # it: it costs ~0.4 s of cold start, and nothing needs it until a
 # pull actually runs.
 from .runner import (GenerationCancelled, LoadCancelled, LlamaRunner,
-                     RunnerError, auto_context_tokens, trim_history)
+                     RunnerError, auto_context_tokens, trim_history,
+                     warm_engine)
 from .theme import (DARK, HIGH_CONTRAST, THEMES, build_stylesheet,
                     fit_badges, rgba_string)
 
@@ -149,6 +152,21 @@ def set_chime_muted(value):
     settings.sync()
 
 
+def get_update_check():
+    """Whether Fyrn checks for a newer release when it starts
+    (Settings window). On by default: the standing order is that
+    the app checks on launch, silently, and asks before it
+    downloads anything."""
+    settings = get_settings()
+    return bool(settings.value("update_check", True, type=bool))
+
+
+def set_update_check(value):
+    settings = get_settings()
+    settings.setValue("update_check", bool(value))
+    settings.sync()
+
+
 def current_tokens():
     """The active theme's tokens: high-contrast when that
     setting is on, the dark theme otherwise."""
@@ -238,17 +256,27 @@ HOW_TO_USE_SECTIONS = {
         "When the pull finishes, the model appears in the Models tab."
     ),
     "Settings": (
-        "Settings lives in the File menu. It has three settings: "
+        "Settings lives in the File menu. It has seven settings: "
         "the models folder, where pulled and imported models are "
-        "kept, Reduce motion, and whether Ollama's already-"
-        "downloaded models are listed.\n\n"
+        "kept; whether Ollama's already-downloaded models are "
+        "listed; Reduce motion; Compact model list; High-contrast "
+        "mode; the pull-complete chime mute; and whether Fyrn "
+        "checks for a newer release when it starts.\n\n"
         "Press Browse to pick a different models folder, then Save. "
         "The Models tab switches to the new folder right away.\n\n"
         "Check Reduce motion if movement on screen bothers you: "
         "the short fades and lifts become instant instead.\n\n"
+        "Compact model list makes the cards smaller, so more "
+        "models fit on screen at once. High-contrast mode is "
+        "black and white with yellow highlights. Mute the "
+        "pull-complete chime turns off the short sound that plays "
+        "when a pull finishes.\n\n"
+        "Check for updates when Fyrn starts is on by default: "
+        "Fyrn quietly asks GitHub whether a newer release is out "
+        "when it starts, and says so only when one is. Turn it "
+        "off to check by hand instead, from the Help menu.\n\n"
         "Everything else about how models run (threads, context "
-        "size) is set by the program itself to fit this PC. There "
-        "is nothing else to set."
+        "size) is set by the program itself to fit this PC."
     ),
     "Chatting": (
         "Load a model first, then open the Chat tab.\n\n"
@@ -327,18 +355,22 @@ def save_window_geometry(settings, prefix, widget):
 def restore_window_geometry(settings, prefix, widget):
     """Restore a window's geometry saved by save_window_geometry.
     Does nothing when nothing is saved, or when the saved rect is
-    off every screen (a monitor setup that changed since)."""
+    off every screen (a monitor setup that changed since).
+    Returns True when a geometry was restored: a caller that
+    sizes from content needs to know whether the user's own size
+    is already in place."""
     values = [settings.value("%s/%s" % (prefix, key), type=int)
               for key in ("x", "y", "width", "height")]
     if any(value is None for value in values):
-        return
+        return False
     rect = QRect(*values)
     screens = QGuiApplication.screens()
     if screens and not any(
             screen.availableGeometry().intersects(rect)
             for screen in screens):
-        return
+        return False
     widget.setGeometry(rect)
+    return True
 
 
 # ---------------------------------------------------------------- workers
@@ -499,6 +531,109 @@ class ImportWorker(QThread):
             self.failed.emit("The import failed (%s)." % exc)
         else:
             self.finished.emit(str(dest))
+
+    def cancel(self):
+        self.cancel_event.set()
+
+
+class UpdateCheckWorker(QThread):
+    """Check GitHub for a newer Fyrn release off the UI thread
+    (v0.6): the check never blocks startup, and a failed check is
+    silent, never a crash or a popup."""
+
+    finished = Signal(dict)  # the check_for_update result
+
+    def __init__(self, current_version):
+        super().__init__()
+        self.current_version = current_version
+
+    def run(self):
+        # The updates module is imported here, not at module
+        # level: it costs nothing to import, but keeping the
+        # worker self-contained matches the other workers.
+        from .updates import check_for_update
+        self.finished.emit(check_for_update(self.current_version))
+
+
+class UpdateDownloadWorker(QThread):
+    """Download a release zip and its checksum sidecar off the UI
+    thread, verify the SHA-256, and stage the update (v0.6).
+
+    The zip downloads next to the staging dir, not in it: the
+    staging step clears the dir first, so a zip already inside
+    it would be wiped. A failed verification, a missing sidecar,
+    or a cancel all leave the old version exactly as it was.
+    """
+
+    progress = Signal(int, int)  # downloaded, total (-1 unknown)
+    finished = Signal(dict)      # {"version": ...} on success
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, release, home):
+        super().__init__()
+        self.release = release
+        self.home = Path(home)
+        self.cancel_event = threading.Event()
+
+    def run(self):
+        from .pull import (DownloadError, PullCancelled,
+                           download_file)
+        from .updates import (UpdateError, fetch_sidecar,
+                              parse_sidecar, stage_update)
+        try:
+            sha256_url = self.release.get("sha256_url")
+            if not sha256_url:
+                self.failed.emit(
+                    "This release has no checksum to check "
+                    "against, so Fyrn will not install it.")
+                return
+            sidecar_text = fetch_sidecar(sha256_url)
+            expected = parse_sidecar(
+                sidecar_text, self.release.get("zip_name"))
+            if expected is None:
+                self.failed.emit(
+                    "The update's checksum could not be read, so "
+                    "the update was not installed.")
+                return
+            updates_dir = self.home / "updates"
+            updates_dir.mkdir(parents=True, exist_ok=True)
+            dest = updates_dir / "download.zip"
+            # A stale download from an interrupted attempt never
+            # resumes into this one: the checksum would catch a
+            # bad resume, but a fresh start is cleaner.
+            for suffix in ("", ".part", ".part.url", ".part.etag"):
+                stale = Path(str(dest) + suffix)
+                if stale.exists():
+                    stale.unlink()
+            download_file(
+                self.release["zip_url"], dest,
+                progress_cb=lambda d, t, s: self.progress.emit(
+                    d, -1 if t is None else t),
+                cancel_event=self.cancel_event,
+                expected_sha256=expected)
+            stage_update(self.home, dest, sidecar_text,
+                         self.release["version"], expected)
+        except PullCancelled:
+            self.cancelled.emit()
+        except DownloadError as exc:
+            # download_file's messages are written for model
+            # pulls ("not saved as a model. Try pulling it
+            # again"): a checksum failure during an update says
+            # so in update words instead.
+            if "checksum differs" in str(exc):
+                self.failed.emit(
+                    "The update's download did not match its "
+                    "checksum, so it was not installed. The old "
+                    "version keeps running.")
+            else:
+                self.failed.emit(str(exc))
+        except UpdateError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit("The update failed (%s)." % exc)
+        else:
+            self.finished.emit({"version": self.release["version"]})
 
     def cancel(self):
         self.cancel_event.set()
@@ -858,7 +993,8 @@ class PullWindow(QDialog):
         self.cancel_button.setEnabled(False)
         self.close_button = QPushButton("Close")
         self.close_button.setToolTip(
-            "Close this window (a download keeps running)")
+            "Close this window (a running download stops, keeping "
+            "its part file)")
         self.close_button.clicked.connect(self.close)
         buttons.addWidget(self.pull_button)
         buttons.addWidget(self.queue_add_button)
@@ -953,6 +1089,32 @@ class PullWindow(QDialog):
         """Fill the field with the suggested first model."""
         self.input.setText(FIRST_PULL_SUGGESTION)
         self.input.setFocus()
+
+    def _fit_to_content(self):
+        """Grow the window to its content (task 4): when the
+        queue or unfinished list appears, the window grows so
+        every control stays readable, instead of crushing to
+        slivers at its first size. Bounded by the screen, so a
+        long queue never pushes the window off-screen; the lists
+        cap at 120 px each, so the window stays a sane size.
+        Grow-only: the window never shrinks under the user when
+        a list empties. Before the window is shown there is
+        nothing to fit, so construction-time calls are no-ops
+        and never fight the restored geometry."""
+        if not self.isVisible():
+            return
+        hint = self.sizeHint()
+        screen = self.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(max(hint.width(), self.minimumWidth()),
+                        available.width())
+            height = min(max(hint.height(), self.minimumHeight()),
+                         available.height())
+        else:
+            width, height = hint.width(), hint.height()
+        self.resize(max(self.width(), width),
+                    max(self.height(), height))
 
     def apply_theme(self, tokens):
         """Re-skin the pull window's busy dot for a theme change
@@ -1153,6 +1315,7 @@ class PullWindow(QDialog):
                               item["target"].filename)
             self.queue_list.addItem(list_item)
         self._update_queue_buttons()
+        self._fit_to_content()
 
     def _update_queue_item(self, item):
         """Refresh one queue item's line in place (its progress
@@ -1219,6 +1382,7 @@ class PullWindow(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, str(part["path"]))
             self.parts_list.addItem(item)
         self._update_part_buttons()
+        self._fit_to_content()
 
     def _update_part_buttons(self):
         selected = bool(self.parts_list.selectedItems())
@@ -1495,10 +1659,13 @@ class PullWindow(QDialog):
 class SettingsWindow(QDialog):
     """Settings: its own resizable pop-up window (U1).
 
-    The models folder, Reduce motion, and the display and sound
-    settings: compact list, high-contrast mode, and the
-    pull-complete chime mute. The window is resizable and
-    maximizable; nothing pins its size.
+    The models folder, Reduce motion, the Ollama listing, and
+    the display, sound, and update settings: compact list,
+    high-contrast mode, the pull-complete chime mute, and the
+    startup update check. The window is resizable and
+    maximizable; it opens at its content size, unless a saved
+    size of the user's own exists (that one is honoured
+    exactly).
     """
 
     folder_changed = Signal(str)
@@ -1507,9 +1674,11 @@ class SettingsWindow(QDialog):
     def __init__(self, current_folder, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumSize(480, 180)
-        self.resize(560, 220)
-        restore_window_geometry(
+        # The folder this window opened with: _save only
+        # announces a folder change when the folder actually
+        # changed (task 10).
+        self._initial_folder = str(current_folder)
+        restored = restore_window_geometry(
             get_settings(), "settings_window", self)
 
         layout = QVBoxLayout(self)
@@ -1587,6 +1756,18 @@ class SettingsWindow(QDialog):
         chime_help.setWordWrap(True)
         layout.addWidget(chime_help)
 
+        self.update_check = QCheckBox(
+            "Check for updates when Fyrn starts")
+        self.update_check.setChecked(get_update_check())
+        layout.addWidget(self.update_check)
+
+        update_help = QLabel(
+            "Fyrn quietly asks GitHub whether a newer release is "
+            "out when it starts, and says so only when one is. "
+            "Nothing downloads without asking first.")
+        update_help.setWordWrap(True)
+        layout.addWidget(update_help)
+
         layout.addStretch(1)
 
         buttons = QHBoxLayout()
@@ -1602,6 +1783,34 @@ class SettingsWindow(QDialog):
         buttons.addWidget(self.save_button)
         buttons.addWidget(cancel_button)
         layout.addLayout(buttons)
+
+        # Size the dialog from its content (task 1): the old
+        # hardcoded 560x220 crushed it (labels clipped, Save and
+        # Cancel 9 px slivers). A saved geometry is honoured
+        # exactly instead: it is the user's own size, and the
+        # dialog stays freely resizable either way (no minimum
+        # pins it to its content). The height is capped to the
+        # screen, so a large system text size never makes a
+        # window taller than the display.
+        #
+        # The height comes from totalHeightForWidth at the real
+        # width, not from sizeHint: the help labels wrap, and
+        # sizeHint measures them at the layout's narrow width
+        # (301 px), which overestimates the height by ~140 px at
+        # the dialog's real width and leaves a dead band above
+        # the buttons (the L10 gap the hugs test guards).
+        self.setMinimumSize(480, 180)
+        if not restored:
+            width = max(self.width(), self.sizeHint().width())
+            height = layout.totalHeightForWidth(width)
+            if height <= 0:
+                height = self.sizeHint().height()
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                max_height = (screen.availableGeometry().height()
+                              - 40)
+                height = min(height, max_height)
+            self.resize(width, height)
 
     def hideEvent(self, event):  # noqa: N802 - Qt naming
         # Save on hide: Save and Cancel hide the dialog without a
@@ -1636,7 +1845,11 @@ class SettingsWindow(QDialog):
         set_compact_list(self.compact_check.isChecked())
         set_high_contrast(self.contrast_check.isChecked())
         set_chime_muted(self.chime_check.isChecked())
-        self.folder_changed.emit(str(folder))
+        set_update_check(self.update_check.isChecked())
+        # Only a real folder change is announced (task 10): a
+        # settings-only save used to claim the folder had moved.
+        if str(folder) != self._initial_folder:
+            self.folder_changed.emit(str(folder))
         self.settings_saved.emit()
         self.accept()
 
@@ -2111,11 +2324,28 @@ class ModelCard(QFrame):
     def focusInEvent(self, event):  # noqa: N802 - Qt naming
         self._apply_frame()
         # Keyboard focus shows the same detail hover does, so a
-        # keyboard user gets the preview without a mouse.
+        # keyboard user gets the preview without a mouse. The
+        # tooltip is shown on a short delay, not in the focus
+        # event itself: showText called during focusInEvent never
+        # renders (Qt hides it again as the focus change
+        # settles), while the same call 100 ms later shows.
+        # The timer checks the card still has focus when it
+        # fires, and never touches a deleted card.
+        QTimer.singleShot(
+            100,
+            lambda: (self._show_focus_tooltip()
+                     if isValid(self) else None))
+        super().focusInEvent(event)
+
+    def _show_focus_tooltip(self):
+        """Show the hover detail for a focused card (task 7):
+        path, size, RAM need, and fit reason, the same text the
+        mouse hover shows."""
+        if not self.hasFocus():
+            return
         QToolTip.showText(
             self.mapToGlobal(QPoint(0, self.height())),
             self.toolTip(), self)
-        super().focusInEvent(event)
 
     def focusOutEvent(self, event):  # noqa: N802 - Qt naming
         QToolTip.hideText()
@@ -2176,22 +2406,85 @@ class ModelCard(QFrame):
         anim.setStartValue(rest)
         anim.setEndValue(lifted)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # The rest captured here can be stale: the layout
+        # activates while the card is still settling (the grid
+        # grows as the scroll area makes room), so the geometry
+        # at lift time is not always the card's true cell. When
+        # the lift finishes, the card is re-synced to its true
+        # cell (see _on_lift_finished), instead of sitting at the
+        # stale spot forever.
+        anim.finished.connect(
+            lambda a=anim, r=rest: self._on_lift_finished(a, r))
         self._lift_anim = anim
         anim.start()
+
+    def _on_lift_finished(self, anim, rest):
+        """The lift landed: put the card above its TRUE cell, not
+        the rest captured when the lift started (task 3). The
+        layout may have moved the card while it was lifting (a
+        scrollbar appearing, a resize): the animation just
+        parked the card at stale-rest-minus-4px, and nothing
+        re-runs the layout afterwards, so without this the card
+        sits in the wrong cell until the next refresh. Re-derive
+        the cell from the layout and sit lifted above it."""
+        if self._lift_anim is not anim:
+            return  # a newer lift/drop owns the geometry now
+        parent = self.parentWidget()
+        layout = parent.layout() if parent is not None else None
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
+            cell = QRect(self.geometry())
+        else:
+            cell = QRect(rest)
+        self._lift_rest = cell
+        lifted = QRect(cell)
+        lifted.translate(0, -4)
+        self.setGeometry(lifted)
 
     def _end_lift(self):
         if self._lift_rest is None:
             return
-        rest = self._lift_rest
+        # The drop target is re-derived from the layout (task 3):
+        # the stored rest can be stale (the layout moved the card
+        # while it was lifted), and dropping to a stale rest
+        # parks the card in the wrong cell. The layout is asked
+        # for the true cell, then the card is put back at its
+        # lifted spot so the animation still drops it visibly.
+        start = QRect(self.geometry())
+        parent = self.parentWidget()
+        layout = parent.layout() if parent is not None else None
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
+            rest = QRect(self.geometry())
+            self.setGeometry(start)
+        else:
+            rest = self._lift_rest
+        self._lift_rest = rest
         anim = QPropertyAnimation(self, b"geometry", self)
         anim.setDuration(200)
-        anim.setStartValue(self.geometry())
+        anim.setStartValue(start)
         anim.setEndValue(rest)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         anim.finished.connect(
             lambda a=anim, r=rest: self._on_drop_finished(a, r))
         self._lift_anim = anim
         anim.start()
+
+    def cancel_lift(self):
+        """Stop any lift or drop in flight and forget the rest
+        (task 3): a relayout owns the card's geometry, and an
+        animation writing stale values during it would fight the
+        layout and park the card in the wrong cell. The layout's
+        own activation puts the card in its cell; if the cursor
+        is still over it, the next mouse move lifts it again."""
+        anim = self._lift_anim
+        self._lift_anim = None
+        self._lift_rest = None
+        self._hover_timer.stop()
+        if anim is not None:
+            anim.stop()
 
     def _on_drop_finished(self, anim, rest):
         # Only the current animation may clear the rest: a stale
@@ -2349,6 +2642,11 @@ class MainWindow(QMainWindow):
         self.load_worker = None
         self.chat_worker = None
         self.import_worker = None
+        self._update_check_worker = None
+        self._update_check_manual = False
+        self._update_download_worker = None
+        self._update_progress = None
+        self._update_release = None
         self.pull_window = None
         self.settings_window = None
         self.howto_window = None
@@ -2485,6 +2783,9 @@ class MainWindow(QMainWindow):
         settings_action = file_menu.addAction("Settings")
         settings_action.setShortcut(QKeySequence("Ctrl+,"))
         settings_action.triggered.connect(self.show_settings)
+        save_chat_action = file_menu.addAction("Save chat")
+        save_chat_action.setShortcut(QKeySequence("Ctrl+S"))
+        save_chat_action.triggered.connect(self._save_chat)
         report_action = file_menu.addAction("Debug report")
         report_action.triggered.connect(self.make_debug_report)
         file_menu.addSeparator()
@@ -2511,6 +2812,15 @@ class MainWindow(QMainWindow):
         unload_action = models_menu.addAction("Unload model")
         unload_action.setShortcut(QKeySequence("Ctrl+U"))
         unload_action.triggered.connect(self.unload_model)
+        # The Models actions are stored (they used to be locals)
+        # so _update_buttons can enable and disable them with
+        # the state, the way the buttons already are (task 6).
+        self._load_action = load_action
+        self._pull_action = pull_action
+        self._import_action = import_action
+        self._remove_action = remove_action
+        self._refresh_action = refresh_action
+        self._unload_action = unload_action
 
         help_menu = self.menuBar().addMenu("Help")
         palette_action = help_menu.addAction("Command palette")
@@ -2519,6 +2829,9 @@ class MainWindow(QMainWindow):
         howto_action = help_menu.addAction("How to Use")
         howto_action.setShortcut(QKeySequence("F1"))
         howto_action.triggered.connect(self.show_how_to_use)
+        update_action = help_menu.addAction("Check for updates")
+        update_action.triggered.connect(
+            lambda: self.check_for_updates(manual=True))
         about_action = help_menu.addAction("About")
         about_action.triggered.connect(self.show_about)
 
@@ -2552,6 +2865,9 @@ class MainWindow(QMainWindow):
             ("How to Use", "F1", self.show_how_to_use),
             ("Debug report", "", self.make_debug_report),
             ("Clear chat", "", self._clear_chat),
+            ("Save chat", "Ctrl+S", self._save_chat),
+            ("Check for updates", "",
+             lambda: self.check_for_updates(manual=True)),
             ("Go to Models tab", "",
              lambda: self.tabs.setCurrentIndex(0)),
             ("Go to Chat tab", "",
@@ -2601,8 +2917,14 @@ class MainWindow(QMainWindow):
         layout.addLayout(search_row)
 
         # Bento grid: models as tiles, size as hierarchy, fit front
-        # and center. The loaded model gets the hero tile.
+        # and center. The loaded model gets the hero tile. The
+        # scroll area itself is out of the tab order (task 15):
+        # Tab used to land on the bare container with no visible
+        # focus between the filter and the buttons. Keyboard
+        # scrolling still works: the grid scrolls to show the
+        # focused card on its own.
         self._cards_scroll = QScrollArea()
+        self._cards_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._cards_scroll.setWidgetResizable(True)
         self._cards_widget = QWidget()
         self._cards_layout = QGridLayout(self._cards_widget)
@@ -2701,13 +3023,16 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
 
         folder_label = QLabel(
-            "Models live in the folder set in File menu, Settings.")
+            "Models live in the folder set in the File menu, "
+            "under Settings.")
         folder_label.setWordWrap(True)
         layout.addWidget(folder_label)
 
-        hint_label = QLabel("Double-click a model to load it.")
-        hint_label.setWordWrap(True)
-        layout.addWidget(hint_label)
+        # The double-click hint hides with the empty state (task
+        # 16): with no models there is nothing to double-click.
+        self._hint_label = QLabel("Double-click a model to load it.")
+        self._hint_label.setWordWrap(True)
+        layout.addWidget(self._hint_label)
 
         self.tabs.addTab(tab, "Models")
 
@@ -2776,6 +3101,11 @@ class MainWindow(QMainWindow):
         a filter that matches nothing keeps the "no models match"
         line in place of the empty grid."""
         self._empty_state.setVisible(show)
+        # The double-click hint goes with the grid (task 16):
+        # with no models there is nothing to double-click, and
+        # the hint sitting under the empty state reads as a
+        # leftover.
+        self._hint_label.setVisible(not show)
         if show:
             self._cards_scroll.setVisible(False)
             self._filter_empty_label.setVisible(False)
@@ -2853,11 +3183,16 @@ class MainWindow(QMainWindow):
         self.clear_button.setToolTip(
             "Clear the chat and forget the conversation so far")
         self.clear_button.clicked.connect(self._clear_chat)
+        self.save_chat_button = QPushButton("Save chat")
+        self.save_chat_button.setToolTip(
+            "Save this chat to a file (Ctrl+S)")
+        self.save_chat_button.clicked.connect(self._save_chat)
         row.addWidget(self.chat_input)
         row.addWidget(self.attach_button)
         row.addWidget(self.send_button)
         row.addWidget(self.stop_button)
         row.addWidget(self.clear_button)
+        row.addWidget(self.save_chat_button)
         layout.addLayout(row)
 
         self.tabs.addTab(tab, "Chat")
@@ -3164,6 +3499,24 @@ class MainWindow(QMainWindow):
         scroll_bar = self._cards_scroll.verticalScrollBar()
         saved_scroll = scroll_bar.value()
         columns = grid_columns()
+        # A lift or drop in flight writes the card's geometry
+        # itself: stop every one before the layout moves the
+        # cards, or the animation parks its card at a stale spot
+        # and the layout never corrects it (task 3).
+        for card in self.model_cards.values():
+            card.cancel_lift()
+        # Equal column stretches (task 17): one card used to span
+        # the full row like the hero tile, and two cards took half
+        # each. Every column now takes an equal share whether it
+        # holds a card or not, so a short row keeps the one-third
+        # card width and the hero tile's full width stays
+        # meaningful. Columns past the current count (a density
+        # change from four back to three) get no stretch, or the
+        # empty column would claim a share of the row.
+        for col_index in range(max(GRID_COLUMNS,
+                                   GRID_COLUMNS_COMPACT)):
+            self._cards_layout.setColumnStretch(
+                col_index, 1 if col_index < columns else 0)
         # FLIP: remember where each visible card sits now, so the
         # ones that move can be flown to their new spot below.
         old_positions = {}
@@ -3438,6 +3791,26 @@ class MainWindow(QMainWindow):
             has_selection and selected_visible and not loading
             and not importing and not replying
             and not selected_is_ollama)
+        # The Models menu actions follow the same state (task 6),
+        # with one deliberate difference from the buttons: Load
+        # and Remove stay enabled for a hidden or Ollama selection.
+        # A disabled menu action kills its shortcut, and the
+        # shortcut is how the user is told why nothing happened
+        # ("That model is hidden by the search", "belongs to
+        # Ollama"). The guards in load_selected_model and
+        # remove_selected_model say it in plain words instead.
+        self._load_action.setEnabled(
+            has_selection and not loading and not importing
+            and not replying and not selected_is_loaded)
+        self._remove_action.setEnabled(
+            has_selection and not loading and not importing
+            and not replying)
+        self._unload_action.setEnabled(
+            loaded and not loading and not replying)
+        self._import_action.setEnabled(
+            not loading and not importing)
+        self._pull_action.setEnabled(True)
+        self._refresh_action.setEnabled(True)
         self.unload_button.setEnabled(
             loaded and not loading and not replying)
         self.import_button.setEnabled(not loading and not importing)
@@ -3466,6 +3839,15 @@ class MainWindow(QMainWindow):
             self._show_status(
                 "Pick a model from the list first.")
             return
+        if str(path) not in self._visible_paths:
+            # The card is hidden by the search or filter: the user
+            # cannot see what they would be loading (task 5). The
+            # button already greys out for this; the shortcut used
+            # to bypass it.
+            self._show_status(
+                "That model is hidden by the search. Clear the "
+                "search to load it.")
+            return
         try:
             verdict, message = self.controller.check_before_load(path)
         except ModelNotFoundError as exc:
@@ -3487,9 +3869,12 @@ class MainWindow(QMainWindow):
         self.log.action("load started: %s" % path.name)
         self.load_progress.setValue(0)
         self._set_busy(True)
-        self._show_status_persistent("Loading %s..." % path.name)
         card = self.model_cards.get(str(path))
         display_name = card.model_name if card is not None else None
+        # The status names the model, never the blob filename
+        # (task 11): an Ollama model's file name is a hash.
+        self._show_status_persistent(
+            "Loading %s..." % (display_name or path.name))
         self.load_worker = LoadWorker(self.controller, path,
                                       display_name=display_name)
         self.load_worker.progress.connect(self._on_load_progress)
@@ -3587,7 +3972,9 @@ class MainWindow(QMainWindow):
         if (self.load_worker is not None
                 or self.chat_worker is not None
                 or self.import_worker is not None
-                or self._scan_worker is not None):
+                or self._scan_worker is not None
+                or self._update_check_worker is not None
+                or self._update_download_worker is not None):
             return
         self._close_pending = False
         self.close()
@@ -3976,6 +4363,34 @@ class MainWindow(QMainWindow):
         self._chat_history = []
         self._refresh_stats()
 
+    def _save_chat(self):
+        """Save the chat to a file the user picks (task 13): the
+        minimum scope for keeping a conversation. No history
+        across sessions: the file is the record, and Clear still
+        wipes the transcript with no confirm."""
+        text = self.transcript.toPlainText().strip()
+        if not text:
+            self._show_status("There is no chat to save yet.")
+            return
+        default = str(Path.home() / "fyrn-chat.txt")
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "Save chat", default, "Text files (*.txt)")
+        if not path:
+            return
+        name = self.controller.current_name
+        content = format_chat_export(
+            self.transcript.toPlainText(), model_name=name)
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Save chat",
+                "The chat could not be saved (%s)." % exc)
+            return
+        self.log.action("chat saved: %s" % Path(path).name)
+        self._show_status("Chat saved to %s." % path)
+
     def _refresh_stats(self):
         total, free = read_ram_bytes()
         parts = []
@@ -4113,14 +4528,181 @@ class MainWindow(QMainWindow):
         self.log.set_setting("models_folder", str(self.models_folder))
         self.log.action("models folder changed: %s" % folder)
         self._refresh_model_list()
+        # The folder message goes out now; the settings-saved
+        # message that follows in the same save must not clobber
+        # it (task 10).
+        self._folder_message_shown = True
         self._show_status(
             "Models folder is now %s." % folder)
 
     def _on_settings_saved(self):
         """Settings were saved: apply the theme and the density
-        live, so the window changes without a restart."""
+        live, so the window changes without a restart. A
+        settings-only save says so plainly; when the folder
+        changed in the same save, the folder message stands and
+        this one stays quiet (task 10)."""
         self._apply_theme()
         self._apply_density()
+        if getattr(self, "_folder_message_shown", False):
+            self._folder_message_shown = False
+        else:
+            self._show_status("Settings saved.")
+
+    # ------------------------------------------------------------ updates
+
+    def check_for_updates(self, manual=False):
+        """Check GitHub for a newer Fyrn release (v0.6). The
+        startup check (manual=False) is silent: up to date, or
+        any failure, means nothing happens at all. A manual
+        check (Help menu, command palette) always reports. A
+        newer release pops up and asks either way; nothing
+        downloads until the user taps to update."""
+        if self._update_check_worker is not None:
+            if manual:
+                self._show_status("Already checking for updates.")
+            return
+        self._update_check_manual = manual
+        self._update_check_worker = UpdateCheckWorker(__version__)
+        self._update_check_worker.finished.connect(
+            self._on_update_check_result)
+        self._update_check_worker.start()
+
+    def _on_update_check_result(self, result):
+        worker = self._update_check_worker
+        self._update_check_worker = None
+        if worker is not None:
+            worker.wait()
+        manual = self._update_check_manual
+        state = result.get("state")
+        if state == "newer":
+            answer = QMessageBox.question(
+                self, "Update available",
+                "Fyrn %s is out. You have %s.\n\n"
+                "Download and install it now?"
+                % (result["latest"], __version__),
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer == QMessageBox.StandardButton.Yes:
+                self._start_update_download(result)
+            return
+        if not manual:
+            return  # silent when up to date or unknown
+        if state == "current":
+            QMessageBox.information(
+                self, "Check for updates",
+                "Fyrn is up to date (%s)." % __version__)
+        else:
+            QMessageBox.information(
+                self, "Check for updates",
+                "Could not check for updates: %s"
+                % result.get("reason", "unknown reason"))
+
+    def _start_update_download(self, release):
+        if self._update_download_worker is not None:
+            return
+        # The check result names the release "latest"; the worker
+        # stages it under "version". Normalize here, the one place
+        # a check result becomes a download.
+        release = dict(release)
+        release.setdefault("version", release.get("latest"))
+        self._update_release = release
+        self._update_progress = QProgressDialog(
+            "Downloading Fyrn %s..." % release["latest"],
+            "Cancel", 0, 100, self)
+        self._update_progress.setWindowTitle("Updating Fyrn")
+        self._update_progress.setMinimumDuration(0)
+        self._update_progress.canceled.connect(
+            self._cancel_update_download)
+        worker = UpdateDownloadWorker(release, self._home)
+        self._update_download_worker = worker
+        worker.progress.connect(self._on_update_download_progress)
+        worker.finished.connect(self._on_update_downloaded)
+        worker.failed.connect(self._on_update_download_failed)
+        worker.cancelled.connect(self._on_update_download_cancelled)
+        worker.start()
+        self._update_progress.show()
+
+    def _on_update_download_progress(self, downloaded, total):
+        dialog = self._update_progress
+        if dialog is None:
+            return
+        if total is None or total <= 0:
+            dialog.setRange(0, 0)
+            return
+        dialog.setRange(0, 100)
+        dialog.setValue(int(downloaded * 100 / total))
+
+    def _cancel_update_download(self):
+        if self._update_download_worker is not None:
+            self._update_download_worker.cancel()
+
+    def _drop_update_download_worker(self):
+        """Forget the update download worker, after it has fully
+        stopped (see PullWindow._drop_worker for why the wait
+        matters)."""
+        worker = self._update_download_worker
+        self._update_download_worker = None
+        if worker is not None:
+            worker.wait()
+
+    def _close_update_progress(self):
+        if self._update_progress is not None:
+            self._update_progress.close()
+            self._update_progress = None
+
+    def _on_update_downloaded(self, result):
+        self._drop_update_download_worker()
+        self._close_update_progress()
+        version = result.get("version", "")
+        answer = QMessageBox.question(
+            self, "Update ready",
+            "Fyrn %s is downloaded and checked. Restart now to "
+            "complete the update?"
+            % version,
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            self._show_status(
+                "Fyrn %s will install when Fyrn restarts." % version)
+            return
+        self._apply_update_and_restart(version)
+
+    def _on_update_download_failed(self, message):
+        self._drop_update_download_worker()
+        self._close_update_progress()
+        self._show_status(message)
+        QMessageBox.warning(self, "Update", message)
+
+    def _on_update_download_cancelled(self):
+        self._drop_update_download_worker()
+        self._close_update_progress()
+        self._show_status("Update download cancelled.")
+
+    def _apply_update_and_restart(self, version):
+        """Install the staged update and restart on it (v0.6).
+        A model operation in flight means the update waits for
+        the next restart instead: installing over the running
+        program mid-load would pull the files out from under it.
+        A failed install leaves the old version in place and
+        says so; the restart only happens once the new files
+        are in."""
+        if (self.load_worker is not None
+                or self.chat_worker is not None
+                or self.import_worker is not None):
+            self._show_status(
+                "Fyrn %s is ready and will install when Fyrn "
+                "restarts." % version)
+            return
+        from .updates import apply_pending_update, restart_after_exit
+        ok, message = apply_pending_update(self._home)
+        if not ok:
+            QMessageBox.warning(self, "Update", message)
+            return
+        save_window_geometry(get_settings(), "window", self)
+        restart_after_exit([sys.executable, "-m", "fyrn"])
+        QApplication.instance().quit()
 
     def _apply_theme(self):
         """Re-skin the window from the active theme's tokens:
@@ -4203,8 +4785,17 @@ class MainWindow(QMainWindow):
         if self.import_worker is not None:
             self.import_worker.cancel()
             self.import_worker.wait(5000)
+        if self._update_check_worker is not None:
+            # The check is a short network call with its own
+            # timeout: wait it out rather than abandoning it.
+            self._update_check_worker.wait(10000)
+        if self._update_download_worker is not None:
+            self._update_download_worker.cancel()
+            self._update_download_worker.wait(5000)
         workers = (self._scan_worker, self.load_worker,
-                   self.chat_worker, self.import_worker)
+                   self.chat_worker, self.import_worker,
+                   self._update_check_worker,
+                   self._update_download_worker)
         if any(worker is not None and worker.isRunning()
                for worker in workers):
             # A worker is still running after its cancel and wait:
@@ -4214,9 +4805,17 @@ class MainWindow(QMainWindow):
             # Destroyed while thread is still running"). Stay open
             # and close once the workers finish.
             self._close_pending = True
-            self._show_status_persistent(
-                "A model is still loading. Fyrn will close when "
-                "it finishes.")
+            if ((self._update_check_worker is not None
+                 and self._update_check_worker.isRunning())
+                    or (self._update_download_worker is not None
+                        and self._update_download_worker.isRunning())):
+                self._show_status_persistent(
+                    "An update is still downloading. Fyrn will "
+                    "close when it finishes.")
+            else:
+                self._show_status_persistent(
+                    "A model is still loading. Fyrn will close when "
+                    "it finishes.")
             event.ignore()
             return
         if self.controller.is_loaded:
@@ -4266,6 +4865,19 @@ def main(argv=None):
     # import costs ~0.5 s, which is why it is not paid during
     # construction. It is ready before the user can do anything.
     QTimer.singleShot(0, window._init_logger)
+    # Warm the model engine in the background (task 2): the first
+    # load of a session paid a 70-90 s engine import inside the
+    # load worker. Warming it now, on a daemon thread, means the
+    # first load starts loading at once. The thread never blocks
+    # the window or the exit.
+    threading.Thread(target=warm_engine, daemon=True).start()
+    # The silent update check (v0.6): a background thread asks
+    # GitHub for a newer release. Up to date, or unreachable,
+    # means nothing happens at all; a newer release pops up
+    # once. Off when the setting says so.
+    if get_update_check():
+        QTimer.singleShot(
+            0, lambda: window.check_for_updates(manual=False))
     try:
         return app.exec()
     finally:

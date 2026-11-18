@@ -71,6 +71,7 @@ PLAIN_FILES = [
     "fyrn/discover.py",
     "fyrn/theme.py",
     "fyrn/chime.py",
+    "fyrn/updates.py",
     "fyrn/gui.py",
     "tests/__init__.py",
     "tests/helpers.py",
@@ -83,6 +84,7 @@ PLAIN_FILES = [
     "tests/test_install.py",
     "tests/test_theme.py",
     "tests/test_chime.py",
+    "tests/test_updates.py",
     "tests/test_launch.py",
 ]
 
@@ -143,10 +145,18 @@ def build():
     digest = hashlib.sha256()
     with open(zip_path, "rb") as fh:
         digest.update(fh.read())
+    sha = digest.hexdigest()
+    # The checksum sidecar (v0.6): the updater verifies a release
+    # zip against it before installing anything, so every release
+    # from v0.6 on ships one, in sha256sum format.
+    sidecar_path = zip_path + ".sha256"
+    with open(sidecar_path, "w", encoding="utf-8") as fh:
+        fh.write("%s  %s\n" % (sha, ZIP_NAME))
     print("built %s" % zip_path)
     print("files: %d" % len(files))
     print("size: %d bytes" % size)
-    print("sha256: %s" % digest.hexdigest())
+    print("sha256: %s" % sha)
+    print("sidecar: %s" % sidecar_path)
     print("modes ok: %s" % ok)
     return 0 if ok else 1
 

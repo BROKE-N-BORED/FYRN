@@ -1,5 +1,104 @@
 # Changelog
 
+## Fyrn v0.6 (2026-11-18)
+
+The hands-on audit fixes (17 of 18 tasks), plus the silent
+update check. Every item below has a test.
+
+- **Self-update:** Fyrn quietly checks GitHub for a newer
+  release when it starts, in a background thread that never
+  blocks startup. Up to date, or unreachable, means nothing
+  happens at all. A newer release pops up and asks; nothing
+  downloads until you tap to update. The download fetches the
+  release zip and its checksum sidecar (new from this release:
+  every release ships a `.sha256` file beside the zip) and
+  verifies the SHA-256 before touching anything — a failed
+  check means nothing is installed and the old version keeps
+  running. Once verified, you choose: restart now and the
+  update installs and Fyrn restarts on it, or wait and it
+  applies at the next launch (re-verified first). The update
+  replaces program files only — never the models folder,
+  settings, or the venv — and files it replaces are backed up
+  first, so a failed install restores the old version. Help
+  menu, Check for updates, checks by hand; Settings turns the
+  startup check off (it is on by default). Two things the
+  update does not do: it does not touch the launcher or the
+  desktop files (they point at the install folder, which does
+  not move), and it never removes files a release dropped (it
+  replaces and adds only).
+- **Settings opens at full size:** the dialog used to open
+  crushed to 560x220 with clipped labels and 9 px slivers for
+  buttons. It now sizes from its content (bounded by the
+  screen), so every label and button is whole.
+- **First load is fast:** the first load of a session paid a
+  70-90 s engine import inside the load worker, behind a
+  misleading "Loading into RAM" message. The engine now warms
+  up in the background at startup, so the first load starts
+  loading at once; if the warm-up is still running, the load
+  says "Starting the model engine..." honestly while it waits.
+- **The grid stays in its cells:** at 56 models three cards
+  piled on one spot. The hover lift captured a collapsed
+  geometry mid-relayout and parked the card there forever. The
+  lift now re-syncs to its true cell when it lands, the drop
+  re-derives its target the same way, and a relayout cancels
+  any lift in flight first.
+- **The Pull window grows:** when the queue or unfinished list
+  appears, the window grows to fit it (bounded by the screen)
+  instead of crushing the lists into the empty window's space.
+- **Ctrl+L respects the search:** loading a model the search
+  is hiding used to load it unseen. It now refuses in plain
+  words, the way Remove already did.
+- **The Models menu follows state:** Load, Remove, and Unload
+  enable and disable with the selection and the load state,
+  the way the buttons already do. Load and Remove stay enabled
+  for a hidden or Ollama selection, so their shortcuts reach
+  the plain-words guard instead of doing nothing.
+- **Keyboard focus shows the tooltip:** focusing a card with
+  the keyboard used to show nothing (the tooltip call fired
+  while the focus event was still being delivered, and Qt
+  dropped it). It is deferred 100 ms now, and the tooltip
+  appears.
+- **A load failure names the design:** loading LFM3 used to
+  say "The file may be broken", blaming a fine file for an
+  engine that does not know the LFM3 design yet. It now says
+  so plainly: "uses the LFM3 design, which Fyrn's engine does
+  not support yet. The file itself is fine." (The engine bump
+  that would let LFM3 load is still a separate decision, not
+  in this release.)
+- **The Pull window's Close button says what it does:** "Close
+  this window (a running download stops, keeping its part
+  file)".
+- **Settings saves say what changed:** a settings-only save
+  used to claim the models folder had moved. It now says
+  "Settings saved.", and a save that changed the folder says
+  so once, without the settings message clobbering it.
+- **Names, never blob hashes:** loading an Ollama model used
+  to show its blob filename in the status and in errors. The
+  model's name is used everywhere now.
+- **How to Use names all seven settings** (it said three).
+- **Save chat:** the Chat tab and the File menu (Ctrl+S) save
+  the transcript to a file you pick. This is the minimum
+  scope: the file is the record, and there is no chat history
+  across sessions yet.
+- **The folder hint reads as a sentence:** "Models live in the
+  folder set in the File menu, under Settings."
+- **Tab skips the scroll area:** Tab used to land on the bare
+  grid container with no visible focus. Keyboard scrolling
+  still works (the grid scrolls to the focused card).
+- **The double-click hint hides with the empty state:** with
+  no models there is nothing to double-click.
+- **One card is a third of the row:** a single model used to
+  span the full width like the hero tile, and two took half
+  each. Every column now takes an equal share, so a short row
+  keeps the one-third card width and the hero tile's full
+  width stays meaningful.
+
+Not in this release: task 18 (badge hysteresis — the fit
+badges still flip Tight/Too big as free RAM wobbles; the
+current behaviour is defensible and no decision was made to
+change it). The LFM3 engine gap (F1) is still open: LFM3
+still will not load, it just fails plainly now.
+
 ## Fyrn v0.5 (2026-11-16)
 
 The v0.2 review, finished: usability and polish. Every item
