@@ -3,10 +3,14 @@
 # compile on a 2-core PC. The project publishes a pre-built CPU wheel on
 # its own index instead, and --only-binary stops pip ever falling back
 # to a source build if that index ever lags behind PyPI by a version.
+# 0.3.37 has no wheel on that index either (source only), so the
+# release zip carries the wheel built from the 0.3.37 source
+# (wheels/llama_cpp_python-0.3.37-*.whl) and install.sh installs it
+# first; this pin is then already satisfied when pip reads this file.
 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 --only-binary=llama-cpp-python
 # Pinned to the versions the install sim verified (v0.4): an
 # unpinned reinstall months from now would pull whatever is
 # latest, which can break the install or the app.
 PySide6-Essentials==6.12.0
-llama-cpp-python==0.3.36
+llama-cpp-python==0.3.37

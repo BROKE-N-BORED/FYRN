@@ -28,6 +28,13 @@ If `python3-venv` is missing on your machine, the installer tells you
 the one command that fixes it (`sudo apt install python3-venv`) and
 stops — it never runs apt itself.
 
+Updating from v0.6: v0.7 needs a reinstall, because the in-app
+update cannot bring the new model engine (it never touches the
+Python environment where the engine lives). Download v0.7 from
+the releases page and double-click Install-Fyrn again — your
+models folder and settings are untouched. Later releases that
+only change Fyrn's own code will still update in-app.
+
 ## Use
 
 - **Models tab:** every `.gguf` file in your models folder, with its
@@ -135,6 +142,19 @@ Build the release zip with:
 ```
 python3 build_zip.py
 ```
+
+The engine wheel (v0.7): llama-cpp-python 0.3.37 has no
+pre-built wheel on PyPI or on the project's CPU wheel index
+(source only), so the release zip carries a wheel built from
+the 0.3.37 source tarball (built 2026-11-18 on Ubuntu 24.04,
+CPU-only, runtime CPU dispatch). `build_zip.py` takes it from
+the `FYRN_ENGINE_WHEEL` environment variable (default: the
+verified build under `~/workspace/fyrn-engine-probe/wheels/`)
+and checks its SHA-256 on every build; a missing or
+mismatched wheel fails the build in plain words. The wheel is
+a build-time input only — it never goes in the repo or the
+push manifest. The installer installs it from the zip before
+anything else, so no PC ever compiles the engine.
 
 ## License
 

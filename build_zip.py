@@ -38,6 +38,24 @@ def _release_tag(version):
 ZIP_NAME = "%s-v%s.zip" % (APP_ID, _release_tag(VERSION))
 PREFIX = APP_ID + "/"
 
+# The model engine wheel (v0.7): llama-cpp-python 0.3.37 has no
+# pre-built wheel on PyPI or on the project's CPU wheel index
+# (source only), so the release zip carries the wheel built from
+# the 0.3.37 source. It is a build-time input only: it lives
+# outside this tree and is NEVER in the push manifest or the
+# repo. FYRN_ENGINE_WHEEL points at another copy; the default
+# is the verified build. The SHA-256 is checked on every build,
+# so a wrong or damaged wheel fails the build instead of
+# shipping inside the release.
+ENGINE_WHEEL_NAME = ("llama_cpp_python-0.3.37-py3-none-"
+                     "linux_x86_64.whl")
+ENGINE_WHEEL_SHA256 = ("5399a522d12b3af69183de4920292f684a581ff2ae14"
+                       "b811db203ca5f13595b5")
+ENGINE_WHEEL_DEFAULT = (
+    "/home/hatch/workspace/fyrn-engine-probe/wheels/"
+    + ENGINE_WHEEL_NAME)
+ENGINE_WHEEL_ARCNAME = "wheels/" + ENGINE_WHEEL_NAME
+
 EXEC_FILES = {
     "install.sh",
     "run.sh",
@@ -111,17 +129,47 @@ def _ensure_icons():
         return False
 
 
+def _engine_wheel():
+    """The engine wheel to ship: (path, error). The path comes
+    from FYRN_ENGINE_WHEEL or the default build; a missing file
+    or a hash mismatch is a plain error, never a silent skip."""
+    wheel = os.environ.get("FYRN_ENGINE_WHEEL",
+                           ENGINE_WHEEL_DEFAULT)
+    if not os.path.exists(wheel):
+        return None, ("engine wheel not found: %s\n"
+                      "Set FYRN_ENGINE_WHEEL to the built wheel, "
+                      "or build it from the llama-cpp-python "
+                      "0.3.37 source (see README)." % wheel)
+    digest = hashlib.sha256()
+    with open(wheel, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != ENGINE_WHEEL_SHA256:
+        return None, ("engine wheel hash mismatch: %s\n"
+                      "The wheel at %s is not the verified "
+                      "0.3.37 build." % (wheel, wheel))
+    return wheel, None
+
+
 def build():
     if not _ensure_icons():
+        return 1
+    wheel, error = _engine_wheel()
+    if error is not None:
+        print(error)
         return 1
     zip_path = os.path.join(ROOT, ZIP_NAME)
     if os.path.exists(zip_path):
         os.remove(zip_path)
-    files = [(name, 0o100755) for name in sorted(EXEC_FILES)]
-    files += [(name, 0o100644) for name in PLAIN_FILES]
+    # (archive name, mode, full path): tree files live under
+    # ROOT, the engine wheel lives outside it.
+    files = [(name, 0o100755, os.path.join(ROOT, name))
+             for name in sorted(EXEC_FILES)]
+    files += [(name, 0o100644, os.path.join(ROOT, name))
+              for name in PLAIN_FILES]
+    files.append((ENGINE_WHEEL_ARCNAME, 0o100644, wheel))
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, mode in files:
-            full = os.path.join(ROOT, name)
+        for name, mode, full in files:
             if not os.path.exists(full):
                 print("MISSING: %s" % name)
                 return 1
@@ -129,7 +177,15 @@ def build():
             info.create_system = 3  # Unix, so the mode bits are kept
             info.external_attr = mode << 16
             with open(full, "rb") as fh:
-                zf.writestr(info, fh.read())
+                data = fh.read()
+            if name == ENGINE_WHEEL_ARCNAME:
+                # The wheel is already a zip: storing it
+                # uncompressed skips a pointless re-deflate of
+                # 28 MB of already-compressed bytes.
+                zf.writestr(info, data,
+                            compress_type=zipfile.ZIP_STORED)
+            else:
+                zf.writestr(info, data)
     # Verify stored modes.
     ok = True
     with zipfile.ZipFile(zip_path) as zf:

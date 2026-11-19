@@ -126,7 +126,9 @@ def kv_cache_bytes_per_token(header):
     """KV cache bytes per context token, from a GGUF header.
 
     header is the dict from _read_gguf_kv (or read_gguf_metadata
-    plus read_gguf_numbers). Each layer stores one key vector and
+    plus read_gguf_numbers), with a per-layer head_count_kv array
+    merged in when the file carries one (see
+    model_headroom_bytes). Each layer stores one key vector and
     one value vector per token, so the size is layers times (key
     size plus value size) times 2 bytes. Returns None when the
     header lacks what the calculation needs, so the caller falls
@@ -141,8 +143,6 @@ def kv_cache_bytes_per_token(header):
         return None
     heads = header.get(prefix + "attention.head_count")
     heads_kv = header.get(prefix + "attention.head_count_kv", heads)
-    if not _is_count(heads_kv) or heads_kv <= 0:
-        return None
     key_len = header.get(prefix + "attention.key_length")
     if key_len is None:
         # Head dimension from the embedding size and head count.
@@ -155,6 +155,35 @@ def kv_cache_bytes_per_token(header):
         return None
     if not _is_count(value_len) or value_len <= 0:
         return None
+    if isinstance(heads_kv, list):
+        # Per-layer KV head counts (hybrid designs like LFM3,
+        # whose attention.head_count_kv is an array, not a
+        # scalar): a layer with 0 KV heads is a convolution layer
+        # that caches no KV at all, and must not be charged for
+        # any. Keys are charged at each layer's own size. Values
+        # are padded: the backend stores every KV layer's values
+        # at the largest value size across layers ("padding V
+        # cache to 512" in the load log), so each KV layer pays
+        # the maximum. Sliding-window layers count in full: this
+        # backend uses a full-size cache for them ("using
+        # full-size SWA cache"), not a window-sized one. The
+        # numbers were checked against a real LFM3 load (see the
+        # v0.7 changelog): 11 KV layers of 24, 22,528 bytes per
+        # token, against the old 196,608.
+        if (len(heads_kv) != layers
+                or any(not _is_count(count) or count < 0
+                       for count in heads_kv)):
+            return None
+        key_total = sum(count * key_len for count in heads_kv)
+        value_sizes = [count * value_len for count in heads_kv
+                       if count > 0]
+        if not value_sizes:
+            return 0
+        per_token = (key_total
+                     + len(value_sizes) * max(value_sizes))
+        return per_token * _KV_BYTES_PER_VALUE
+    if not _is_count(heads_kv) or heads_kv <= 0:
+        return None
     per_token = layers * (heads_kv * key_len + heads_kv * value_len)
     return per_token * _KV_BYTES_PER_VALUE
 
@@ -166,7 +195,20 @@ def model_headroom_bytes(path, context_tokens):
     header does not carry the numbers (not a GGUF file, or an
     older format without them).
     """
-    per_token = kv_cache_bytes_per_token(_read_gguf_kv(path))
+    header = _read_gguf_kv(path)
+    arch = header.get("general.architecture")
+    if isinstance(arch, str) and arch:
+        # A per-layer head_count_kv array (LFM3) is invisible to
+        # the scalar reader, which skips arrays: read it directly
+        # when the scalar is missing, so a hybrid model is charged
+        # for its KV layers only (v0.7, F3).
+        key = arch + ".attention.head_count_kv"
+        if key not in header:
+            array = read_gguf_number_array(path, key)
+            if array is not None:
+                header = dict(header)
+                header[key] = array
+    per_token = kv_cache_bytes_per_token(header)
     if per_token is None:
         return HEADROOM_BYTES
     return per_token * max(0, int(context_tokens)) + WORKING_BYTES
@@ -349,6 +391,73 @@ def _read_gguf_kv(path):
         return {}
     metadata, _reader, _count = _parse_gguf_header(head)
     return metadata or {}
+
+
+# How much of a file read_gguf_number_array scans: the
+# architecture keys it looks for sit at the very start of the
+# header (before the tokenizer section, which is megabytes of
+# token strings), so 1 MB is generous.
+_GGUF_ARRAY_SCAN_BYTES = 1024 * 1024
+
+# A per-layer array is at most one entry per layer (a few
+# hundred); anything bigger is not a per-layer array.
+_GGUF_MAX_LAYER_ARRAY = 4096
+
+
+def read_gguf_number_array(path, key):
+    """Read one numeric ARRAY entry from a GGUF file's header.
+
+    Returns the list of values (ints, floats, or bools) when the
+    key is there as an array of numbers with at most
+    _GGUF_MAX_LAYER_ARRAY entries, else None. The scan stops as
+    soon as the key is found, so the tokenizer section (megabytes
+    of strings) is never walked for a key that sits before it.
+    A bad file, a missing key, a non-numeric array, or a key past
+    the scan window all return None: the caller falls back to the
+    scalar numbers or the fixed headroom, never raises.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(_GGUF_ARRAY_SCAN_BYTES)
+    except OSError:
+        return None
+    if len(head) < 8 or head[:4] != _GGUF_MAGIC:
+        return None
+    reader = _GgufReader(head)
+    reader.pos = 4
+    try:
+        version = reader.u32()
+        if version == 3:
+            reader.u64()  # tensor count
+            kv_count = reader.u64()
+        elif version == 2:
+            reader.u32()  # tensor count
+            kv_count = reader.u32()
+        else:
+            return None
+        if kv_count > _GGUF_MAX_KV:
+            return None
+        for _ in range(kv_count):
+            entry_key = reader.string()
+            value_type = reader.u32()
+            if entry_key == key:
+                if value_type != 9:  # not an array
+                    return None
+                elem_type = reader.u32()
+                count = reader.u64()
+                if (count > _GGUF_MAX_LAYER_ARRAY
+                        or elem_type not in _GGUF_FIXED):
+                    return None
+                return [reader.value(elem_type)
+                        for _ in range(count)]
+            # Not the key: skip the value. A huge array (the
+            # tokenizer's, over the reader's cap) raises here,
+            # which ends the scan: a key past one is not found,
+            # and None is the honest answer for it.
+            reader.value(value_type)
+    except (ValueError, struct.error, UnicodeDecodeError):
+        return None
+    return None
 
 
 # GGUF general.file_type values, from the llama.cpp enum

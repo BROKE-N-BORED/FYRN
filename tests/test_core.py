@@ -20,9 +20,9 @@ from fyrn.core import (HEADROOM_BYTES, WORKING_BYTES, ImportCancelled,
                              model_headroom_bytes, move_to_trash,
                              projector_size_bytes, ram_check,
                              read_gguf_facts, read_gguf_metadata,
-                             read_gguf_numbers, read_gguf_tensor_params,
-                             read_ram_bytes, remove_gguf, scan_models,
-                             trash_dir)
+                             read_gguf_number_array, read_gguf_numbers,
+                             read_gguf_tensor_params, read_ram_bytes,
+                             remove_gguf, scan_models, trash_dir)
 from fyrn.runner import FakeRunner
 
 GB = 1024 ** 3
@@ -472,6 +472,126 @@ class KvCacheTests(unittest.TestCase):
         path = make_fake_gguf(self.folder / "fake.gguf", 2048)
         self.assertEqual(model_headroom_bytes(path, 4096),
                          HEADROOM_BYTES)
+
+
+class PerLayerKvTests(unittest.TestCase):
+    """v0.7 (F3): per-layer KV head counts. LFM3's
+    attention.head_count_kv is an array of 24 ints (11 layers
+    with 4 KV heads, 13 convolution layers with 0), not a
+    scalar. The old code fell back to head_count=16 for all 24
+    layers and charged 196,608 bytes per token; the real number
+    is 22,528, measured against a real LFM3 load."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _header(self, heads_kv, layers=4):
+        return {"general.architecture": "lfm3",
+                "lfm3.block_count": layers,
+                "lfm3.attention.head_count": 16,
+                "lfm3.attention.head_count_kv": heads_kv,
+                "lfm3.attention.key_length": 128,
+                "lfm3.attention.value_length": 128}
+
+    def test_zero_head_layers_cache_nothing(self):
+        # 4 layers, heads [0, 4, 0, 2]: keys (0 + 512 + 0 + 256)
+        # plus values padded to the largest (512) for the 2 KV
+        # layers, times 2 bytes: (768 + 1024) * 2 = 3,584.
+        header = self._header([0, 4, 0, 2])
+        self.assertEqual(kv_cache_bytes_per_token(header), 3584)
+
+    def test_values_padded_to_the_largest_layer(self):
+        # Heads [1, 4]: value sizes 128 and 512. The backend
+        # pads every KV layer's values to 512, so both layers
+        # pay 512: keys (128 + 512) + values (512 + 512), times
+        # 2 bytes = 3,328.
+        header = self._header([1, 4], layers=2)
+        self.assertEqual(kv_cache_bytes_per_token(header), 3328)
+
+    def test_all_zero_heads_means_no_kv(self):
+        header = self._header([0, 0, 0, 0])
+        self.assertEqual(kv_cache_bytes_per_token(header), 0)
+
+    def test_bad_arrays_return_none(self):
+        # Wrong length, a negative count, and a non-integer:
+        # inconsistent data falls back to the fixed headroom.
+        self.assertIsNone(kv_cache_bytes_per_token(
+            self._header([4, 4, 4])))
+        self.assertIsNone(kv_cache_bytes_per_token(
+            self._header([4, -1, 4, 4])))
+        self.assertIsNone(kv_cache_bytes_per_token(
+            self._header([4, "4", 4, 4])))
+
+    def test_headroom_reads_the_array_from_a_file(self):
+        path = write_gguf_file(
+            self.folder / "hybrid.gguf",
+            {"general.architecture": "lfm3"},
+            numbers={"lfm3.block_count": 4,
+                     "lfm3.attention.head_count": 16,
+                     "lfm3.attention.key_length": 128,
+                     "lfm3.attention.value_length": 128},
+            arrays={"lfm3.attention.head_count_kv": (5, [0, 4, 0, 2])})
+        # 3,584 bytes per token (see above) at 2048 context,
+        # plus the fixed working memory.
+        self.assertEqual(model_headroom_bytes(path, 2048),
+                         3584 * 2048 + WORKING_BYTES)
+
+    def test_real_lfm3_blob_numbers(self):
+        blob = Path(
+            "/home/hatch/workspace/ollama/models/blobs/sha256-"
+            "3793e1e6e2266919d6e015287221b41100175a98eddaba92"
+            "e111aed3b05c93c4")
+        if not blob.is_file():
+            self.skipTest("roster blob absent")
+        # The real LFM3 header: 24 layers, 11 with 4 KV heads.
+        array = read_gguf_number_array(
+            blob, "lfm3.attention.head_count_kv")
+        self.assertEqual(len(array), 24)
+        self.assertEqual(sum(1 for count in array if count > 0),
+                         11)
+        self.assertEqual(model_headroom_bytes(blob, 2048),
+                         22528 * 2048 + WORKING_BYTES)
+
+
+class GgufNumberArrayTests(unittest.TestCase):
+    """read_gguf_number_array: the per-layer array reader."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_reads_an_int_array(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf",
+            {"general.architecture": "lfm3"},
+            arrays={"lfm3.attention.head_count_kv":
+                    (5, [0, 4, 0, 2])})
+        self.assertEqual(
+            read_gguf_number_array(
+                path, "lfm3.attention.head_count_kv"),
+            [0, 4, 0, 2])
+
+    def test_missing_key_scalar_key_and_bad_file_are_none(self):
+        path = write_gguf_file(
+            self.folder / "a.gguf",
+            {"general.architecture": "llama"},
+            numbers={"llama.block_count": 2})
+        self.assertIsNone(read_gguf_number_array(
+            path, "llama.attention.head_count_kv"))
+        # A scalar under the key is not an array.
+        self.assertIsNone(read_gguf_number_array(
+            path, "llama.block_count"))
+        self.assertIsNone(read_gguf_number_array(
+            self.folder / "gone.gguf", "llama.block_count"))
+        self.assertIsNone(read_gguf_number_array(
+            Path("/nonexistent.gguf"), "llama.block_count"))
 
 
 class FitHeadroomTests(unittest.TestCase):

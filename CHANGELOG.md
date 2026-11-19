@@ -1,5 +1,56 @@
 # Changelog
 
+## Fyrn v0.7 (2026-11-18)
+
+The engine bump: LFM3 loads now.
+
+- **LFM3 loads:** the engine is now llama-cpp-python 0.3.37,
+  whose bundled llama.cpp knows the LFM3 design (and qwen3vl).
+  LFM3 1.7B loads and chats like any other model. The old
+  "uses the LFM3 design, which Fyrn's engine does not support
+  yet" message is gone for LFM3; the mechanism stays for any
+  design the engine genuinely does not know yet.
+- **The engine wheel ships inside the zip:** 0.3.37 has no
+  pre-built wheel on PyPI or on the project's CPU wheel index
+  (source only), so the release zip carries the wheel built
+  from the 0.3.37 source (28 MB, in wheels/). The installer
+  installs it first, so nothing ever compiles on your PC. The
+  builder checks the wheel's SHA-256 on every build.
+- **This release needs a reinstall:** the in-app update cannot
+  bring the new engine, because the updater never touches the
+  Python environment where the engine lives. To get v0.7,
+  download it from the releases page and double-click
+  Install-Fyrn again (your models folder and settings are
+  untouched). Releases that only change Fyrn's own code will
+  still update in-app.
+- **LFM3's fit numbers are fixed:** the old code charged LFM3
+  196,608 bytes of KV cache per context token, counting all 24
+  layers at 16 KV heads. The model's header actually carries a
+  per-layer head count: 11 layers cache KV (4 heads each) and
+  13 are convolution layers that cache nothing. The real number
+  is 22,528 bytes per token, measured against a real LFM3 load
+  (the engine's own per-layer dims, cross-checked by memory
+  measurement). The fit badge and the load check for LFM3 use
+  the real number now.
+- **Unload explains itself during a reply:** Unload is greyed
+  out while a reply streams (unloading mid-reply would leave
+  a reply coming from a model that is gone), but nothing said
+  so — on a real PC it read as a broken button. The hero
+  tile's stats line now carries "Reply in progress…" while a
+  reply streams, so the greyed button is explained, and
+  Unload says "Wait for the reply to finish first." instead
+  of silently doing nothing. The guard itself is unchanged:
+  unloading mid-reply is still refused.
+- **Roster re-verified:** every roster model loads and
+  generates under the new engine — all 11, plus qwen3:0.6b:
+  both Qwen3.5 builds and the uncensored one, Qwen2.5-Coder,
+  MiniCPM5-Heretic, Phi-4 mini, Granite, both Bonsai-2 builds,
+  qwen3-vl, and LFM3 itself.
+- **Vision works on the new engine:** qwen3-vl and
+  Bonsai-2-uncensored both read a test picture correctly
+  through their vision projectors (checked at engine level;
+  Fyrn's own attach-a-photo flow is unchanged).
+
 ## Fyrn v0.6 (2026-11-18)
 
 The hands-on audit fixes (17 of 18 tasks), plus the silent

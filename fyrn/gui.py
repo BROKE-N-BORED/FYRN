@@ -3988,7 +3988,11 @@ class MainWindow(QMainWindow):
         if not self.controller.is_loaded:
             return
         if self.chat_worker is not None:
-            return  # a reply is streaming; Unload waits for it
+            # A reply is streaming: Unload waits for it, and says
+            # so instead of silently doing nothing (v0.7: a greyed
+            # Unload during a reply read as a broken button).
+            self._show_status("Wait for the reply to finish first.")
+            return
         name = self.controller.current_name or "model"
         self.controller.unload()
         self.load_time_s = None
@@ -4288,6 +4292,9 @@ class MainWindow(QMainWindow):
         self.chat_worker.start()
         self._update_buttons()
         self.stop_button.setEnabled(True)
+        # The stats carry the reply-in-progress line now (v0.7):
+        # refresh at once instead of waiting for the 2 s timer.
+        self._refresh_stats()
 
     def _on_chat_token(self, piece):
         self._current_reply += piece
@@ -4340,6 +4347,9 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         self.stop_button.setEnabled(False)
         self._update_buttons()
+        # Clear the reply-in-progress line at once (v0.7), the
+        # way the finished path does.
+        self._refresh_stats()
         self._end_turn("(%s)" % message)
         self._show_status(message)
         self.log.error("chat failed: %s", message)
@@ -4415,6 +4425,12 @@ class MainWindow(QMainWindow):
                                     % stats.get("ttft_s", 0.0))
                 loaded_parts.append("Reply: %d tokens"
                                     % stats.get("tokens", 0))
+            if self.chat_worker is not None:
+                # A reply in progress, visible on the Models tab
+                # too (the hero tile carries these stats): a
+                # greyed Unload during a reply reads as broken
+                # unless something says a reply is running (v0.7).
+                loaded_parts.append("Reply in progress…")
             parts.extend(loaded_parts)
             # The hero tile shows the same live stats as the Chat
             # tab, so the loaded model's numbers are visible

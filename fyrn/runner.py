@@ -50,17 +50,16 @@ class GenerationCancelled(Exception):
     """The user stopped a reply."""
 
 
-# Architectures the pinned engine (llama-cpp-python 0.3.36) is
-# KNOWN not to support, proven by a failed load, not guessed:
-# LFM3 raises "Failed to load model from file" because the
-# bundled llama.cpp predates the architecture (the C++ error
-# names it, but only on stderr, so the Python exception never
-# carries it). When a load of one of these fails, the user is
-# told the engine does not know the design yet, instead of being
-# told the file may be broken (task 8). The engine bump that
-# adds support (F1) is Joshua's call on timing; when it lands,
-# this set shrinks.
-UNSUPPORTED_ARCHITECTURES = frozenset({"lfm3"})
+# Architectures the pinned engine is KNOWN not to support,
+# proven by a failed load, not guessed: when a load of one of
+# these fails, the user is told the engine does not know the
+# design yet, instead of being told the file may be broken
+# (task 8). The mechanism stays for genuinely unknown
+# architectures (the C++ error names them, but only on stderr,
+# so the Python exception never carries it). LFM3 was the one
+# member until v0.7: the engine bump to llama-cpp-python
+# 0.3.37 added it, so it loads now and the set is empty.
+UNSUPPORTED_ARCHITECTURES = frozenset()
 
 
 def warm_engine():

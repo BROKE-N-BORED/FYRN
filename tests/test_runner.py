@@ -291,14 +291,18 @@ class EngineStartMessageTests(unittest.TestCase):
 
 class UnsupportedArchitectureTests(unittest.TestCase):
     """Task 8: an architecture the engine does not know is not
-    a broken file. The LFM3 case is the real one: the engine
-    fails with a bare "Failed to load model from file", and the
-    architecture text only ever reaches C++ stderr."""
+    a broken file. The engine fails with a bare "Failed to load
+    model from file", and the architecture text only ever
+    reaches C++ stderr. LFM3 was the real case until v0.7, when
+    the engine bump made it load: the test now uses a synthetic
+    architecture pinned into the unsupported set for the test,
+    so the mechanism is covered without pinning a fake
+    architecture in the product."""
 
-    def _lfm3_file(self, tmp):
+    def _arch_file(self, tmp, arch, name):
         from helpers import write_gguf_file
-        path = Path(tmp) / "lfm3.gguf"
-        write_gguf_file(path, {"general.architecture": "lfm3"})
+        path = Path(tmp) / name
+        write_gguf_file(path, {"general.architecture": arch})
         return path
 
     def _raising_module(self, message):
@@ -311,23 +315,27 @@ class UnsupportedArchitectureTests(unittest.TestCase):
         module.Llama = FailingLlama
         return module
 
-    def test_lfm3_failure_names_the_design_not_the_file(self):
+    def test_unsupported_failure_names_the_design_not_the_file(
+            self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._lfm3_file(tmp)
+            path = self._arch_file(tmp, "qwen99", "qwen99.gguf")
             module = self._raising_module(
                 "Failed to load model from file: %s" % path)
             runner = LlamaRunner()
             with mock.patch.dict(sys.modules,
-                                 {"llama_cpp": module}):
+                                 {"llama_cpp": module}), \
+                    mock.patch("fyrn.runner."
+                               "UNSUPPORTED_ARCHITECTURES",
+                               frozenset({"qwen99"})):
                 with self.assertRaises(RunnerError) as ctx:
-                    runner.load(str(path), display_name="LFM3 1.7B")
+                    runner.load(str(path), display_name="Qwen99")
             text = str(ctx.exception)
-            self.assertIn("LFM3", text)
+            self.assertIn("QWEN99", text)
             self.assertIn("does not support yet", text)
             self.assertIn("file itself is fine", text)
             self.assertNotIn("may be broken", text)
             self.assertNotIn(str(path), text)
-            self.assertIn("LFM3 1.7B", text)
+            self.assertIn("Qwen99", text)
             self.assertFalse(runner.is_loaded)
 
     def test_unknown_architecture_text_is_matched_too(self):
@@ -381,6 +389,94 @@ class UnsupportedArchitectureTests(unittest.TestCase):
             text = str(ctx.exception)
             self.assertNotIn("sha256-abcdef", text)
             self.assertIn("Tiny 1B", text)
+
+
+
+# The real LFM3 blob, from the roster model store. The test
+# below needs it, the 0.3.37 engine, and the opt-in flag: a
+# real load takes minutes on a throttled sandbox, so it never
+# runs in the default suite.
+_LFM3_BLOB = (
+    "/home/hatch/workspace/ollama/models/blobs/sha256-3793e1e6"
+    "e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4")
+
+
+def _real_engine_available():
+    """True when the real-engine test can run: opted in, the
+    0.3.37 engine installed, and the roster blob present."""
+    import os
+    if os.environ.get("FYRN_REAL_ENGINE_TESTS") != "1":
+        return False
+    try:
+        import llama_cpp
+    except ImportError:
+        return False
+    try:
+        major, minor, patch = (
+            int(part) for part in
+            llama_cpp.__version__.split(".")[:3])
+    except (ValueError, AttributeError):
+        return False
+    if (major, minor, patch) < (0, 3, 37):
+        return False
+    return Path(_LFM3_BLOB).is_file()
+
+
+class RealLfm3LoadTests(unittest.TestCase):
+    """v0.7 (F1): the real LFM3 model loads under the bumped
+    engine and generates text. Opt-in only
+    (FYRN_REAL_ENGINE_TESTS=1): a real load takes minutes, and
+    the roster store is not on every machine. Skips cleanly
+    otherwise, with the reason in the skip message."""
+
+    def test_real_lfm3_loads_and_generates(self):
+        if not _real_engine_available():
+            import os
+            reasons = []
+            if os.environ.get("FYRN_REAL_ENGINE_TESTS") != "1":
+                reasons.append("FYRN_REAL_ENGINE_TESTS != 1")
+            try:
+                import llama_cpp
+                version = llama_cpp.__version__
+            except ImportError:
+                version = "not installed"
+            reasons.append("llama-cpp-python %s" % version)
+            if not Path(_LFM3_BLOB).is_file():
+                reasons.append("roster blob absent")
+            self.skipTest("real-engine test skipped (%s)"
+                          % "; ".join(reasons))
+        runner = LlamaRunner(
+            free_ram_fn=lambda: 8 * GB)
+        result = runner.load(_LFM3_BLOB, display_name="lfm3:1.7b")
+        self.assertTrue(runner.is_loaded)
+        self.assertGreater(result.get("load_time_s", 0), 0)
+        try:
+            # A short generation, with a cancel backstop: the
+            # model should stop at its end token after a few
+            # words, but a rambling model must not hold the
+            # suite open. Either a finished reply or a
+            # cancelled one proves generation works, as long
+            # as tokens arrived.
+            received = []
+            cancel = threading.Event()
+            timer = threading.Timer(120.0, cancel.set)
+            timer.daemon = True
+            timer.start()
+            try:
+                runner.generate(
+                    "Say hello in one sentence.",
+                    on_token=received.append,
+                    cancel_event=cancel)
+            except GenerationCancelled:
+                pass
+            finally:
+                timer.cancel()
+            self.assertTrue(received,
+                            "no tokens arrived from LFM3")
+            self.assertTrue("".join(received).strip())
+        finally:
+            runner.unload()
+        self.assertFalse(runner.is_loaded)
 
 
 class DisplayNameTests(unittest.TestCase):

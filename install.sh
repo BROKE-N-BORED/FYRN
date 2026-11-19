@@ -46,6 +46,19 @@ if ! python3 -c "import venv, ensurepip" >/dev/null 2>&1; then
   exit 1
 fi
 
+# The model engine wheel ships inside this zip (v0.7):
+# llama-cpp-python 0.3.37 has no pre-built wheel on any index,
+# so the release carries the wheel built from the 0.3.37 source.
+# Check it is here before creating anything: a missing wheel
+# fails here in plain words, not halfway through the install.
+WHEEL="wheels/llama_cpp_python-0.3.37-py3-none-linux_x86_64.whl"
+if [ ! -f "$WHEEL" ]; then
+  echo "The model engine wheel is missing from this install."
+  echo "Expected: $WHEEL"
+  echo "Download Fyrn v0.7 again from the releases page and try again."
+  exit 1
+fi
+
 if [ ! -d .venv ]; then
   if ! python3 -m venv .venv; then
     echo "Creating the virtual environment failed."
@@ -56,6 +69,16 @@ if [ ! -d .venv ]; then
   fi
 fi
 .venv/bin/pip install --quiet --upgrade pip
+# Install the wheel first: requirements.txt then finds the pin
+# already satisfied and never tries a source build (no compiler,
+# no 15-30 minute compile on this PC). A wheel pip rejects is
+# damaged, and fails here in plain words, not as a traceback.
+if ! .venv/bin/pip install --quiet "$WHEEL"; then
+  echo "The model engine could not be installed."
+  echo "The wheel file is $WHEEL - it may be damaged."
+  echo "Download Fyrn v0.7 again from the releases page and try again."
+  exit 1
+fi
 .venv/bin/pip install --quiet -r requirements.txt
 
 # Fatal check: the packages must actually import before the

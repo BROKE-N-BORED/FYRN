@@ -158,7 +158,7 @@ class ProjectFileTests(unittest.TestCase):
         # and a new llama-cpp-python can break the vision handler
         # or the load path without warning.
         self.assertIn("PySide6-Essentials==6.12.0", text)
-        self.assertIn("llama-cpp-python==0.3.36", text)
+        self.assertIn("llama-cpp-python==0.3.37", text)
         # llama-cpp-python has no PyPI wheels: without the CPU wheel
         # index + --only-binary, pip builds llama.cpp from source
         # (needs gcc + cmake + a long compile). Pin both lines so the
@@ -289,6 +289,13 @@ class ZipBuilderTests(unittest.TestCase):
                         if rel == "CI-STATUS.md":
                             continue
                         expected.add("fyrn/" + rel)
+                # The engine wheel (v0.7) ships inside the zip but
+                # lives outside the tree, so it is not in the walk:
+                # it is expected explicitly, with the plain-file
+                # mode the loop above already asserted.
+                expected.add(
+                    "fyrn/wheels/llama_cpp_python-0.3.37-py3-none-"
+                    "linux_x86_64.whl")
                 self.assertEqual(set(names), expected)
             self.assertIn("modes ok: True", result.stdout)
             # The checksum sidecar (v0.6): the updater verifies a
@@ -303,6 +310,74 @@ class ZipBuilderTests(unittest.TestCase):
             self.assertEqual(
                 sidecar_path.read_text(encoding="utf-8"),
                 "%s  %s\n" % (digest.hexdigest(), zip_path.name))
+
+
+class EngineWheelTests(unittest.TestCase):
+    """v0.7: the engine wheel ships inside the zip, and both the
+    builder and the installer fail plainly without a good one."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.copy = self.base / "fyrn"
+        shutil.copytree(
+            ROOT, self.copy,
+            ignore=shutil.ignore_patterns(
+                "__pycache__", "*.zip", "*.pyc"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run_builder(self, wheel=None):
+        env = dict(os.environ)
+        if wheel is not None:
+            env["FYRN_ENGINE_WHEEL"] = str(wheel)
+        return subprocess.run(
+            [sys.executable, "build_zip.py"], cwd=str(self.copy),
+            capture_output=True, text=True, timeout=300, env=env)
+
+    def test_builder_fails_without_the_wheel(self):
+        result = self._run_builder(
+            wheel=self.base / "no-such-wheel.whl")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not found", result.stdout)
+
+    def test_builder_fails_on_a_wrong_hash(self):
+        fake = self.base / "fake.whl"
+        fake.write_bytes(b"not the engine wheel")
+        result = self._run_builder(wheel=fake)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("hash mismatch", result.stdout)
+
+    def test_installer_fails_without_the_wheel(self):
+        # No wheels/ dir in the copy: the installer refuses
+        # before creating anything, in plain words. A fake df
+        # reports plenty of space, so the disk check (1 GB
+        # floor) does not fire first: the temp copy lives on
+        # the 512 MB /tmp tmpfs. The wheels/ dir is removed
+        # explicitly: a fresh unzip ships it, so the premise
+        # is the test's own, not the tree's.
+        shutil.rmtree(self.copy / "wheels", ignore_errors=True)
+        home = self.base / "home"
+        home.mkdir()
+        bin_dir = self.base / "bin"
+        bin_dir.mkdir()
+        df = bin_dir / "df"
+        df.write_text(
+            "#!/bin/sh\n"
+            "echo 'Filesystem 1024-blocks Used Available "
+            "Capacity Mounted on'\n"
+            "echo '/dev/fake 100000000 10000000 90000000 10%% /tmp'\n")
+        df.chmod(0o755)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["PATH"] = "%s:%s" % (bin_dir, os.environ["PATH"])
+        result = subprocess.run(
+            ["bash", "install.sh"], cwd=str(self.copy),
+            capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing from this install", result.stdout)
+        self.assertFalse((self.copy / ".venv").exists())
 
 
 class DiskSpaceTests(unittest.TestCase):

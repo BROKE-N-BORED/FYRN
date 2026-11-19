@@ -2046,6 +2046,64 @@ class ReplyButtonTests(GuiTestCase):
         self.assertTrue(window.unload_button.isEnabled())
         self.assertTrue(window.remove_button.isEnabled())
 
+    def test_unload_during_a_reply_says_so_and_keeps_the_model(self):
+        # v0.7: on a real PC a greyed Unload during a reply read
+        # as a broken button, and the guard returned silently.
+        # Unload still refuses mid-reply; now it says why.
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        runner = FakeRunner(
+            reply_text="one two three four five six seven eight",
+            token_delay_s=0.3)
+        window = self.make_window(runner=runner)
+        self.load_first_model(window)
+        window.chat_input.setText("go")
+        window.send_button.click()
+        pump_until(lambda: window.chat_worker is not None, 5000)
+        self.assertIsNotNone(window.chat_worker)
+        # The button is greyed during a reply; the guard is
+        # reached through the method (menu, shortcut, or race).
+        window.unload_model()
+        self.assertIn("Wait for the reply to finish first.",
+                      window.statusBar().currentMessage())
+        self.assertTrue(window.controller.is_loaded)
+        self.wait_chat(window)
+        # After the reply, Unload works again.
+        self.assertTrue(window.unload_button.isEnabled())
+        window.unload_button.click()
+        QTest.qWait(100)
+        self.assertFalse(window.controller.is_loaded)
+
+    def test_reply_in_progress_shows_on_the_models_tab(self):
+        # v0.7: the hero tile's stats line (visible on the Models
+        # tab) carries "Reply in progress…" while a reply
+        # streams, so a greyed Unload is explained; the line
+        # goes away when the reply ends.
+        make_fake_gguf(self.models / "alpha.gguf", 2048)
+        runner = FakeRunner(
+            reply_text="one two three four five six seven eight",
+            token_delay_s=0.3)
+        window = self.make_window(runner=runner)
+        self.load_first_model(window)
+        ok = pump_until(lambda: window._hero_card is not None,
+                        5000)
+        self.assertTrue(ok, "hero tile never appeared")
+        hero = window._hero_card
+        self.assertNotIn("Reply in progress",
+                         hero.stats_label.text())
+        window.chat_input.setText("go")
+        window.send_button.click()
+        pump_until(lambda: window.chat_worker is not None, 5000)
+        ok = pump_until(
+            lambda: "Reply in progress" in hero.stats_label.text()
+            and "Reply in progress" in window.stats_label.text(),
+            5000)
+        self.assertTrue(ok, "reply indicator never appeared")
+        self.wait_chat(window)
+        self.assertNotIn("Reply in progress",
+                         hero.stats_label.text())
+        self.assertNotIn("Reply in progress",
+                         window.stats_label.text())
+
 
 class LoadOfferedTests(GuiTestCase):
     def test_load_not_offered_for_the_loaded_model(self):
@@ -3711,13 +3769,16 @@ class FocusTooltipTests(GuiTestCase):
 
 
 class UnsupportedArchitectureGuiTests(GuiTestCase):
-    """Task 8, through the window: loading LFM3 fails with a
-    modal that names the design, not the file."""
+    """Task 8, through the window: loading an architecture the
+    engine does not know fails with a modal that names the
+    design, not the file. LFM3 was the real case until v0.7,
+    when the engine bump made it load: the test now uses a
+    synthetic architecture pinned into the unsupported set."""
 
-    def test_lfm3_load_modal_names_the_design(self):
+    def test_unsupported_load_modal_names_the_design(self):
         write_gguf_file(
-            self.models / "lfm3.gguf",
-            {"general.architecture": "lfm3"})
+            self.models / "qwen99.gguf",
+            {"general.architecture": "qwen99"})
 
         class FailingLlama:
             def __init__(self, model_path, n_threads, n_ctx,
@@ -3730,9 +3791,12 @@ class UnsupportedArchitectureGuiTests(GuiTestCase):
         module.Llama = FailingLlama
         window = self.make_window(runner=LlamaRunner())
         window.controller._free_ram_fn = lambda: 8 * GB
-        with mock.patch.dict(sys.modules, {"llama_cpp": module}):
+        with mock.patch.dict(sys.modules, {"llama_cpp": module}), \
+                mock.patch("fyrn.runner."
+                           "UNSUPPORTED_ARCHITECTURES",
+                           frozenset({"qwen99"})):
             self.wait_scan(window)
-            path = str(self.models / "lfm3.gguf")
+            path = str(self.models / "qwen99.gguf")
             window.model_cards[path].clicked.emit(path)
             window.load_button.click()
             self.wait_load(window)
@@ -3740,12 +3804,12 @@ class UnsupportedArchitectureGuiTests(GuiTestCase):
         texts = [text for title, text in self.watcher.seen
                  if title == "Load model"]
         self.assertEqual(len(texts), 1)
-        self.assertIn("LFM3", texts[0])
+        self.assertIn("QWEN99", texts[0])
         self.assertIn("does not support yet", texts[0])
         self.assertIn("file itself is fine", texts[0])
         self.assertNotIn("may be broken", texts[0])
         # No filesystem path in the message (a local card's name
-        # is its filename, "lfm3.gguf" included, but the folder
+        # is its filename, "qwen99.gguf" included, but the folder
         # path never appears).
         self.assertNotIn(str(self.models), texts[0])
 
@@ -4014,7 +4078,7 @@ class UpdateCheckGuiTests(GuiTestCase):
     """The update check through the window: silent when it
     should be, plain when it should speak."""
 
-    def _result(self, state, latest="0.7", reason=None):
+    def _result(self, state, latest="0.8", reason=None):
         result = {"state": state, "latest": latest,
                   "url": "https://example.invalid/releases",
                   "zip_url": "https://example.invalid/f.zip",
@@ -4036,12 +4100,12 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_manual_check_current_reports_up_to_date(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("current", "0.6"), manual=True)
+            window, self._result("current", "0.7"), manual=True)
         texts = [text for title, text in self.watcher.seen
                  if title == "Check for updates"]
         self.assertEqual(len(texts), 1)
         self.assertIn("up to date", texts[0])
-        self.assertIn("0.6", texts[0])
+        self.assertIn("0.7", texts[0])
 
     def test_manual_check_unknown_reports_the_reason(self):
         window = self.make_window()
@@ -4063,8 +4127,8 @@ class UpdateCheckGuiTests(GuiTestCase):
         texts = [text for title, text in self.watcher.seen
                  if title == "Update available"]
         self.assertEqual(len(texts), 1)
-        self.assertIn("Fyrn 0.7 is out", texts[0])
-        self.assertIn("You have 0.6", texts[0])
+        self.assertIn("Fyrn 0.8 is out", texts[0])
+        self.assertIn("You have 0.7", texts[0])
         # The watcher clicks the default (No): nothing downloads.
         QTest.qWait(200)
         self.assertIsNone(window._update_download_worker)
@@ -4072,7 +4136,7 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_silent_check_current_is_silent(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("current", "0.6"), manual=False)
+            window, self._result("current", "0.7"), manual=False)
         self.assertEqual(self.watcher.seen, [])
 
     def test_silent_check_unknown_is_silent(self):
@@ -4096,7 +4160,7 @@ class UpdateCheckGuiTests(GuiTestCase):
 
         def slow_check(_version):
             time.sleep(1.0)
-            return self._result("current", "0.6")
+            return self._result("current", "0.7")
 
         with mock.patch("fyrn.updates.check_for_update",
                         side_effect=slow_check):
