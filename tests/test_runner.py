@@ -831,5 +831,351 @@ class VisionTests(unittest.TestCase):
         self.assertIsNone(runner.projector_path)
 
 
+
+
+class FakeRunnerToolTests(unittest.TestCase):
+    """The tool loop with the fake runner (v0.8): scripted calls
+    run through a real executor, events fire in order, stop works
+    mid-loop, and a model without tool support refuses plainly."""
+
+    def _loaded(self, **kwargs):
+        runner = FakeRunner(**kwargs)
+        runner.load("model.gguf")
+        return runner
+
+    def test_multi_round_loop(self):
+        import tempfile
+        from fyrn.tools import ToolExecutor
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "a.txt").write_text("alpha", encoding="utf-8")
+            executor = ToolExecutor(folder)
+            runner = self._loaded(
+                supports_tools=True,
+                tool_script=[
+                    ("call", "read_file", {"path": "a.txt"}),
+                    ("call", "calculate", {"expression": "6 * 7"}),
+                    ("text", "Done: alpha and 42."),
+                ])
+            events = []
+            pieces = []
+            stats = runner.generate_tools(
+                "read and add",
+                execute_tool=executor.execute,
+                on_token=pieces.append,
+                on_event=lambda kind, data: events.append(
+                    (kind, data["name"])))
+            self.assertEqual("".join(pieces), "Done: alpha and 42.")
+            self.assertEqual(events, [
+                ("call", "read_file"), ("result", "read_file"),
+                ("call", "calculate"), ("result", "calculate")])
+            self.assertEqual(
+                [m["content"] for m in runner.last_tool_messages],
+                ["alpha", "6 * 7 = 42"])
+            self.assertGreater(stats["tokens"], 0)
+
+    def test_instructions_reach_the_runner(self):
+        runner = self._loaded(supports_tools=True)
+        runner.generate_tools(
+            "hi", instructions="Be brief.",
+            execute_tool=lambda n, a: ("", ""))
+        self.assertEqual(runner.last_instructions, "Be brief.")
+
+    def test_stop_mid_loop(self):
+        runner = self._loaded(
+            supports_tools=True,
+            tool_script=[("call", "calculate",
+                          {"expression": "1+1"}),
+                         ("sleep", 0.3),
+                         ("text", "late")])
+        cancel = threading.Event()
+        timer = threading.Timer(0.1, cancel.set)
+        timer.daemon = True
+        timer.start()
+        try:
+            with self.assertRaises(GenerationCancelled):
+                runner.generate_tools(
+                    "hi", execute_tool=lambda n, a: ("2", "2"),
+                    cancel_event=cancel)
+        finally:
+            timer.cancel()
+
+    def test_tool_refusal_is_a_result_not_a_crash(self):
+        import tempfile
+        from fyrn.tools import ToolExecutor
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = ToolExecutor(Path(tmp))
+            runner = self._loaded(
+                supports_tools=True,
+                tool_script=[
+                    ("call", "read_file", {"path": "../secret"}),
+                    ("text", "I could not read that.")])
+            pieces = []
+            runner.generate_tools(
+                "read it", execute_tool=executor.execute,
+                on_token=pieces.append)
+            self.assertEqual("".join(pieces),
+                             "I could not read that.")
+            self.assertTrue(
+                runner.last_tool_messages[0]["content"].startswith(
+                    "Refused:"))
+
+    def test_no_tool_support_raises(self):
+        from fyrn.runner import ToolsUnsupportedError
+        runner = self._loaded(supports_tools=False)
+        with self.assertRaises(ToolsUnsupportedError):
+            runner.generate_tools(
+                "hi", execute_tool=lambda n, a: ("", ""))
+
+    def test_base_runner_has_no_tools(self):
+        from fyrn.runner import Runner, ToolsUnsupportedError
+        with self.assertRaises(ToolsUnsupportedError):
+            Runner().generate_tools("hi")
+
+
+class _StubLlm:
+    """A stand-in for the engine object: answers create_chat_
+    completion from a script and records what it was sent."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+        self.metadata = {}
+
+    def create_chat_completion(self, messages=None, **kwargs):
+        self.calls.append((list(messages), kwargs))
+        step = self.script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+    def tokenize(self, blob):
+        return blob.split()
+
+
+def _tool_response(name, arguments):
+    return {"choices": [{"message": {
+        "role": "assistant", "content": "",
+        "tool_calls": [{
+            "id": "call-1", "type": "function",
+            "function": {"name": name, "arguments": arguments}}],
+    }}], "usage": {"completion_tokens": 5}}
+
+
+def _text_response(text):
+    return {"choices": [{"message": {
+        "role": "assistant", "content": text}}],
+        "usage": {"completion_tokens": 5}}
+
+
+class LlamaRunnerToolLoopTests(unittest.TestCase):
+    """LlamaRunner.generate_tools against a stub engine: the
+    loop's shape (definitions offered, results fed back, rounds
+    capped) without a real model."""
+
+    def _runner(self, script):
+        runner = LlamaRunner(free_ram_fn=lambda: 8 * GB)
+        runner._llm = _StubLlm(script)
+        runner.model_path = "stub.gguf"
+        runner._tools = True
+        return runner
+
+    def test_native_tool_call_round(self):
+        runner = self._runner([
+            _tool_response("calculate", '{"expression": "2+2"}'),
+            _text_response("The answer is 4."),
+        ])
+        events = []
+        pieces = []
+        stats = runner.generate_tools(
+            "what is 2+2", instructions="Be brief.",
+            execute_tool=lambda n, a: ("2+2 = 4", "2+2 = 4"),
+            on_token=pieces.append,
+            on_event=lambda k, d: events.append(k))
+        self.assertEqual("".join(pieces), "The answer is 4.")
+        self.assertEqual(events, ["call", "result"])
+        # The definitions were offered, the system prompt went
+        # first, and the tool result went back as a tool message.
+        first_messages, first_kwargs = runner._llm.calls[0]
+        self.assertIn("tools", first_kwargs)
+        self.assertEqual(first_messages[0]["role"], "system")
+        second_messages, _ = runner._llm.calls[1]
+        tool_msgs = [m for m in second_messages
+                     if m.get("role") == "tool"]
+        self.assertEqual(len(tool_msgs), 1)
+        self.assertEqual(tool_msgs[0]["content"], "2+2 = 4")
+        self.assertGreater(stats["tokens"], 0)
+
+    def test_text_tool_call_fallback(self):
+        runner = self._runner([
+            _text_response(
+                "<tool_call>\n<function=calculate>\n"
+                "<parameter=expression>3*3</parameter>\n"
+                "</function>\n</tool_call>"),
+            _text_response("Nine."),
+        ])
+        pieces = []
+        runner.generate_tools(
+            "3*3?", execute_tool=lambda n, a: ("3*3 = 9", "ok"),
+            on_token=pieces.append)
+        self.assertEqual("".join(pieces), "Nine.")
+        second_messages, _ = runner._llm.calls[1]
+        self.assertTrue(any(
+            m.get("role") == "tool" and m["content"] == "3*3 = 9"
+            for m in second_messages))
+
+    def test_template_tool_error_is_unsupported(self):
+        from fyrn.runner import ToolsUnsupportedError
+        runner = self._runner([
+            RuntimeError("Failed to apply jinja template: tools "
+                         "are not supported")])
+        with self.assertRaises(ToolsUnsupportedError):
+            runner.generate_tools(
+                "hi", execute_tool=lambda n, a: ("", ""))
+
+    def test_rounds_are_capped(self):
+        from fyrn.runner import MAX_TOOL_ROUNDS
+        # MAX_TOOL_ROUNDS executed rounds, one more tool request
+        # that trips the cap, then the final no-tools answer.
+        script = [_tool_response("calculate",
+                                 '{"expression": "1+1"}')
+                  for _ in range(MAX_TOOL_ROUNDS + 1)]
+        script.append(_text_response("Final."))
+        runner = self._runner(script)
+        pieces = []
+        runner.generate_tools(
+            "loop", execute_tool=lambda n, a: ("2", "2"),
+            on_token=pieces.append)
+        self.assertEqual("".join(pieces), "Final.")
+        # MAX_TOOL_ROUNDS tool rounds + the final no-tools call.
+        self.assertEqual(len(runner._llm.calls),
+                         MAX_TOOL_ROUNDS + 2)
+        self.assertNotIn("tools", runner._llm.calls[-1][1])
+
+    def test_bad_arguments_are_reported_not_run(self):
+        runner = self._runner([
+            _tool_response("calculate", "{not json"),
+            _text_response("Sorry."),
+        ])
+        executed = []
+        runner.generate_tools(
+            "hi",
+            execute_tool=lambda n, a: executed.append(n) or ("", ""),
+            on_token=lambda piece: None)
+        self.assertEqual(executed, [])
+        second_messages, _ = runner._llm.calls[1]
+        self.assertTrue(any(
+            "could not be read as JSON" in str(m.get("content", ""))
+            for m in second_messages if m.get("role") == "tool"))
+
+
+class PlainGenerateInstructionsTests(unittest.TestCase):
+    """The plain (non-tool) generate path sends the chat's
+    instructions as a leading system message (v0.8)."""
+
+    def test_instructions_lead_the_messages(self):
+        class StreamLlm:
+            def __init__(self):
+                self.calls = []
+
+            def create_chat_completion(self, messages=None,
+                                       **kwargs):
+                self.calls.append(list(messages))
+                return [{"choices": [{"delta": {
+                    "content": "Bonjour."}}]}]
+
+            def tokenize(self, blob):
+                return blob.split()
+
+        runner = LlamaRunner(free_ram_fn=lambda: 8 * GB)
+        runner._llm = StreamLlm()
+        runner.model_path = "stub.gguf"
+        pieces = []
+        runner.generate("Hello", on_token=pieces.append,
+                        instructions="Always answer in French.")
+        self.assertEqual("".join(pieces), "Bonjour.")
+        messages = runner._llm.calls[0]
+        self.assertEqual(messages[0], {
+            "role": "system",
+            "content": "Always answer in French."})
+        self.assertEqual(messages[-1]["role"], "user")
+
+    def test_no_instructions_no_system_message(self):
+        class StreamLlm:
+            def __init__(self):
+                self.calls = []
+
+            def create_chat_completion(self, messages=None,
+                                       **kwargs):
+                self.calls.append(list(messages))
+                return [{"choices": [{"delta": {"content": "Hi."}}]}]
+
+            def tokenize(self, blob):
+                return blob.split()
+
+        runner = LlamaRunner(free_ram_fn=lambda: 8 * GB)
+        runner._llm = StreamLlm()
+        runner.model_path = "stub.gguf"
+        runner.generate("Hello", on_token=lambda piece: None)
+        self.assertEqual(runner._llm.calls[0][0]["role"], "user")
+
+
+class ToolDetectionTests(unittest.TestCase):
+    def test_template_with_tools_supports_them(self):
+        from fyrn.runner import _template_supports_tools
+
+        class FakeLlm:
+            metadata = {"tokenizer.chat_template":
+                        "{% if tools %}...{% endif %}"}
+        self.assertTrue(_template_supports_tools(FakeLlm()))
+
+    def test_template_without_tools_does_not(self):
+        from fyrn.runner import _template_supports_tools
+
+        class FakeLlm:
+            metadata = {"tokenizer.chat_template":
+                        "{% for message in messages %}hi"}
+        self.assertFalse(_template_supports_tools(FakeLlm()))
+
+    def test_missing_template_does_not(self):
+        from fyrn.runner import _template_supports_tools
+
+        class FakeLlm:
+            metadata = {}
+        self.assertFalse(_template_supports_tools(FakeLlm()))
+        self.assertFalse(_template_supports_tools(object()))
+
+
+class RealToolCallTests(unittest.TestCase):
+    """v0.8: one REAL tool call end to end — the real LFM3 model
+    asks for the calculator and answers from its result. Opt-in
+    only (FYRN_REAL_ENGINE_TESTS=1), like the load test above:
+    a real load takes minutes and RAM the sandbox may not have.
+    """
+
+    def test_real_lfm3_tool_call(self):
+        if not _real_engine_available():
+            self.skipTest("real-engine test not opted in")
+        from fyrn.tools import ToolExecutor
+        runner = LlamaRunner(free_ram_fn=lambda: 8 * GB)
+        runner.load(_LFM3_BLOB, display_name="lfm3:1.7b")
+        try:
+            self.assertTrue(
+                runner.supports_tools,
+                "LFM3's template should carry tool support")
+            with tempfile.TemporaryDirectory() as tmp:
+                executor = ToolExecutor(Path(tmp))
+                pieces = []
+                events = []
+                runner.generate_tools(
+                    "Use the calculate tool to work out "
+                    "17 * 24, then tell me the result.",
+                    execute_tool=executor.execute,
+                    on_token=pieces.append,
+                    on_event=lambda k, d: events.append(k))
+            self.assertIn("call", events)
+            self.assertIn("408", "".join(pieces))
+        finally:
+            runner.unload()
 if __name__ == "__main__":
     unittest.main()

@@ -90,6 +90,8 @@ PLAIN_FILES = [
     "fyrn/theme.py",
     "fyrn/chime.py",
     "fyrn/updates.py",
+    "fyrn/chats.py",
+    "fyrn/tools.py",
     "fyrn/gui.py",
     "tests/__init__.py",
     "tests/helpers.py",
@@ -104,6 +106,9 @@ PLAIN_FILES = [
     "tests/test_chime.py",
     "tests/test_updates.py",
     "tests/test_launch.py",
+    "tests/test_chats.py",
+    "tests/test_tools.py",
+    "tests/test_gui_tools.py",
 ]
 
 

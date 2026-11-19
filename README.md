@@ -71,18 +71,42 @@ only change Fyrn's own code will still update in-app.
 - **Settings** (File menu): the models folder — pick any folder you
   like — whether Ollama's already-downloaded models are listed,
   a Reduce motion switch, Compact model list, High-contrast mode,
-  the pull-complete chime mute, and whether Fyrn checks for a
-  newer release when it starts. Everything else (threads,
+  the pull-complete chime mute, whether Fyrn checks for a
+  newer release when it starts, the tools folder, and an optional
+  Forge Browser folder. Everything else (threads,
   context size) is set by the program itself to fit this PC.
 - **Chat tab:** load a model, type a message (Enter sends, Shift+Enter
   starts a new line), press Send. The reply streams in, and the
   model remembers the conversation: each message carries the
-  earlier turns with it. Clear empties the transcript; Save chat
-  writes it to a file you pick. Live numbers
+  earlier turns with it. Live numbers
   show RAM used and free, speed in tokens per second, time to first
   token, and load time. A vision model (one with its projector
   file next to it) gains an Attach image button: pick a PNG or
   JPEG picture and ask about it.
+- **Saved chats:** chats save themselves as you talk, as plain
+  JSON files in `~/.fyrn/chats`. The sidebar on the Chat tab lists
+  them, named from their first message; click one to reopen it
+  with its whole conversation back in place, and keep chatting
+  with whichever model is loaded. New chat (Ctrl+N) starts fresh;
+  Rename and Delete work on the open chat. Clear empties the open
+  chat; Save chat still writes a copy to a file you pick.
+- **Instructions per chat:** the box above the transcript tells
+  the model how to act in that chat ("You are…", "Always…"). It
+  is saved with the chat and sent as its system prompt; a change
+  applies from your next message; empty means none.
+- **Tools:** a model whose own chat template supports tools can
+  use them mid-chat, and every call shows in the transcript as it
+  happens. It can read and write text files and list folders,
+  but only inside the tools folder (Settings, or the Tools folder
+  button on the Chat tab) — anything outside is refused, and the
+  refusal shows. It can search and read the web through Forge
+  Browser (the browser app on this PC): the Browser view window
+  shows the search or page as it comes back, with a button that
+  opens the real Forge Browser on the same page. It can ask to
+  run a command: Fyrn shows the exact command first, and it runs
+  only when you press Run. It can also ask for the current time
+  and work out arithmetic. A model that cannot use tools just
+  chats, exactly as before, and the Chat tab says so in one line.
 - **Updates:** Fyrn quietly checks GitHub for a newer release when
   it starts, and says so only when one is out. Nothing downloads
   until you tap to update; the download is checked against the

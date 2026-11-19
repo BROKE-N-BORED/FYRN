@@ -9,15 +9,24 @@ The backend configures itself (U35): threads and context size come
 from the machine, never from a settings screen.
 """
 
+import json
 import os
+import re
 import sys
 import time
+
+from .tools import TOOL_DEFINITIONS, parse_tool_calls
 
 # A reply never runs past this many tokens: a model that never
 # emits its stop token would otherwise run to context fill, which
 # is up to ~10 minutes on this PC. 1024 is a full answer from a
 # 2B model, and Stop still cuts it short.
 MAX_GENERATION_TOKENS = 1024
+
+# How many tool rounds one reply may take (model asks for tools,
+# gets the results, asks again) before it has to answer with what
+# it has.
+MAX_TOOL_ROUNDS = 5
 
 # The conversation history sent with each message is trimmed to
 # this many characters (about 1000 tokens): half the smallest
@@ -48,6 +57,12 @@ class LoadCancelled(Exception):
 
 class GenerationCancelled(Exception):
     """The user stopped a reply."""
+
+
+class ToolsUnsupportedError(RunnerError):
+    """The loaded model cannot do tool calls after all: its chat
+    template has no working tool support. The GUI falls back to a
+    plain reply for the turn and says so in one plain line."""
 
 
 # Architectures the pinned engine is KNOWN not to support,
@@ -116,6 +131,11 @@ class Runner:
     # sight it does not have.
     supports_vision = False
 
+    # True when the loaded model can call tools mid-chat (its own
+    # chat template carries tool support). The UI offers the tool
+    # path only then; every other model chats exactly as before.
+    supports_tools = False
+
     def __init__(self):
         self.model_path = None
 
@@ -150,7 +170,8 @@ class Runner:
         self.model_path = None
 
     def generate(self, prompt, on_token=None, cancel_event=None,
-                 history=None, images=None):
+                 history=None, images=None,
+                 instructions=None):
         """Stream a reply. Returns a stats dict.
 
         on_token is called with each piece of text as it arrives.
@@ -165,6 +186,23 @@ class Runner:
         """
         raise NotImplementedError
 
+    def generate_tools(self, prompt, history=None, instructions=None,
+                       images=None, execute_tool=None, on_token=None,
+                       on_event=None, cancel_event=None):
+        """Reply with tools on offer (v0.8).
+
+        The model may call tools mid-reply: each call is reported
+        through on_event("call", {...}), run through execute_tool
+        (a callable(name, arguments) -> (result_text, summary)),
+        reported through on_event("result", {...}), and the result
+        goes back to the model. After at most MAX_TOOL_ROUNDS
+        rounds the final answer streams through on_token as usual.
+        Returns the same stats dict as generate(). Runners whose
+        model cannot do this raise ToolsUnsupportedError.
+        """
+        raise ToolsUnsupportedError(
+            "This model cannot use tools.")
+
 
 class FakeRunner(Runner):
     """A predictable stand-in for tests and demos.
@@ -177,7 +215,8 @@ class FakeRunner(Runner):
 
     def __init__(self, reply_text=None, load_delay_s=0.0,
                  token_delay_s=0.0, ttft_delay_s=0.0,
-                 supports_vision=False):
+                 supports_vision=False, supports_tools=False,
+                 tool_script=None):
         super().__init__()
         self.reply_text = (
             reply_text
@@ -187,6 +226,15 @@ class FakeRunner(Runner):
         self.token_delay_s = token_delay_s
         self.ttft_delay_s = ttft_delay_s
         self.supports_vision = supports_vision
+        self.supports_tools = supports_tools
+        # The scripted tool rounds for generate_tools: a list of
+        # ("call", name, arguments) steps, a ("sleep", seconds)
+        # step, and a final ("text", reply) step. Empty means the
+        # model answers at once with reply_text.
+        self.tool_script = list(tool_script or [])
+        # What the last generate_tools() call saw and did.
+        self.last_instructions = None
+        self.last_tool_messages = []
         # The history the last generate() call received, so tests
         # can check the conversation actually reached the runner.
         self.last_history = None
@@ -213,7 +261,8 @@ class FakeRunner(Runner):
         super().unload()
 
     def generate(self, prompt, on_token=None, cancel_event=None,
-                 history=None, images=None):
+                 history=None, images=None,
+                 instructions=None):
         if not self.is_loaded:
             raise RunnerError("No model is loaded.")
         if images and not self.supports_vision:
@@ -223,6 +272,7 @@ class FakeRunner(Runner):
                 "to ask about a picture.")
         self.last_history = list(history or [])
         self.last_images = list(images or [])
+        self.last_instructions = instructions
         started = time.monotonic()
         if self.ttft_delay_s > 0:
             time.sleep(self.ttft_delay_s)
@@ -238,6 +288,61 @@ class FakeRunner(Runner):
                 time.sleep(self.token_delay_s)
         elapsed_s = time.monotonic() - started
         tokens = len(words)
+        return {"tokens": tokens,
+                "elapsed_s": elapsed_s,
+                "ttft_s": ttft_s,
+                "tokens_per_sec": compute_tokens_per_sec(tokens,
+                                                         elapsed_s)}
+
+    def generate_tools(self, prompt, history=None, instructions=None,
+                       images=None, execute_tool=None, on_token=None,
+                       on_event=None, cancel_event=None):
+        if not self.is_loaded:
+            raise RunnerError("No model is loaded.")
+        if not self.supports_tools:
+            raise ToolsUnsupportedError(
+                "This model cannot use tools.")
+        self.last_history = list(history or [])
+        self.last_images = list(images or [])
+        self.last_instructions = instructions
+        self.last_tool_messages = []
+        started = time.monotonic()
+        ttft_s = None
+        final_text = self.reply_text
+        for step in self.tool_script:
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelled("Reply stopped.")
+            kind = step[0]
+            if kind == "sleep":
+                time.sleep(step[1])
+            elif kind == "call":
+                _, name, arguments = step
+                if on_event is not None:
+                    on_event("call", {"name": name,
+                                      "arguments": arguments})
+                if execute_tool is not None:
+                    result, summary = execute_tool(name, arguments)
+                else:
+                    result = "Tools are not available."
+                    summary = result
+                self.last_tool_messages.append(
+                    {"role": "tool", "name": name, "content": result})
+                if on_event is not None:
+                    on_event("result", {"name": name,
+                                        "summary": summary,
+                                        "result": result})
+            elif kind == "text":
+                final_text = step[1]
+                break
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled("Reply stopped.")
+        if self.ttft_delay_s > 0:
+            time.sleep(self.ttft_delay_s)
+        ttft_s = time.monotonic() - started
+        if on_token is not None:
+            on_token(final_text)
+        elapsed_s = time.monotonic() - started
+        tokens = max(1, len(final_text.split()))
         return {"tokens": tokens,
                 "elapsed_s": elapsed_s,
                 "ttft_s": ttft_s,
@@ -268,6 +373,61 @@ def _image_data_url(path):
     return "data:%s;base64,%s" % (mime, encoded)
 
 
+def _template_supports_tools(llm):
+    """Whether a loaded model's own chat template carries tool
+    support. The template is the model's to declare: the ones with
+    tool sections render the tool list and the tool replies, and
+    the engine parses their calls. Read from the loaded engine
+    object, not the file header — the header reader only scans
+    the start of the file, and the template sits past the
+    tokenizer tables."""
+    try:
+        metadata = getattr(llm, "metadata", None) or {}
+        template = metadata.get("tokenizer.chat_template") or ""
+    except Exception:
+        return False
+    return "tool" in template.lower()
+
+
+def _looks_like_tool_problem(exc):
+    """Whether an engine error from a tools call points at the
+    template/tool machinery (as opposed to the model itself)."""
+    text = str(exc).lower()
+    return any(word in text for word in
+               ("tool", "jinja", "template", "chat format"))
+
+
+def _native_tool_calls(message):
+    """Normalise a chat completion message's tool_calls into
+    {"id", "name", "arguments", "args_error"} dicts. Returns []
+    when the message carries none."""
+    calls = []
+    for entry in message.get("tool_calls") or []:
+        function = entry.get("function") or {}
+        name = function.get("name") or ""
+        raw_args = function.get("arguments")
+        args_error = None
+        if isinstance(raw_args, dict):
+            arguments = raw_args
+        elif isinstance(raw_args, str) and raw_args.strip():
+            try:
+                arguments = json.loads(raw_args)
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                    args_error = raw_args
+            except ValueError:
+                arguments = {}
+                args_error = raw_args
+        else:
+            arguments = {}
+        if name:
+            calls.append({"id": entry.get("id") or "",
+                          "name": name,
+                          "arguments": arguments,
+                          "args_error": args_error})
+    return calls
+
+
 class LlamaRunner(Runner):
     """The real runner: GGUF models on the CPU via llama.cpp.
 
@@ -289,11 +449,16 @@ class LlamaRunner(Runner):
         self._llm = None
         self._free_ram_fn = free_ram_fn
         self._vision = False
+        self._tools = False
         self.projector_path = None
 
     @property
     def supports_vision(self):
         return self._vision
+
+    @property
+    def supports_tools(self):
+        return self._tools
 
     def _free_ram(self):
         if self._free_ram_fn is not None:
@@ -413,6 +578,7 @@ class LlamaRunner(Runner):
             progress_cb(100, "Loaded")
         self.model_path = str(path)
         self._vision = chat_handler is not None
+        self._tools = _template_supports_tools(self._llm)
         self.projector_path = (str(projector)
                                if chat_handler is not None else None)
         result = {"load_time_s": time.monotonic() - started}
@@ -425,11 +591,13 @@ class LlamaRunner(Runner):
         # no other state. The vision state goes with it.
         self._llm = None
         self._vision = False
+        self._tools = False
         self.projector_path = None
         super().unload()
 
     def generate(self, prompt, on_token=None, cancel_event=None,
-                 history=None, images=None):
+                 history=None, images=None,
+                 instructions=None):
         if not self.is_loaded or self._llm is None:
             raise RunnerError("No model is loaded.")
         if images and not self._vision:
@@ -444,7 +612,13 @@ class LlamaRunner(Runner):
         # the model answers in context; the new message is last.
         # With pictures, the new message carries them as image
         # parts the engine's vision handler turns into sight.
-        messages = trim_history(history or [])
+        # The chat's instructions, when it has any, lead as the
+        # system prompt (v0.8).
+        messages = []
+        if instructions and str(instructions).strip():
+            messages.append({"role": "system",
+                             "content": str(instructions)})
+        messages.extend(trim_history(history or []))
         if images:
             parts = [{"type": "text", "text": prompt}]
             for image_path in images:
@@ -497,3 +671,161 @@ class LlamaRunner(Runner):
                 "ttft_s": ttft_s,
                 "tokens_per_sec": compute_tokens_per_sec(tokens,
                                                          elapsed_s)}
+
+    def generate_tools(self, prompt, history=None, instructions=None,
+                       images=None, execute_tool=None, on_token=None,
+                       on_event=None, cancel_event=None):
+        """A reply with tools on offer (v0.8).
+
+        Rounds of chat completion with the tool definitions: the
+        model's calls run through execute_tool and the results go
+        back as tool messages, for at most MAX_TOOL_ROUNDS rounds;
+        the final answer is then handed to on_token in pieces.
+        Tool rounds do not stream (a round is a call, not prose),
+        so the reply appears once the model answers — the tool
+        lines stream live through on_event meanwhile.
+        """
+        if not self.is_loaded or self._llm is None:
+            raise RunnerError("No model is loaded.")
+        if images and not self._vision:
+            raise RunnerError(
+                "This model cannot see images. Load a vision "
+                "model (one with its projector file next to it) "
+                "to ask about a picture.")
+        if execute_tool is None:
+            raise ToolsUnsupportedError(
+                "This model cannot use tools.")
+        started = time.monotonic()
+        messages = []
+        if instructions and str(instructions).strip():
+            messages.append({"role": "system",
+                             "content": str(instructions)})
+        messages.extend(trim_history(history or []))
+        if images:
+            parts = [{"type": "text", "text": prompt}]
+            for image_path in images:
+                try:
+                    url = _image_data_url(image_path)
+                except OSError as exc:
+                    raise RunnerError(
+                        "That picture could not be read (%s)."
+                        % exc)
+                parts.append({"type": "image_url",
+                              "image_url": {"url": url}})
+            messages.append({"role": "user", "content": parts})
+        else:
+            messages.append({"role": "user", "content": prompt})
+
+        def cancelled():
+            return cancel_event is not None and cancel_event.is_set()
+
+        def finish(text):
+            """Emit the final answer in pieces; build the stats."""
+            ttft_s = time.monotonic() - started
+            if text and on_token is not None:
+                for piece in re.findall(r"\S+\s*|\s+", text):
+                    if cancelled():
+                        raise GenerationCancelled("Reply stopped.")
+                    on_token(piece)
+            elapsed_s = time.monotonic() - started
+            try:
+                tokens = len(self._llm.tokenize(
+                    text.encode("utf-8")))
+            except Exception:
+                tokens = max(1, len(text) // 4)
+            return {"tokens": tokens,
+                    "elapsed_s": elapsed_s,
+                    "ttft_s": ttft_s,
+                    "tokens_per_sec": compute_tokens_per_sec(
+                        tokens, elapsed_s)}
+
+        rounds = 0
+        while True:
+            if cancelled():
+                raise GenerationCancelled("Reply stopped.")
+            try:
+                response = self._llm.create_chat_completion(
+                    messages=messages,
+                    tools=TOOL_DEFINITIONS,
+                    tool_choice="auto",
+                    stream=False,
+                    max_tokens=MAX_GENERATION_TOKENS,
+                )
+            except GenerationCancelled:
+                raise
+            except Exception as exc:
+                if rounds == 0 and _looks_like_tool_problem(exc):
+                    raise ToolsUnsupportedError(
+                        "This model cannot use tools.")
+                raise RunnerError(
+                    "The model stopped with an error (%s)." % exc)
+            choices = response.get("choices") or []
+            message = (choices[0].get("message")
+                       if choices else None) or {}
+            calls = _native_tool_calls(message)
+            content = message.get("content") or ""
+            parsed_text = False
+            if not calls and content:
+                text_calls, has_calls = parse_tool_calls(content)
+                if has_calls:
+                    calls = [{"id": "", "name": call["name"],
+                              "arguments": call["arguments"],
+                              "args_error": None}
+                             for call in text_calls]
+                    parsed_text = True
+            if not calls:
+                return finish(content)
+            rounds += 1
+            if rounds > MAX_TOOL_ROUNDS:
+                # The model kept asking: one last round with no
+                # tools on offer, so the turn still ends in an
+                # answer built from the results it already has.
+                try:
+                    response = self._llm.create_chat_completion(
+                        messages=messages,
+                        stream=False,
+                        max_tokens=MAX_GENERATION_TOKENS,
+                    )
+                    choices = response.get("choices") or []
+                    message = (choices[0].get("message")
+                               if choices else None) or {}
+                    return finish(message.get("content") or "")
+                except Exception:
+                    return finish(
+                        "I used my tools %d times and still could "
+                        "not finish an answer. The tool results "
+                        "above are what I found." % MAX_TOOL_ROUNDS)
+            if parsed_text:
+                messages.append({"role": "assistant",
+                                 "content": content})
+            else:
+                messages.append({
+                    "role": "assistant",
+                    "content": message.get("content") or "",
+                    "tool_calls": message.get("tool_calls"),
+                })
+            for call in calls:
+                if cancelled():
+                    raise GenerationCancelled("Reply stopped.")
+                if on_event is not None:
+                    on_event("call", {"name": call["name"],
+                                      "arguments":
+                                          call["arguments"]})
+                if call["args_error"] is not None:
+                    result = ("The tool call's arguments could not "
+                              "be read as JSON, so the tool was "
+                              "not run.")
+                    summary = result
+                else:
+                    result, summary = execute_tool(
+                        call["name"], call["arguments"])
+                if on_event is not None:
+                    on_event("result", {"name": call["name"],
+                                        "summary": summary,
+                                        "result": result})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "name": call["name"],
+                    "content": result,
+                })

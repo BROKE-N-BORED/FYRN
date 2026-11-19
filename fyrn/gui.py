@@ -16,17 +16,18 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import (QEvent, QEasingCurve, QLockFile, QPoint,
-                            QPropertyAnimation, QRect, QSettings, Qt,
-                            QThread, QTimer, Signal)
+                            QPropertyAnimation, QRect, QSettings,
+                            QSignalBlocker, Qt, QThread, QTimer, Signal)
 from shiboken6 import isValid
 from PySide6.QtGui import (QAction, QCursor, QGuiApplication, QIcon,
-                           QKeySequence, QShortcut)
+                           QKeySequence, QPixmap, QShortcut)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
                                QDialog, QFileDialog, QFrame,
                                QGraphicsOpacityEffect, QGridLayout,
-                               QHBoxLayout, QLabel, QLineEdit,
-                               QListWidget, QListWidgetItem, QMainWindow,
-                               QMenu, QMessageBox, QProgressBar,
+                               QHBoxLayout, QInputDialog, QLabel,
+                               QLineEdit, QListWidget, QListWidgetItem,
+                               QMainWindow, QMenu, QMessageBox,
+                               QPlainTextEdit, QProgressBar,
                                QProgressDialog, QPushButton, QScrollArea,
                                QSizePolicy, QSpacerItem, QSystemTrayIcon,
                                QTabWidget, QTextEdit, QToolTip,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
 
 from . import __version__
 from . import core
+from .chats import ChatStore, auto_title, history_from_messages
 from .core import (HEADROOM_BYTES, ImportCancelled, ModelController,
                    ModelNotFoundError, ModelTooBigError, ensure_home,
                    ensure_models_folder, fit_status, format_chat_export,
@@ -45,10 +47,11 @@ from .discover import discover_ollama_models
 # it: it costs ~0.4 s of cold start, and nothing needs it until a
 # pull actually runs.
 from .runner import (GenerationCancelled, LoadCancelled, LlamaRunner,
-                     RunnerError, auto_context_tokens, trim_history,
-                     warm_engine)
+                     RunnerError, ToolsUnsupportedError,
+                     auto_context_tokens, trim_history, warm_engine)
 from .theme import (DARK, HIGH_CONTRAST, THEMES, build_stylesheet,
                     fit_badges, rgba_string)
+from .tools import ToolExecutor
 
 DEFAULT_WIDTH = 1100
 DEFAULT_HEIGHT = 700
@@ -167,6 +170,39 @@ def set_update_check(value):
     settings.sync()
 
 
+def default_tools_folder():
+    """Where the file tools work until the user picks a folder:
+    a visible folder in the home directory, created on use."""
+    return str(Path.home() / "Fyrn files")
+
+
+def get_tools_folder():
+    """The one folder the model's file tools may touch (Settings
+    window, or the button on the Chat tab)."""
+    settings = get_settings()
+    value = settings.value("tools_folder", "", type=str)
+    return value if value else default_tools_folder()
+
+
+def set_tools_folder(value):
+    settings = get_settings()
+    settings.setValue("tools_folder", str(value))
+    settings.sync()
+
+
+def get_forge_browser_path():
+    """An optional override for where Forge Browser is installed
+    (Settings window). Empty means: find it in its usual place."""
+    settings = get_settings()
+    return settings.value("forge_browser_path", "", type=str)
+
+
+def set_forge_browser_path(value):
+    settings = get_settings()
+    settings.setValue("forge_browser_path", str(value))
+    settings.sync()
+
+
 def current_tokens():
     """The active theme's tokens: high-contrast when that
     setting is on, the dark theme otherwise."""
@@ -256,12 +292,13 @@ HOW_TO_USE_SECTIONS = {
         "When the pull finishes, the model appears in the Models tab."
     ),
     "Settings": (
-        "Settings lives in the File menu. It has seven settings: "
+        "Settings lives in the File menu. It has nine settings: "
         "the models folder, where pulled and imported models are "
         "kept; whether Ollama's already-downloaded models are "
         "listed; Reduce motion; Compact model list; High-contrast "
-        "mode; the pull-complete chime mute; and whether Fyrn "
-        "checks for a newer release when it starts.\n\n"
+        "mode; the pull-complete chime mute; whether Fyrn "
+        "checks for a newer release when it starts; the tools "
+        "folder; and an optional Forge Browser folder.\n\n"
         "Press Browse to pick a different models folder, then Save. "
         "The Models tab switches to the new folder right away.\n\n"
         "Check Reduce motion if movement on screen bothers you: "
@@ -275,6 +312,11 @@ HOW_TO_USE_SECTIONS = {
         "Fyrn quietly asks GitHub whether a newer release is out "
         "when it starts, and says so only when one is. Turn it "
         "off to check by hand instead, from the Help menu.\n\n"
+        "The tools folder is the one folder a tool-using model "
+        "can read and write files in. The Forge Browser folder "
+        "is optional: Fyrn finds Forge Browser in its usual "
+        "install place on its own, and the setting only matters "
+        "when yours lives somewhere else.\n\n"
         "Everything else about how models run (threads, context "
         "size) is set by the program itself to fit this PC."
     ),
@@ -284,6 +326,21 @@ HOW_TO_USE_SECTIONS = {
         "in as the model writes it. Press Stop to cut a reply short. "
         "Shift+Enter starts a new line without sending. Clear "
         "empties the transcript.\n\n"
+        "Your chats save themselves as you talk. The list on the "
+        "left of the Chat tab holds every saved chat, named from "
+        "its first message. Click one to reopen it, with its whole "
+        "conversation back in place; New chat starts a fresh one; "
+        "Rename and Delete work on the open chat. A chat reopens "
+        "even when its model is not the one loaded: send, and the "
+        "loaded model answers with the saved conversation as its "
+        "context. Chats are plain files in ~/.fyrn/chats, one file "
+        "per chat.\n\n"
+        "The box above the transcript holds instructions for this "
+        "chat: tell the model how to act ('You are a patient "
+        "teacher', 'Always answer in plain words'), and it follows "
+        "them for this chat only. They save with the chat, and a "
+        "change applies from your next message. Leave the box "
+        "empty for no instructions.\n\n"
         "Some models can see pictures: a vision model has a "
         "projector file (its name starts with mmproj) sitting next "
         "to the model file. With one of those loaded, Attach image "
@@ -292,6 +349,34 @@ HOW_TO_USE_SECTIONS = {
         "stays greyed out.\n\n"
         "If no model is loaded, Send stays greyed out. Load a model "
         "from the Models tab first."
+    ),
+    "Tools": (
+        "Some models can use tools while they answer: they can "
+        "look things up and do small jobs, then answer with what "
+        "they found. The line above the transcript says whether "
+        "the loaded model can. A model that cannot use tools just "
+        "chats, exactly as before.\n\n"
+        "Every tool call shows in the transcript as it happens: "
+        "the tool's name, what it did, and a short result line. "
+        "Nothing happens out of sight.\n\n"
+        "Files: the model can read and write text files and list "
+        "what is there, but only inside the tools folder (Settings, "
+        "or the Tools folder button on the Chat tab). Anything "
+        "outside that folder is refused, and the refusal shows.\n\n"
+        "The web: searches and page reads go through Forge "
+        "Browser, the browser app on this PC. The Browser view "
+        "button (and the window that opens when a web tool runs) "
+        "shows the search or the page as it comes back, and its "
+        "Open in Forge Browser button opens the real Forge "
+        "Browser on the same page. Without Forge Browser "
+        "installed, the web tools say so and the rest still work.\n\n"
+        "Commands: the model can ask to run a command. Fyrn shows "
+        "the exact command and the folder it runs in, and it runs "
+        "only when you press Run: Cancel is the button it lands "
+        "on. The output comes back into the chat. You never need "
+        "a terminal: the model runs commands, you approve them.\n\n"
+        "Time and calculator: the model can ask for the current "
+        "date and time, and work out arithmetic."
     ),
     "Stats": (
         "While a model runs, the Chat tab shows live numbers: RAM "
@@ -415,28 +500,71 @@ class LoadWorker(QThread):
 
 
 class ChatWorker(QThread):
-    """Stream one reply off the UI thread (U30)."""
+    """Stream one reply off the UI thread (U30).
+
+    With tools on offer (v0.8), the worker runs the runner's tool
+    loop instead: tool calls and results come back through
+    tool_event, and a run_command call blocks in
+    request_command_approval until the UI thread answers through
+    resolve_approval — the approval modal lives on the UI thread,
+    and the command never runs without a yes."""
 
     token = Signal(str)
     finished = Signal(dict)  # generation stats
     failed = Signal(str)
+    tool_event = Signal(str, dict)         # "call" / "result"
+    web_event = Signal(str, dict)          # browser view updates
+    tools_fallback = Signal()              # tool path failed; plain reply used
+    approval_requested = Signal(str, str)  # command, working dir
 
-    def __init__(self, runner, prompt, history=None, images=None):
+    def __init__(self, runner, prompt, history=None, images=None,
+                 instructions=None, executor=None):
         super().__init__()
         self.runner = runner
         self.prompt = prompt
         self.history = list(history or [])
         self.images = list(images or [])
+        self.instructions = instructions
+        self.executor = executor
         self.cancel_event = threading.Event()
+        self._approval_event = threading.Event()
+        self._approval_answer = False
 
     def run(self):
+        emit_token = lambda piece: self.token.emit(piece)
         try:
-            stats = self.runner.generate(
-                self.prompt,
-                on_token=lambda piece: self.token.emit(piece),
-                cancel_event=self.cancel_event,
-                history=self.history,
-                images=self.images)
+            if self.executor is not None:
+                try:
+                    stats = self.runner.generate_tools(
+                        self.prompt,
+                        history=self.history,
+                        instructions=self.instructions,
+                        images=self.images,
+                        execute_tool=self._execute_tool,
+                        on_token=emit_token,
+                        on_event=lambda kind, data:
+                            self.tool_event.emit(kind, data),
+                        cancel_event=self.cancel_event)
+                except ToolsUnsupportedError:
+                    # The model's template cannot really do tools
+                    # after all: this turn still gets its reply,
+                    # the plain way, and the window says so once.
+                    self.tools_fallback.emit()
+                    stats = self.runner.generate(
+                        self.prompt,
+                        on_token=emit_token,
+                        cancel_event=self.cancel_event,
+                        history=self.history,
+                        images=self.images,
+                        instructions=self.instructions)
+            else:
+                stats = self.runner.generate(
+                    self.prompt,
+                    on_token=emit_token,
+                    cancel_event=self.cancel_event,
+                    history=self.history,
+                    images=self.images,
+                    instructions=self.instructions)
         except GenerationCancelled:
             self.finished.emit({"stopped": True})
         except RunnerError as exc:
@@ -448,8 +576,44 @@ class ChatWorker(QThread):
             stats["stopped"] = False
             self.finished.emit(stats)
 
+    def _execute_tool(self, name, arguments):
+        """Run one tool call for the runner's loop. The executor's
+        approval callback is swapped for this worker's bridge, so
+        a run_command call asks the UI thread and waits; its web
+        events are swapped for this worker's signal, so the
+        browser view updates on the UI thread too."""
+        executor = self.executor
+        previous_approve = executor._approve_command
+        previous_event = executor._on_event
+        executor._approve_command = self.request_command_approval
+        executor._on_event = lambda kind, data: self.web_event.emit(
+            kind, data)
+        try:
+            return executor.execute(name, arguments)
+        finally:
+            executor._approve_command = previous_approve
+            executor._on_event = previous_event
+
+    def request_command_approval(self, command, cwd):
+        """Called on the worker thread by the executor: ask the UI
+        thread and wait for the answer. A stop reads as a no."""
+        self._approval_answer = False
+        self._approval_event.clear()
+        self.approval_requested.emit(command, cwd)
+        while not self._approval_event.wait(0.05):
+            if self.cancel_event.is_set():
+                return False
+        return self._approval_answer
+
+    def resolve_approval(self, approved):
+        self._approval_answer = bool(approved)
+        self._approval_event.set()
+
     def cancel(self):
         self.cancel_event.set()
+        # A worker waiting on an approval wakes up and reads the
+        # cancel as a no.
+        self._approval_event.set()
 
 
 class PullWorker(QThread):
@@ -1768,6 +1932,49 @@ class SettingsWindow(QDialog):
         update_help.setWordWrap(True)
         layout.addWidget(update_help)
 
+        tools_label = QLabel("Tools folder")
+        layout.addWidget(tools_label)
+
+        tools_row = QHBoxLayout()
+        self.tools_folder_edit = QLineEdit(get_tools_folder())
+        self.tools_folder_edit.setReadOnly(True)
+        tools_browse = QPushButton("Browse")
+        tools_browse.setToolTip(
+            "Pick the folder the model's file tools may use")
+        tools_browse.clicked.connect(self._browse_tools_folder)
+        tools_row.addWidget(self.tools_folder_edit)
+        tools_row.addWidget(tools_browse)
+        layout.addLayout(tools_row)
+
+        tools_help = QLabel(
+            "When a model that can use tools is loaded, it can "
+            "read and write text files, but only inside this "
+            "folder. Nothing outside it can be touched.")
+        tools_help.setWordWrap(True)
+        layout.addWidget(tools_help)
+
+        forge_label = QLabel("Forge Browser folder (optional)")
+        layout.addWidget(forge_label)
+
+        forge_row = QHBoxLayout()
+        self.forge_path_edit = QLineEdit(get_forge_browser_path())
+        self.forge_path_edit.setPlaceholderText(
+            "Found on its own when this is empty")
+        forge_browse = QPushButton("Browse")
+        forge_browse.setToolTip(
+            "Pick the folder Forge Browser is installed in")
+        forge_browse.clicked.connect(self._browse_forge_folder)
+        forge_row.addWidget(self.forge_path_edit)
+        forge_row.addWidget(forge_browse)
+        layout.addLayout(forge_row)
+
+        forge_help = QLabel(
+            "The model's web tools go through Forge Browser. Fyrn "
+            "finds it in its usual install place on its own; set "
+            "this only if yours lives somewhere else.")
+        forge_help.setWordWrap(True)
+        layout.addWidget(forge_help)
+
         layout.addStretch(1)
 
         buttons = QHBoxLayout()
@@ -1830,6 +2037,20 @@ class SettingsWindow(QDialog):
         if folder:
             self.folder_edit.setText(folder)
 
+    def _browse_tools_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Pick the tools folder",
+            self.tools_folder_edit.text())
+        if folder:
+            self.tools_folder_edit.setText(folder)
+
+    def _browse_forge_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Pick the Forge Browser folder",
+            self.forge_path_edit.text() or str(Path.home()))
+        if folder:
+            self.forge_path_edit.setText(folder)
+
     def _save(self):
         folder = Path(self.folder_edit.text())
         try:
@@ -1846,6 +2067,8 @@ class SettingsWindow(QDialog):
         set_high_contrast(self.contrast_check.isChecked())
         set_chime_muted(self.chime_check.isChecked())
         set_update_check(self.update_check.isChecked())
+        set_tools_folder(self.tools_folder_edit.text())
+        set_forge_browser_path(self.forge_path_edit.text().strip())
         # Only a real folder change is announced (task 10): a
         # settings-only save used to claim the folder had moved.
         if str(folder) != self._initial_folder:
@@ -1891,6 +2114,127 @@ class HowToUseWindow(QDialog):
     def _show_section(self, title):
         self.text_view.setPlainText(
             HOW_TO_USE_SECTIONS.get(title, ""))
+
+
+class CommandApprovalDialog(QDialog):
+    """The run_command gate (v0.8): the exact command the model
+    wants to run, and where it will run. Run is never the default
+    button — Cancel is — and nothing runs unless the user clicks
+    Run. The user approves commands here; they never open a
+    terminal."""
+
+    def __init__(self, command, cwd, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Run this command?")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "The model wants to run this command. It runs only "
+            "if you press Run.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.command_view = QPlainTextEdit(command)
+        self.command_view.setReadOnly(True)
+        self.command_view.setMaximumHeight(110)
+        layout.addWidget(self.command_view)
+        where = QLabel(f"It will run in this folder: {cwd}")
+        where.setWordWrap(True)
+        layout.addWidget(where)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.run_button = QPushButton("Run")
+        self.run_button.setToolTip("Run this command now")
+        self.run_button.clicked.connect(self.accept)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setToolTip("Do not run it")
+        self.cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(self.run_button)
+        buttons.addWidget(self.cancel_button)
+        layout.addLayout(buttons)
+        self.cancel_button.setDefault(True)
+        self.cancel_button.setFocus()
+
+
+class BrowserWindow(QDialog):
+    """The browser view (v0.8): what the model's web tools are
+    doing, live — the current search or page, the text Forge
+    Browser brought back, a screenshot when one comes back, and
+    a button that opens the real Forge Browser on the same page.
+    """
+
+    open_requested = Signal(str)  # URL to open in Forge Browser
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Browser view")
+        self.setMinimumSize(560, 420)
+        self.resize(680, 520)
+        restore_window_geometry(
+            get_settings(), "browser_window", self)
+        self._current_url = ""
+        layout = QVBoxLayout(self)
+        self.status_label = QLabel("Nothing has been looked up yet.")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self.url_label = QLabel("")
+        self.url_label.setWordWrap(True)
+        layout.addWidget(self.url_label)
+        self.screenshot_label = QLabel()
+        self.screenshot_label.setVisible(False)
+        layout.addWidget(self.screenshot_label)
+        self.content_view = QTextEdit()
+        self.content_view.setReadOnly(True)
+        layout.addWidget(self.content_view, 1)
+        buttons = QHBoxLayout()
+        self.open_button = QPushButton("Open in Forge Browser")
+        self.open_button.setToolTip(
+            "Open this page in the real Forge Browser window")
+        self.open_button.setEnabled(False)
+        self.open_button.clicked.connect(
+            lambda: self.open_requested.emit(self._current_url))
+        buttons.addWidget(self.open_button)
+        buttons.addStretch(1)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+    def show_busy(self, text):
+        self.status_label.setText(text)
+
+    def show_search(self, query, text):
+        self.status_label.setText(f"Search results for: {query}")
+        self._current_url = ""
+        self.url_label.setText("")
+        self.screenshot_label.setVisible(False)
+        self.content_view.setPlainText(text)
+        self.open_button.setEnabled(False)
+
+    def show_page(self, url, title, markdown, screenshot=None):
+        self.status_label.setText(title or "Page")
+        self._current_url = url or ""
+        self.url_label.setText(url or "")
+        self.content_view.setPlainText(markdown or "")
+        shown = False
+        if screenshot:
+            pixmap = QPixmap(str(screenshot))
+            if not pixmap.isNull():
+                self.screenshot_label.setPixmap(pixmap.scaledToWidth(
+                    520, Qt.TransformationMode.SmoothTransformation))
+                shown = True
+        self.screenshot_label.setVisible(shown)
+        self.open_button.setEnabled(bool(url))
+
+    def hideEvent(self, event):  # noqa: N802 - Qt naming
+        save_window_geometry(
+            get_settings(), "browser_window", self)
+        super().hideEvent(event)
+
+    def closeEvent(self, event):  # noqa: N802 - Qt naming
+        save_window_geometry(
+            get_settings(), "browser_window", self)
+        super().closeEvent(event)
 
 
 class CommandPalette(QDialog):
@@ -2663,6 +3007,35 @@ class MainWindow(QMainWindow):
         self._chat_history = []
         self._current_reply = ""
 
+        # Saved chats (v0.8): the store, the open chat's id (None
+        # until its first save), its display messages (user,
+        # assistant and tool lines — the transcript kept as data),
+        # and a chat switch waiting for a streaming reply to stop.
+        self._chat_store = ChatStore()
+        self._current_chat_id = None
+        self._current_title = "New chat"
+        self._current_title_auto = True
+        self._current_created = None
+        self._display_messages = []
+        self._pending_chat_action = None
+        self._executor = None
+        self.browser_window = None
+        self._reply_name = "Model"
+        # Set when a model's tool path failed mid-turn and the
+        # turn fell back to a plain reply: tools stay off for the
+        # rest of this model's session.
+        self._tools_broken = False
+        # Whether the "Name: " prefix of the streaming reply has
+        # been written yet (tool lines can come before it in v0.8).
+        self._reply_prefix_done = False
+        # Instructions save a moment after typing stops, not on
+        # every keystroke.
+        self._instructions_timer = QTimer(self)
+        self._instructions_timer.setSingleShot(True)
+        self._instructions_timer.setInterval(800)
+        self._instructions_timer.timeout.connect(
+            self._save_current_chat)
+
         # Model tiles (bento grid): the scan runs off the UI thread
         # and the tiles fill in when it finishes.
         self._scan_worker = None
@@ -2780,6 +3153,9 @@ class MainWindow(QMainWindow):
         # and the same shortcuts are listed on the buttons and in
         # the command palette, so there is one set to learn.
         file_menu = self.menuBar().addMenu("File")
+        new_chat_action = file_menu.addAction("New chat")
+        new_chat_action.setShortcut(QKeySequence("Ctrl+N"))
+        new_chat_action.triggered.connect(self.new_chat)
         settings_action = file_menu.addAction("Settings")
         settings_action.setShortcut(QKeySequence("Ctrl+,"))
         settings_action.triggered.connect(self.show_settings)
@@ -2866,6 +3242,10 @@ class MainWindow(QMainWindow):
             ("Debug report", "", self.make_debug_report),
             ("Clear chat", "", self._clear_chat),
             ("Save chat", "Ctrl+S", self._save_chat),
+            ("New chat", "Ctrl+N", self.new_chat),
+            ("Rename chat", "", self.rename_chat),
+            ("Delete chat", "", self.delete_chat),
+            ("Browser view", "", self.show_browser_window),
             ("Check for updates", "",
              lambda: self.check_for_updates(manual=True)),
             ("Go to Models tab", "",
@@ -3125,7 +3505,78 @@ class MainWindow(QMainWindow):
 
     def _build_chat_tab(self):
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        layout = QHBoxLayout(tab)
+
+        # Saved chats (v0.8): the sidebar lists the chats saved
+        # on disk; a chat saves itself as the user talks, and
+        # clicking one reopens it.
+        sidebar = QWidget()
+        sidebar.setFixedWidth(216)
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(0, 0, 8, 0)
+        side_header = QHBoxLayout()
+        side_header.addWidget(QLabel("Chats"))
+        side_header.addStretch(1)
+        self.new_chat_button = QPushButton("New chat")
+        self.new_chat_button.setToolTip(
+            "Start a new chat (Ctrl+N)")
+        self.new_chat_button.clicked.connect(self.new_chat)
+        side_header.addWidget(self.new_chat_button)
+        side_layout.addLayout(side_header)
+        self.chat_list = QListWidget()
+        self.chat_list.setToolTip("Your saved chats")
+        self.chat_list.currentRowChanged.connect(
+            self._on_chat_list_row)
+        side_layout.addWidget(self.chat_list, 1)
+        chat_buttons = QHBoxLayout()
+        self.rename_chat_button = QPushButton("Rename")
+        self.rename_chat_button.setToolTip("Rename the open chat")
+        self.rename_chat_button.clicked.connect(self.rename_chat)
+        self.delete_chat_button = QPushButton("Delete")
+        self.delete_chat_button.setToolTip("Delete the open chat")
+        self.delete_chat_button.clicked.connect(self.delete_chat)
+        chat_buttons.addWidget(self.rename_chat_button)
+        chat_buttons.addWidget(self.delete_chat_button)
+        side_layout.addLayout(chat_buttons)
+        layout.addWidget(sidebar)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Instructions for this chat, and the tool controls: the
+        # instructions are saved with the chat and sent as its
+        # system prompt.
+        tools_row = QHBoxLayout()
+        tools_row.addWidget(QLabel("Instructions for this chat"))
+        tools_row.addStretch(1)
+        self.tools_folder_button = QPushButton("Tools folder...")
+        self.tools_folder_button.setToolTip(
+            "Pick the folder the model's file tools may use")
+        self.tools_folder_button.clicked.connect(
+            self._pick_tools_folder)
+        tools_row.addWidget(self.tools_folder_button)
+        self.browser_view_button = QPushButton("Browser view")
+        self.browser_view_button.setToolTip(
+            "See what the model's web tools are doing")
+        self.browser_view_button.clicked.connect(
+            self.show_browser_window)
+        tools_row.addWidget(self.browser_view_button)
+        right_layout.addLayout(tools_row)
+        self.instructions_edit = QPlainTextEdit()
+        self.instructions_edit.setPlaceholderText(
+            "Tell the model how to act in this chat, e.g. 'You "
+            "are a patient teacher. Keep answers short.' Saved "
+            "with the chat; empty means no instructions.")
+        self.instructions_edit.setMaximumHeight(58)
+        self.instructions_edit.textChanged.connect(
+            self._on_instructions_changed)
+        right_layout.addWidget(self.instructions_edit)
+        self.tools_status_label = QLabel("")
+        self.tools_status_label.setWordWrap(True)
+        self.tools_status_label.setStyleSheet(
+            "color: %s;" % current_tokens()["text_muted"])
+        right_layout.addWidget(self.tools_status_label)
 
         self.transcript = QTextEdit()
         self.transcript.setReadOnly(True)
@@ -3134,7 +3585,7 @@ class MainWindow(QMainWindow):
         # Drops fall through to the window (a .gguf dropped on the
         # transcript imports it); the text box never swallows one.
         self.transcript.setAcceptDrops(False)
-        layout.addWidget(self.transcript)
+        right_layout.addWidget(self.transcript)
 
         # Calm technology: the live numbers sit quietly in muted
         # text. They inform at a glance, they never shout.
@@ -3142,7 +3593,7 @@ class MainWindow(QMainWindow):
         self.stats_label.setWordWrap(True)
         self.stats_label.setStyleSheet(
             "color: %s;" % current_tokens()["text_muted"])
-        layout.addWidget(self.stats_label)
+        right_layout.addWidget(self.stats_label)
 
         # The attached picture, for the next message to a vision
         # model: shown only while one is attached.
@@ -3157,7 +3608,7 @@ class MainWindow(QMainWindow):
             self._remove_attachment)
         attach_row.addWidget(self.attachment_remove_button)
         attach_row.addStretch(1)
-        layout.addLayout(attach_row)
+        right_layout.addLayout(attach_row)
         self.attachment_label.setVisible(False)
         self.attachment_remove_button.setVisible(False)
 
@@ -3193,9 +3644,13 @@ class MainWindow(QMainWindow):
         row.addWidget(self.stop_button)
         row.addWidget(self.clear_button)
         row.addWidget(self.save_chat_button)
-        layout.addLayout(row)
+        right_layout.addLayout(row)
 
+        layout.addWidget(right, 1)
         self.tabs.addTab(tab, "Chat")
+        self._refresh_chat_list()
+        self._update_tools_status()
+
 
     # ------------------------------------------------------------ status
 
@@ -3903,6 +4358,8 @@ class MainWindow(QMainWindow):
         warning = result.get("warning", "")
         self._set_busy(False)
         self._refresh_stats()
+        self._tools_broken = False
+        self._update_tools_status()
         self._update_buttons()
         # Rebuild the cards so the loaded model becomes the hero
         # tile with its Loaded pill; otherwise the list still shows
@@ -3997,6 +4454,7 @@ class MainWindow(QMainWindow):
         self.controller.unload()
         self.load_time_s = None
         self._refresh_stats()
+        self._update_tools_status()
         self._update_buttons()
         # Rebuild the cards so the hero tile and Loaded pill go away.
         self._refresh_model_list()
@@ -4250,6 +4708,358 @@ class MainWindow(QMainWindow):
         self.attachment_label.setVisible(False)
         self.attachment_remove_button.setVisible(False)
 
+    # ------------------------------------------------------------ saved chats
+
+    def _save_current_chat(self):
+        """Save the open chat to its file (v0.8): the display
+        messages, the instructions, the title. A chat with nothing
+        in it and no instructions is not worth a file."""
+        instructions = self.instructions_edit.toPlainText()
+        if (not self._display_messages
+                and not instructions.strip()
+                and self._current_chat_id is None
+                and self._current_title_auto):
+            return
+        title = self._current_title
+        if self._current_title_auto:
+            first_user = next(
+                (m for m in self._display_messages
+                 if m["role"] == "user"), None)
+            if first_user is not None:
+                title = auto_title(
+                    first_user["content"].split("\n")[0])
+        record = {
+            "id": self._current_chat_id or "",
+            "title": title,
+            "title_auto": self._current_title_auto,
+            "created": self._current_created or 0,
+            "instructions": instructions,
+            "model": self.controller.current_name or "",
+            "messages": list(self._display_messages),
+        }
+        try:
+            saved = self._chat_store.save(record)
+        except (OSError, ValueError):
+            return
+        self._current_chat_id = saved["id"]
+        self._current_title = saved["title"]
+        self._current_created = saved["created"]
+        self._refresh_chat_list()
+
+    def _refresh_chat_list(self):
+        """Rebuild the sidebar list from the chats on disk,
+        newest first, with the open chat selected."""
+        if not hasattr(self, "chat_list"):
+            return
+        self._refreshing_chats = True
+        try:
+            self.chat_list.clear()
+            selected = -1
+            for index, summary in enumerate(
+                    self._chat_store.list_chats()):
+                item = QListWidgetItem(summary["title"])
+                item.setData(Qt.ItemDataRole.UserRole,
+                             summary["id"])
+                item.setToolTip(summary["title"])
+                self.chat_list.addItem(item)
+                if summary["id"] == self._current_chat_id:
+                    selected = index
+            self.chat_list.setCurrentRow(selected)
+        finally:
+            self._refreshing_chats = False
+        has_chat = self._current_chat_id is not None
+        self.rename_chat_button.setEnabled(has_chat)
+        self.delete_chat_button.setEnabled(has_chat)
+
+    def _on_chat_list_row(self, row):
+        if getattr(self, "_refreshing_chats", False) or row < 0:
+            return
+        item = self.chat_list.item(row)
+        if item is None:
+            return
+        chat_id = item.data(Qt.ItemDataRole.UserRole)
+        if not chat_id or chat_id == self._current_chat_id:
+            return
+        self._request_chat_action(("open", chat_id))
+
+    def _request_chat_action(self, action):
+        """Switch chats, now or after the streaming reply stops:
+        a switch never silently loses a reply in progress — it
+        follows the same Stop path the Stop button uses."""
+        if self.chat_worker is not None:
+            self._pending_chat_action = action
+            self._stop_reply()
+            self._show_status(
+                "Stopping the reply, then switching chats...")
+            return
+        self._run_chat_action(action)
+
+    def _run_pending_chat_action(self):
+        action = self._pending_chat_action
+        self._pending_chat_action = None
+        if action is not None:
+            self._run_chat_action(action)
+
+    def _run_chat_action(self, action):
+        if action[0] == "open":
+            self._open_chat(action[1])
+        elif action[0] == "new":
+            self._start_new_chat()
+
+    def new_chat(self):
+        """Start a fresh chat (the open one is already saved)."""
+        if self._current_chat_id is None \
+                and not self._display_messages \
+                and not self.instructions_edit.toPlainText():
+            self._show_status("This is already a new chat.")
+            return
+        self._request_chat_action(("new",))
+
+    def _start_new_chat(self):
+        self._save_current_chat()
+        self._reset_chat_state()
+        self._refresh_chat_list()
+        self._show_status("New chat started.")
+
+    def _reset_chat_state(self):
+        """Blank chat state: no open chat, empty transcript,
+        empty instructions, no history."""
+        self._current_chat_id = None
+        self._current_title = "New chat"
+        self._current_title_auto = True
+        self._current_created = None
+        self._display_messages = []
+        self._chat_history = []
+        self._current_reply = ""
+        self._last_stats = None
+        self.transcript.clear()
+        blocker = QSignalBlocker(self.instructions_edit)
+        self.instructions_edit.clear()
+        del blocker
+        self._refresh_stats()
+
+    def _open_chat(self, chat_id):
+        self._save_current_chat()
+        record = self._chat_store.load(chat_id)
+        if record is None:
+            self._show_status("That chat could not be opened.")
+            self._refresh_chat_list()
+            return
+        self._reset_chat_state()
+        self._current_chat_id = record["id"]
+        self._current_title = record["title"]
+        self._current_title_auto = record["title_auto"]
+        self._current_created = record["created"] or None
+        self._display_messages = list(record["messages"])
+        self._chat_history = history_from_messages(
+            record["messages"])
+        blocker = QSignalBlocker(self.instructions_edit)
+        self.instructions_edit.setPlainText(record["instructions"])
+        del blocker
+        for message in record["messages"]:
+            if message["role"] == "user":
+                self.transcript.append(
+                    "You: %s" % message["content"])
+            elif message["role"] == "assistant":
+                name = message.get("name") or "Model"
+                self.transcript.append(
+                    "%s: %s" % (name, message["content"]))
+                self.transcript.append(TURN_DIVIDER)
+                self.transcript.append("")
+            else:
+                self.transcript.append(message["content"])
+        self._refresh_chat_list()
+        self._show_status("Chat opened: %s" % record["title"])
+
+    def rename_chat(self):
+        if self.chat_worker is not None:
+            self._show_status(
+                "Wait for the reply to finish first.")
+            return
+        if self._current_chat_id is None:
+            self._show_status("There is no chat open to rename.")
+            return
+        title, ok = QInputDialog.getText(
+            self, "Rename chat", "New name:",
+            text=self._current_title)
+        title = title.strip()
+        if not ok or not title:
+            return
+        self._current_title = title
+        self._current_title_auto = False
+        self._save_current_chat()
+        self._show_status("Chat renamed to %s." % title)
+
+    def delete_chat(self):
+        if self.chat_worker is not None:
+            self._show_status(
+                "Wait for the reply to finish first.")
+            return
+        if self._current_chat_id is None:
+            self._show_status("There is no chat open to delete.")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Delete chat")
+        box.setText(
+            "Delete the chat \"%s\"? This cannot be undone."
+            % self._current_title)
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        self._chat_store.delete(self._current_chat_id)
+        self._reset_chat_state()
+        self._refresh_chat_list()
+        self._show_status("Chat deleted.")
+
+    def _on_instructions_changed(self):
+        # Save a moment after typing stops; the text is read live
+        # at send time either way, so a change mid-conversation
+        # applies from the next message.
+        self._instructions_timer.start()
+
+    # ------------------------------------------------------------ tools
+
+    def _update_tools_status(self):
+        """The one plain line about tools for the loaded model:
+        on, with what; or off, because this model cannot."""
+        if not hasattr(self, "tools_status_label"):
+            return
+        if not self.controller.is_loaded:
+            self.tools_status_label.setText(
+                "Tools: load a model that can use tools to turn "
+                "them on for a chat.")
+        elif getattr(self.runner, "supports_tools", False) \
+                and not self._tools_broken:
+            self.tools_status_label.setText(
+                "Tools are on for this chat: files in the tools "
+                "folder, the web through Forge Browser, commands "
+                "(each one asks you first), the time, and a "
+                "calculator.")
+        else:
+            self.tools_status_label.setText(
+                "This model cannot use tools, so this chat is "
+                "plain chat: no tools are offered to it.")
+
+    def _tool_executor(self):
+        if self._executor is None:
+            self._executor = ToolExecutor(
+                get_tools_folder(),
+                forge_override=get_forge_browser_path() or None,
+                approve_command=None,
+                shots_dir=self._home / "browser-shots")
+        return self._executor
+
+    def _pick_tools_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Pick the tools folder", get_tools_folder())
+        if folder:
+            set_tools_folder(folder)
+            self._executor = None
+            self._show_status("Tools folder is now %s." % folder)
+
+    def show_browser_window(self):
+        """Open the browser view (and return it): what the web
+        tools are doing, live."""
+        if self.browser_window is None:
+            window = BrowserWindow(self)
+            window.open_requested.connect(
+                self._open_in_forge_browser)
+            self.browser_window = window
+        self.browser_window.show()
+        self.browser_window.raise_()
+        return self.browser_window
+
+    def _open_in_forge_browser(self, url):
+        if not url:
+            return
+        from .tools import ForgeBrowserClient, ToolFailure
+        client = ForgeBrowserClient(
+            override=get_forge_browser_path() or None)
+        try:
+            client.open_in_browser(url)
+        except ToolFailure as exc:
+            self._show_status(str(exc))
+
+    def _on_browser_event(self, kind, data):
+        """Web tool updates for the browser view (UI thread, via
+        the worker's signal)."""
+        window = self.browser_window
+        if window is None:
+            return
+        payload = data or {}
+        kind_of = payload.get("kind")
+        if kind_of == "busy":
+            window.show_busy(payload.get("text", "Working..."))
+        elif kind_of == "search":
+            window.show_search(payload.get("query", ""),
+                               payload.get("text", ""))
+        elif kind_of == "page":
+            window.show_page(payload.get("url", ""),
+                             payload.get("title", ""),
+                             payload.get("markdown", ""),
+                             payload.get("screenshot"))
+
+    def _tool_arg_summary(self, name, arguments):
+        """The short 'what it is doing' text for a tool call."""
+        arguments = arguments or {}
+        if name in ("read_file", "write_file"):
+            return str(arguments.get("path", ""))
+        if name == "list_folder":
+            return str(arguments.get("path") or ".")
+        if name == "calculate":
+            return str(arguments.get("expression", ""))
+        if name == "web_search":
+            return str(arguments.get("query", ""))
+        if name == "web_read":
+            return str(arguments.get("url", ""))
+        if name == "run_command":
+            return str(arguments.get("command", ""))
+        return ""
+
+    def _on_tool_event(self, kind, data):
+        """A tool call or its result, live in the transcript
+        (v0.8): the user always sees what the model did."""
+        data = data or {}
+        name = data.get("name", "")
+        if kind == "call":
+            detail = self._tool_arg_summary(
+                name, data.get("arguments"))
+            line = "Tool: %s" % name
+            if detail:
+                line = "%s - %s" % (line, detail)
+            self.transcript.append(line)
+            self._display_messages.append(
+                {"role": "tool", "name": name, "content": line})
+            if name in ("web_search", "web_read"):
+                window = self.show_browser_window()
+                window.show_busy("Working on: %s" % detail)
+        elif kind == "result":
+            line = "Result: %s" % data.get("summary", "")
+            self.transcript.append(line)
+            self._display_messages.append(
+                {"role": "tool", "name": name, "content": line})
+
+    def _on_approval_requested(self, command, cwd):
+        """The run_command gate, on the UI thread: the exact
+        command in a modal; only Run runs it."""
+        worker = self.chat_worker
+        dialog = CommandApprovalDialog(command, cwd, self)
+        approved = dialog.exec() == QDialog.DialogCode.Accepted
+        if worker is not None:
+            worker.resolve_approval(approved)
+
+    def _on_tools_fallback(self):
+        self._tools_broken = True
+        self._update_tools_status()
+        self._show_status(
+            "This model cannot use tools after all, so that reply "
+            "was written without them.")
+
+    # ------------------------------------------------------------ chat flow
+
     def send_message(self):
         if self.chat_worker is not None:
             return
@@ -4265,17 +5075,38 @@ class MainWindow(QMainWindow):
         # A picture goes with the message (a vision model only):
         # the transcript notes it, so the turn reads true later.
         images = []
+        user_content = text
         if self._attached_image is not None:
             images = [str(self._attached_image)]
             self.transcript.append(
                 "Image: %s" % self._attached_image.name)
+            user_content = "%s\nImage: %s" % (
+                text, self._attached_image.name)
             self._remove_attachment()
         # The reply carries the model name that wrote it (captured
         # now, so a model switch mid-session never mislabels it).
         name = self.controller.current_name or "Model"
-        self.transcript.append("%s: " % name)
+        self._reply_name = name
+        # Tools are offered when the loaded model can use them —
+        # and not on a picture turn: the vision path stays exactly
+        # the plain one.
+        use_tools = (
+            bool(getattr(self.runner, "supports_tools", False))
+            and not self._tools_broken
+            and not images)
+        if use_tools:
+            # Tool lines may come first; the "Name: " prefix is
+            # written when the first words of the answer arrive.
+            self._reply_prefix_done = False
+        else:
+            self.transcript.append("%s: " % name)
+            self._reply_prefix_done = True
         self._reply_in_progress = True
         self._current_reply = ""
+        self._display_messages.append(
+            {"role": "user", "content": user_content})
+        # The chat saves itself as the user talks (v0.8).
+        self._save_current_chat()
         self.log.action("chat sent (%d chars)" % len(text))
         self._set_busy(True)
         # The earlier turns go with the new message, trimmed to
@@ -4283,12 +5114,23 @@ class MainWindow(QMainWindow):
         # forgetting every turn.
         history = trim_history(self._chat_history)
         self._chat_history.append({"role": "user", "content": text})
-        self.chat_worker = ChatWorker(self.runner, text,
-                                      history=history,
-                                      images=images)
+        instructions = (
+            self.instructions_edit.toPlainText().strip() or None)
+        self.chat_worker = ChatWorker(
+            self.runner, text,
+            history=history,
+            images=images,
+            instructions=instructions,
+            executor=self._tool_executor() if use_tools else None)
         self.chat_worker.token.connect(self._on_chat_token)
         self.chat_worker.finished.connect(self._on_chat_finished)
         self.chat_worker.failed.connect(self._on_chat_failed)
+        self.chat_worker.tool_event.connect(self._on_tool_event)
+        self.chat_worker.web_event.connect(self._on_browser_event)
+        self.chat_worker.tools_fallback.connect(
+            self._on_tools_fallback)
+        self.chat_worker.approval_requested.connect(
+            self._on_approval_requested)
         self.chat_worker.start()
         self._update_buttons()
         self.stop_button.setEnabled(True)
@@ -4297,6 +5139,9 @@ class MainWindow(QMainWindow):
         self._refresh_stats()
 
     def _on_chat_token(self, piece):
+        if not self._reply_prefix_done:
+            self._reply_prefix_done = True
+            self.transcript.append("%s: " % self._reply_name)
         self._current_reply += piece
         cursor = self.transcript.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
@@ -4322,23 +5167,29 @@ class MainWindow(QMainWindow):
             self._end_turn("(Reply stopped.)")
             self._show_status("Reply stopped.")
             self._finish_turn()
+            self._run_pending_chat_action()
             return
         self._end_turn()
         self._last_stats = stats
         self._refresh_stats()
         self._show_status("Reply done.")
         self._finish_turn()
+        self._run_pending_chat_action()
 
     def _finish_turn(self):
         """Close a chat turn in the history: the reply (whole or
         partial) joins the conversation, trimmed to the budget,
-        so the next message carries it."""
+        so the next message carries it. The saved chat follows."""
         if self._current_reply:
             self._chat_history.append(
                 {"role": "assistant",
                  "content": self._current_reply})
             self._chat_history = trim_history(self._chat_history)
+            self._display_messages.append(
+                {"role": "assistant", "name": self._reply_name,
+                 "content": self._current_reply})
         self._current_reply = ""
+        self._save_current_chat()
         self._maybe_close_pending()
 
     def _on_chat_failed(self, message):
@@ -4354,8 +5205,11 @@ class MainWindow(QMainWindow):
         self._show_status(message)
         self.log.error("chat failed: %s", message)
         # A failed reply is not a turn: the model said nothing to
-        # remember, so only the partial text is dropped.
+        # remember, so only the partial text is dropped. The user
+        # message and any tool lines stay in the saved chat.
         self._current_reply = ""
+        self._save_current_chat()
+        self._run_pending_chat_action()
         self._maybe_close_pending()
 
     def _stop_reply(self):
@@ -4367,10 +5221,15 @@ class MainWindow(QMainWindow):
         """Clear the transcript. Nothing is saved, so nothing is
         lost: no confirm is needed (L5). The stats and the model's
         memory of the conversation go with it: numbers and history
-        describing a conversation that no longer exists would lie."""
+        describing a conversation that no longer exists would lie.
+        The saved chat is cleared with it (v0.8): Clear means the
+        chat is emptied, on screen and on disk."""
         self.transcript.clear()
         self._last_stats = None
         self._chat_history = []
+        self._display_messages = []
+        if self._current_chat_id is not None:
+            self._save_current_chat()
         self._refresh_stats()
 
     def _save_chat(self):
@@ -4559,6 +5418,9 @@ class MainWindow(QMainWindow):
         this one stays quiet (task 10)."""
         self._apply_theme()
         self._apply_density()
+        # The tool settings may have changed: the next tool turn
+        # builds a fresh executor from the saved settings.
+        self._executor = None
         if getattr(self, "_folder_message_shown", False):
             self._folder_message_shown = False
         else:

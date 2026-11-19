@@ -279,8 +279,8 @@ class MainWindowTests(GuiTestCase):
         file_items = [a.text() for a in menus["File"].actions()
                       if not a.isSeparator()]
         self.assertEqual(file_items,
-                         ["Settings", "Save chat", "Debug report",
-                          "Quit"])
+                         ["New chat", "Settings", "Save chat",
+                          "Debug report", "Quit"])
         models_items = [a.text() for a in menus["Models"].actions()]
         self.assertEqual(models_items,
                          ["Load selected model", "Pull models",
@@ -1765,11 +1765,11 @@ class WindowHeightTests(GuiTestCase):
         QTest.qWait(200)
         bottom = settings.save_button.geometry().bottom()
         self.assertLess(settings.height() - bottom, 30)
-        # The last help line is the update check's: the stretch
-        # between it and the buttons must stay small.
+        # The last help line is the Forge Browser folder's: the
+        # stretch between it and the buttons must stay small.
         helps = [label for label in settings.findChildren(QLabel)
                  if label.text().startswith(
-                     "Fyrn quietly asks GitHub")]
+                     "The model's web tools go through")]
         self.assertEqual(len(helps), 1)
         gap = (settings.save_button.geometry().top()
                - helps[0].geometry().bottom())
@@ -4100,12 +4100,12 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_manual_check_current_reports_up_to_date(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("current", "0.7"), manual=True)
+            window, self._result("current", "0.8"), manual=True)
         texts = [text for title, text in self.watcher.seen
                  if title == "Check for updates"]
         self.assertEqual(len(texts), 1)
         self.assertIn("up to date", texts[0])
-        self.assertIn("0.7", texts[0])
+        self.assertIn("0.8", texts[0])
 
     def test_manual_check_unknown_reports_the_reason(self):
         window = self.make_window()
@@ -4128,7 +4128,7 @@ class UpdateCheckGuiTests(GuiTestCase):
                  if title == "Update available"]
         self.assertEqual(len(texts), 1)
         self.assertIn("Fyrn 0.8 is out", texts[0])
-        self.assertIn("You have 0.7", texts[0])
+        self.assertIn("You have 0.8", texts[0])
         # The watcher clicks the default (No): nothing downloads.
         QTest.qWait(200)
         self.assertIsNone(window._update_download_worker)
@@ -4136,7 +4136,7 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_silent_check_current_is_silent(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("current", "0.7"), manual=False)
+            window, self._result("current", "0.8"), manual=False)
         self.assertEqual(self.watcher.seen, [])
 
     def test_silent_check_unknown_is_silent(self):
@@ -4160,7 +4160,7 @@ class UpdateCheckGuiTests(GuiTestCase):
 
         def slow_check(_version):
             time.sleep(1.0)
-            return self._result("current", "0.7")
+            return self._result("current", "0.8")
 
         with mock.patch("fyrn.updates.check_for_update",
                         side_effect=slow_check):

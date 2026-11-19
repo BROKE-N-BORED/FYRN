@@ -1,5 +1,79 @@
 # Changelog
 
+## Fyrn v0.8 (2026-11-19)
+
+Saved chats, instructions per chat, and tools the model can
+call mid-chat.
+
+- **Saved chats:** a chat saves itself as you talk, as a plain
+  JSON file in ~/.fyrn/chats (one file per chat). The new
+  sidebar on the Chat tab lists your chats, named from their
+  first message; click one to reopen it with its whole
+  conversation back in place. New chat is in the sidebar, the
+  File menu (Ctrl+N), and the command palette; Rename and
+  Delete work on the open chat, and Delete asks first with No
+  as the answer it lands on. A chat reopens with no model
+  loaded, or a different one: send, and the loaded model
+  answers with the saved conversation as its context.
+  Switching chats while a reply streams stops the reply first,
+  the same as pressing Stop — a switch never silently loses a
+  reply. Clear now empties the saved chat as well as the
+  screen.
+- **Instructions per chat:** the box above the transcript tells
+  the model how to act in that chat ("You are…", "Always…").
+  It is saved inside the chat file and sent as the chat's
+  system prompt; a change applies from your next message;
+  empty means no instructions.
+- **Tools:** a model whose own chat template carries tool
+  support can call tools mid-chat; Fyrn reads the support from
+  the loaded model's template, so a model that cannot use
+  tools simply chats as before, with one plain line on the
+  Chat tab saying so. Every call shows in the transcript as it
+  happens: the tool's name, what it did, and a short result
+  line. Up to five tool rounds per reply; Stop cancels the
+  whole loop. The tools:
+  - **Files** — read and write text files and list folders,
+    but only inside the tools folder (Settings, or the Tools
+    folder button on the Chat tab; default ~/Fyrn files).
+    A path that escapes the folder — .., a symlink, an
+    absolute path outside — is refused, and the refusal goes
+    back to the model and shows in the transcript. Reads are
+    capped at 64 KB and say when they are cut.
+  - **Web** — search and page reads go through Forge Browser,
+    the browser app already on this PC, through its command
+    line (search --json, fetch --json). Fyrn finds it in its
+    usual install place (~/.local/share/forge-browser-app) or
+    on PATH; Settings can point at a different folder. Without
+    Forge Browser, the web tools decline plainly in the
+    transcript and the rest still work.
+  - **Browser view** — a new window showing what the web
+    tools are doing: the current search or page, the text that
+    came back, a screenshot when Forge Browser returns one,
+    and an Open in Forge Browser button that opens the real
+    Forge Browser on the same page. It opens on its own when a
+    web tool runs, and from the Chat tab or the palette.
+  - **Run a command** — the model can propose a command; Fyrn
+    shows a modal with the exact command and the folder it
+    runs in (the tools folder), and it runs only when you
+    press Run — Cancel is the button it lands on. Output
+    (capped) goes back to the model and shows in the
+    transcript; 60-second limit. You never open a terminal:
+    the model runs commands, you approve them.
+  - **Time and calculator** — the current local date and
+    time, and a safe arithmetic evaluator (an AST walk, no
+    eval).
+- **Settings** gains the tools folder picker and the optional
+  Forge Browser folder. The command palette gains New chat,
+  Rename chat, Delete chat, and Browser view.
+- **Verified with a real model:** on the build machine, the
+  real LFM3 1.7B (the roster's tool seat) loaded under the
+  engine, reported tool support from its own template, and
+  made two real tool calls end to end: it called the
+  calculator for 17 * 24 and answered 408 from the result,
+  and it read a notes file with read_file and answered with
+  the launch code written in it. The full suite is 613 tests,
+  all passing (3 skipped: the opt-in real-engine tests).
+
 ## Fyrn v0.7 (2026-11-18)
 
 The engine bump: LFM3 loads now.
