@@ -1,5 +1,53 @@
 # Changelog
 
+## Fyrn v0.9 (2026-11-19)
+
+The bridge for other programs, a reply-length setting,
+honest fit badges, and idle auto-unload.
+
+- **The bridge:** a new Settings switch, "Let other programs
+  use Fyrn (bridge)", off by default. When it is on, Fyrn
+  serves Ollama-shaped calls on this PC only (127.0.0.1,
+  port 11434) while Fyrn is open, so a program that talks to
+  Ollama, such as Code Forge, can run its models through
+  Fyrn instead: one copy of the model in RAM, loaded and
+  unloaded by Fyrn. Fyrn still holds one model at a time: a
+  request naming another model loads it, and the same RAM
+  fit check applies. Your own chat always wins: a request
+  that arrives mid-reply is refused with a plain "busy"
+  error, never by taking the model away, and Fyrn will not
+  load, unload, or send while a bridge reply is running. If
+  something else already holds the port, the status line
+  says so and Fyrn runs on without the bridge. The full
+  contract for client builders is in BRIDGE.md.
+- **Reply length:** replies used to stop at 1024 tokens,
+  which cut long answers off. Settings now offers the cap:
+  512, 1024 (the standard), 2048, or 4096 tokens. It applies
+  to plain replies and to tool-using replies alike.
+- **Honest fit badges:** the fit check used to allow a flat
+  64 MB for the engine's working memory. Real loads measured
+  here show the engine's own buffers beyond the model file
+  and its KV cache run to about 713 MB on the largest
+  measured model (a 515 MB compute buffer alone on
+  qwen3.5:2b), so the allowance is now 768 MB, and the
+  no-header fallback rose from 512 MB to 1 GB. Badges and
+  the load check use the new figures: at 4 GB free, the
+  biggest models (minicpm5-heretic:2b, phi4-mini,
+  qwen3.5:4b) now honestly read Tight where they read Fits
+  before; at 6 GB free nothing in the roster changes.
+- **Idle auto-unload:** a Settings choice (Off, 15, 30, or
+  60 minutes; off by default). A loaded model that sits
+  unused for that long unloads itself to give its RAM back,
+  and the status line says it did. Sending a message,
+  loading a model, and bridge requests all count as use and
+  restart the wait; a reply or a bridge generation in
+  progress is never unloaded from under.
+- **Settings window:** the settings column now scrolls when
+  it is taller than the screen, instead of squeezing its
+  labels; Save and Cancel stay pinned at the bottom.
+- The update check, pull, installer, saved chats, and tools
+  are unchanged, and install.sh is byte-identical to v0.8.
+
 ## Fyrn v0.8 (2026-11-19)
 
 Saved chats, instructions per chat, and tools the model can

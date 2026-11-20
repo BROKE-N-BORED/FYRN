@@ -1177,5 +1177,73 @@ class RealToolCallTests(unittest.TestCase):
             self.assertIn("408", "".join(pieces))
         finally:
             runner.unload()
+class ReplyCapTests(unittest.TestCase):
+    """The reply-length cap (v0.9): one helper decides what an
+    unset or bad cap means, and the cap reaches the engine on
+    the plain path and the tool path alike."""
+
+    def test_reply_cap_defaults(self):
+        from fyrn.runner import reply_cap
+        self.assertEqual(reply_cap(None), MAX_GENERATION_TOKENS)
+        self.assertEqual(reply_cap(0), MAX_GENERATION_TOKENS)
+        self.assertEqual(reply_cap(-3), MAX_GENERATION_TOKENS)
+        self.assertEqual(reply_cap(True), MAX_GENERATION_TOKENS)
+        self.assertEqual(reply_cap("2048"),
+                         MAX_GENERATION_TOKENS)
+        self.assertEqual(reply_cap(2048), 2048)
+        self.assertEqual(reply_cap(1), 1)
+
+    def test_fake_runner_honours_and_records_the_cap(self):
+        runner = FakeRunner(
+            reply_text="one two three four five")
+        runner.load("/tmp/fake.gguf")
+        pieces = []
+        collect = pieces.append
+        runner.generate("hi", on_token=collect,
+                        max_tokens=2)
+        self.assertEqual("".join(pieces), "one two")
+        self.assertEqual(runner.last_max_tokens, 2)
+
+    def test_fake_runner_default_cap_is_the_old_default(self):
+        runner = FakeRunner(reply_text="one two three")
+        runner.load("/tmp/fake.gguf")
+        runner.generate("hi")
+        self.assertEqual(runner.last_max_tokens,
+                         MAX_GENERATION_TOKENS)
+
+    def test_fake_tool_path_honours_the_cap(self):
+        runner = FakeRunner(
+            supports_tools=True,
+            tool_script=[("text", "one two three four")])
+        runner.load("/tmp/fake.gguf")
+        pieces = []
+        collect = pieces.append
+        runner.generate_tools(
+            "hi", execute_tool=lambda name, args: ("", ""),
+            on_token=collect, max_tokens=3)
+        self.assertEqual("".join(pieces), "one two three")
+        self.assertEqual(runner.last_max_tokens, 3)
+
+    def test_llama_runner_passes_the_cap_to_the_engine(self):
+        FakeChatLlama.CREATED.clear()
+        module = types.ModuleType("llama_cpp")
+        module.Llama = FakeChatLlama
+        runner = LlamaRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "small.gguf"
+            path.write_bytes(b"x" * 2048)
+            with mock.patch.dict(sys.modules,
+                                 {"llama_cpp": module}):
+                runner.load(str(path))
+        runner.generate("hello", max_tokens=77)
+        _messages, max_tokens = FakeChatLlama.CREATED[0].calls[0]
+        self.assertEqual(max_tokens, 77)
+        # And with no cap asked for, the engine gets the
+        # default, exactly as before the setting existed.
+        runner.generate("hello again")
+        _messages, max_tokens = FakeChatLlama.CREATED[0].calls[1]
+        self.assertEqual(max_tokens, MAX_GENERATION_TOKENS)
+
+
 if __name__ == "__main__":
     unittest.main()

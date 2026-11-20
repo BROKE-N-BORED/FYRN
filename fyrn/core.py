@@ -11,10 +11,12 @@ from pathlib import Path
 
 APP_NAME = "Fyrn"
 
-# Working headroom a loaded model needs on top of its file size:
-# the prompt context and working memory. 512 MB covers a 4096-token
-# context on a 2B model with room to spare.
-HEADROOM_BYTES = 512 * 1024 * 1024
+# Fallback headroom for a model whose header carries no KV
+# numbers (an unreadable or older file): the measured working
+# memory (WORKING_BYTES) plus a typical 2B model's KV cache at
+# the app's context sizes. A model whose header CAN be read is
+# charged its real numbers instead (model_headroom_bytes).
+HEADROOM_BYTES = 1024 * 1024 * 1024
 
 # A model "fits" when what it needs stays under this share of free
 # RAM, leaving the desktop usable. Above that it is "tight" until it
@@ -108,9 +110,29 @@ def format_size(num_bytes) -> str:
 # ---------------------------------------------------------------- fit
 
 # Working memory a loaded model needs beyond its KV cache:
-# compute buffers and the like. Small and fixed; the KV cache is
-# the part that varies with the model and the context length.
-WORKING_BYTES = 64 * 1024 * 1024
+# the backend's compute buffer, its output buffer, and the
+# context's own bookkeeping. Fixed; the KV cache is the part
+# that varies with the model and the context length.
+#
+# Measured, not guessed (v0.9): the backend prints its own
+# buffer sizes at load, and the load's RSS delta was measured
+# in a fresh process per model. At n_ctx 2048 (the app uses
+# 2048/4096; the compute buffer grows only ~4 KiB per context
+# token, so 4096 adds ~8 MiB):
+#   Qwen3 0.6B   compute 316.77 MiB, output 0.58 MiB
+#   LFM3 1.7B    compute 282.02 MiB (v0.7's F3 measurement)
+#   Qwen3.5 2B   compute 515.02 MiB, recurrent state 19.27 MiB,
+#                output 0.95 MiB (allocations alone: 535 MiB)
+# Qwen3.5 2B's whole footprint beyond its file size and KV
+# cache measured ~713 MB by RSS delta: the allocations above
+# plus the graph reserve and context bookkeeping around them.
+# 768 MiB covers that worst measured case with slack for the
+# roster's bigger models. The old 64 MiB figure understated
+# every model by hundreds of MB, which made the fit badges
+# optimistic (v0.7's F3 follow-up). A cautious badge costs a
+# "tight" warning the user can load past; an optimistic one
+# costs an out-of-memory kill mid-load.
+WORKING_BYTES = 768 * 1024 * 1024
 
 # KV cache element size: the backend stores keys and values as
 # 16-bit floats (2 bytes each).

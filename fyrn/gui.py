@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
 
 from . import __version__
 from . import core
+from .bridge import BridgeService
 from .chats import ChatStore, auto_title, history_from_messages
 from .core import (HEADROOM_BYTES, ImportCancelled, ModelController,
                    ModelNotFoundError, ModelTooBigError, ensure_home,
@@ -203,6 +204,74 @@ def set_forge_browser_path(value):
     settings.sync()
 
 
+# The reply-length choices (v0.9): how long one reply may run,
+# in tokens, before the model is cut off. 1024 is the default
+# Fyrn has always used; a longer cap suits long answers, a
+# shorter one keeps a chatty model brief. The runner's own
+# default matches, so an unset setting changes nothing.
+REPLY_LENGTHS = (512, 1024, 2048, 4096)
+REPLY_LENGTH_DEFAULT = 1024
+
+
+def get_reply_length():
+    """The reply length cap in tokens (Settings window)."""
+    settings = get_settings()
+    value = settings.value("reply_length", REPLY_LENGTH_DEFAULT,
+                           type=int)
+    if value not in REPLY_LENGTHS:
+        return REPLY_LENGTH_DEFAULT
+    return value
+
+
+def set_reply_length(value):
+    settings = get_settings()
+    if value not in REPLY_LENGTHS:
+        value = REPLY_LENGTH_DEFAULT
+    settings.setValue("reply_length", int(value))
+    settings.sync()
+
+
+def get_bridge_enabled():
+    """Whether other programs on this PC may use Fyrn's engine
+    through the bridge (Settings window, v0.9). Off by default:
+    the bridge is an adapter that is only there when asked for,
+    and while it is off no port is bound at all."""
+    settings = get_settings()
+    return bool(settings.value("bridge_enabled", False,
+                               type=bool))
+
+
+def set_bridge_enabled(value):
+    settings = get_settings()
+    settings.setValue("bridge_enabled", bool(value))
+    settings.sync()
+
+
+# Idle auto-unload choices (v0.9), in minutes; 0 is Off. A model
+# left loaded and untouched for this long unloads itself, so
+# its RAM goes back to the PC. Off by default: a loaded model
+# stays loaded until the user unloads it, as Fyrn has always
+# behaved.
+IDLE_UNLOAD_CHOICES = (0, 15, 30, 60)
+
+
+def get_idle_unload_minutes():
+    """The idle auto-unload setting, in minutes (0 = off)."""
+    settings = get_settings()
+    value = settings.value("idle_unload_minutes", 0, type=int)
+    if value not in IDLE_UNLOAD_CHOICES:
+        return 0
+    return value
+
+
+def set_idle_unload_minutes(value):
+    settings = get_settings()
+    if value not in IDLE_UNLOAD_CHOICES:
+        value = 0
+    settings.setValue("idle_unload_minutes", int(value))
+    settings.sync()
+
+
 def current_tokens():
     """The active theme's tokens: high-contrast when that
     setting is on, the dark theme otherwise."""
@@ -292,13 +361,15 @@ HOW_TO_USE_SECTIONS = {
         "When the pull finishes, the model appears in the Models tab."
     ),
     "Settings": (
-        "Settings lives in the File menu. It has nine settings: "
+        "Settings lives in the File menu. It has twelve settings: "
         "the models folder, where pulled and imported models are "
         "kept; whether Ollama's already-downloaded models are "
         "listed; Reduce motion; Compact model list; High-contrast "
         "mode; the pull-complete chime mute; whether Fyrn "
         "checks for a newer release when it starts; the tools "
-        "folder; and an optional Forge Browser folder.\n\n"
+        "folder; an optional Forge Browser folder; the reply "
+        "length; the bridge for other programs; and idle "
+        "auto-unload.\n\n"
         "Press Browse to pick a different models folder, then Save. "
         "The Models tab switches to the new folder right away.\n\n"
         "Check Reduce motion if movement on screen bothers you: "
@@ -317,6 +388,19 @@ HOW_TO_USE_SECTIONS = {
         "is optional: Fyrn finds Forge Browser in its usual "
         "install place on its own, and the setting only matters "
         "when yours lives somewhere else.\n\n"
+        "Reply length caps how long one answer may be, in "
+        "tokens. The standard 1024 fits most chats; pick more "
+        "when long answers keep getting cut off.\n\n"
+        "Let other programs use Fyrn (bridge) lets programs on "
+        "this PC, such as Code Forge, run their models through "
+        "Fyrn instead of Ollama. It is off unless you turn it "
+        "on. Fyrn still holds one model at a time, and your own "
+        "chat always wins: a program asking mid-reply is told "
+        "to wait.\n\n"
+        "Unload an idle model frees the RAM on its own when a "
+        "loaded model has sat unused for the time you pick. "
+        "Sending a message, loading, and bridge requests all "
+        "count as use. It is off unless you turn it on.\n\n"
         "Everything else about how models run (threads, context "
         "size) is set by the program itself to fit this PC."
     ),
@@ -325,7 +409,9 @@ HOW_TO_USE_SECTIONS = {
         "Type a message and press Send (or Enter). The reply streams "
         "in as the model writes it. Press Stop to cut a reply short. "
         "Shift+Enter starts a new line without sending. Clear "
-        "empties the transcript.\n\n"
+        "empties the transcript. A reply stops on its own at the "
+        "reply length set in Settings; raise it there if long "
+        "answers keep getting cut off.\n\n"
         "Your chats save themselves as you talk. The list on the "
         "left of the Chat tab holds every saved chat, named from "
         "its first message. Click one to reopen it, with its whole "
@@ -518,7 +604,7 @@ class ChatWorker(QThread):
     approval_requested = Signal(str, str)  # command, working dir
 
     def __init__(self, runner, prompt, history=None, images=None,
-                 instructions=None, executor=None):
+                 instructions=None, executor=None, max_tokens=None):
         super().__init__()
         self.runner = runner
         self.prompt = prompt
@@ -526,6 +612,10 @@ class ChatWorker(QThread):
         self.images = list(images or [])
         self.instructions = instructions
         self.executor = executor
+        # The reply-length cap for this turn (the Settings value,
+        # read by the window at send time); None means the
+        # runner's default cap.
+        self.max_tokens = max_tokens
         self.cancel_event = threading.Event()
         self._approval_event = threading.Event()
         self._approval_answer = False
@@ -544,7 +634,8 @@ class ChatWorker(QThread):
                         on_token=emit_token,
                         on_event=lambda kind, data:
                             self.tool_event.emit(kind, data),
-                        cancel_event=self.cancel_event)
+                        cancel_event=self.cancel_event,
+                        max_tokens=self.max_tokens)
                 except ToolsUnsupportedError:
                     # The model's template cannot really do tools
                     # after all: this turn still gets its reply,
@@ -556,7 +647,8 @@ class ChatWorker(QThread):
                         cancel_event=self.cancel_event,
                         history=self.history,
                         images=self.images,
-                        instructions=self.instructions)
+                        instructions=self.instructions,
+                        max_tokens=self.max_tokens)
             else:
                 stats = self.runner.generate(
                     self.prompt,
@@ -564,7 +656,8 @@ class ChatWorker(QThread):
                     cancel_event=self.cancel_event,
                     history=self.history,
                     images=self.images,
-                    instructions=self.instructions)
+                    instructions=self.instructions,
+                    max_tokens=self.max_tokens)
         except GenerationCancelled:
             self.finished.emit({"stopped": True})
         except RunnerError as exc:
@@ -1845,7 +1938,22 @@ class SettingsWindow(QDialog):
         restored = restore_window_geometry(
             get_settings(), "settings_window", self)
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        # The settings column scrolls (v0.9): with the reply
+        # length, bridge, and idle-unload settings added, the
+        # column outgrew a 768 px screen, and capping the
+        # dialog height squeezed its labels instead. The
+        # column scrolls when it has to; Save and Cancel stay
+        # pinned below the scroll area, always reachable.
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.settings_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.settings_content = QWidget()
+        layout = QVBoxLayout(self.settings_content)
+        self.settings_scroll.setWidget(self.settings_content)
+        outer.addWidget(self.settings_scroll)
 
         label = QLabel("Models folder")
         layout.addWidget(label)
@@ -1975,7 +2083,63 @@ class SettingsWindow(QDialog):
         forge_help.setWordWrap(True)
         layout.addWidget(forge_help)
 
-        layout.addStretch(1)
+        reply_label = QLabel("Reply length")
+        layout.addWidget(reply_label)
+
+        self.reply_length_combo = QComboBox()
+        for tokens in REPLY_LENGTHS:
+            self.reply_length_combo.addItem(
+                "%d tokens" % tokens, tokens)
+        current_reply = get_reply_length()
+        self.reply_length_combo.setCurrentIndex(
+            REPLY_LENGTHS.index(current_reply))
+        layout.addWidget(self.reply_length_combo)
+
+        reply_help = QLabel(
+            "The longest one reply may be before the model is "
+            "cut off. Longer suits long answers; the model still "
+            "stops on its own when it is done, and Stop still "
+            "cuts a reply short.")
+        reply_help.setWordWrap(True)
+        layout.addWidget(reply_help)
+
+        self.bridge_check = QCheckBox(
+            "Let other programs use Fyrn (bridge)")
+        self.bridge_check.setChecked(get_bridge_enabled())
+        layout.addWidget(self.bridge_check)
+
+        bridge_help = QLabel(
+            "Off unless you turn it on. When it is on, programs "
+            "on this PC that speak to Ollama (like Code Forge "
+            "and STELLA) can use Fyrn's loaded models instead, "
+            "through this PC only (127.0.0.1, port 11434). One "
+            "model still runs at a time, shared with the chat "
+            "here. See BRIDGE.md in the program folder for the "
+            "details.")
+        bridge_help.setWordWrap(True)
+        layout.addWidget(bridge_help)
+
+        idle_label = QLabel("Unload an idle model")
+        layout.addWidget(idle_label)
+
+        self.idle_combo = QComboBox()
+        for minutes in IDLE_UNLOAD_CHOICES:
+            self.idle_combo.addItem(
+                "Off" if minutes == 0 else "After %d minutes"
+                % minutes, minutes)
+        current_idle = get_idle_unload_minutes()
+        self.idle_combo.setCurrentIndex(
+            IDLE_UNLOAD_CHOICES.index(current_idle))
+        layout.addWidget(self.idle_combo)
+
+        idle_help = QLabel(
+            "When a loaded model has sat idle for this long, "
+            "with no reply running and no other program using "
+            "it, Fyrn unloads it on its own to give its RAM "
+            "back, and the status line says so. Chatting, "
+            "loading, and bridge use all restart the wait.")
+        idle_help.setWordWrap(True)
+        layout.addWidget(idle_help)
 
         buttons = QHBoxLayout()
         self.save_button = QPushButton("Save")
@@ -1989,7 +2153,7 @@ class SettingsWindow(QDialog):
         buttons.addStretch(1)
         buttons.addWidget(self.save_button)
         buttons.addWidget(cancel_button)
-        layout.addLayout(buttons)
+        outer.addLayout(buttons)
 
         # Size the dialog from its content (task 1): the old
         # hardcoded 560x220 crushed it (labels clipped, Save and
@@ -1998,7 +2162,8 @@ class SettingsWindow(QDialog):
         # dialog stays freely resizable either way (no minimum
         # pins it to its content). The height is capped to the
         # screen, so a large system text size never makes a
-        # window taller than the display.
+        # window taller than the display; when the cap bites,
+        # the settings column scrolls instead of squeezing.
         #
         # The height comes from totalHeightForWidth at the real
         # width, not from sizeHint: the help labels wrap, and
@@ -2008,10 +2173,21 @@ class SettingsWindow(QDialog):
         # the buttons (the L10 gap the hugs test guards).
         self.setMinimumSize(480, 180)
         if not restored:
-            width = max(self.width(), self.sizeHint().width())
+            width = max(
+                self.width(),
+                self.settings_content.sizeHint().width())
             height = layout.totalHeightForWidth(width)
             if height <= 0:
                 height = self.sizeHint().height()
+            else:
+                # Add what the content height does not cover:
+                # the outer layout's margins and spacing, and
+                # the pinned button row.
+                margins = outer.contentsMargins()
+                height += (margins.top() + margins.bottom()
+                           + outer.spacing()
+                           + self.save_button.sizeHint()
+                           .height())
             screen = QApplication.primaryScreen()
             if screen is not None:
                 max_height = (screen.availableGeometry().height()
@@ -2069,6 +2245,10 @@ class SettingsWindow(QDialog):
         set_update_check(self.update_check.isChecked())
         set_tools_folder(self.tools_folder_edit.text())
         set_forge_browser_path(self.forge_path_edit.text().strip())
+        set_reply_length(
+            self.reply_length_combo.currentData())
+        set_bridge_enabled(self.bridge_check.isChecked())
+        set_idle_unload_minutes(self.idle_combo.currentData())
         # Only a real folder change is announced (task 10): a
         # settings-only save used to claim the folder had moved.
         if str(folder) != self._initial_folder:
@@ -3020,6 +3200,20 @@ class MainWindow(QMainWindow):
         self._pending_chat_action = None
         self._executor = None
         self.browser_window = None
+        # The bridge (v0.9): an optional Ollama-shaped adapter
+        # other programs on this PC can use, off by default.
+        # _sync_bridge starts and stops it as the setting says;
+        # None means it is not running.
+        self._bridge = None
+        # Idle auto-unload (v0.9): when the loaded model was
+        # last active (a send, a load, a finished reply, a
+        # bridge request), on a monotonic clock. A timer checks
+        # every 20 s; the check itself is _idle_unload_check.
+        self._last_activity = time.monotonic()
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setInterval(20000)
+        self._idle_timer.timeout.connect(self._idle_unload_check)
+        self._idle_timer.start()
         self._reply_name = "Model"
         # Set when a model's tool path failed mid-turn and the
         # turn fell back to a plain reply: tools stay off for the
@@ -3119,6 +3313,9 @@ class MainWindow(QMainWindow):
         self._refresh_model_list()
         self._refresh_stats()
         self._setup_tray()
+        # The bridge starts at launch when its setting is on;
+        # off (the default) binds no port at all.
+        self._sync_bridge()
 
     # ------------------------------------------------------------ menus
 
@@ -4289,6 +4486,13 @@ class MainWindow(QMainWindow):
                 or self.chat_worker is not None
                 or self.import_worker is not None):
             return
+        if self._bridge_generating():
+            # Loading would unload the model another program is
+            # mid-reply with: hold off, and say so.
+            self._show_status(
+                "Another program is using the model through "
+                "the bridge. Wait for it to finish.")
+            return
         path = self._selected_model_path()
         if path is None:
             self._show_status(
@@ -4354,6 +4558,7 @@ class MainWindow(QMainWindow):
 
     def _on_load_finished(self, result):
         self._drop_load_worker()
+        self._note_activity()
         self.load_time_s = result.get("load_time_s", 0.0)
         warning = result.get("warning", "")
         self._set_busy(False)
@@ -4441,6 +4646,122 @@ class MainWindow(QMainWindow):
             self.load_worker.cancel()
             self._show_status_persistent("Stopping the load...")
 
+    # ------------------------------------------------------------ bridge
+
+    def _note_activity(self):
+        """Restart the idle auto-unload wait: a send, a load, a
+        finished reply, or any bridge request. Called from the
+        bridge's HTTP threads too; a float assignment is all it
+        does, which is safe there."""
+        self._last_activity = time.monotonic()
+
+    def _bridge_models(self):
+        """The models the bridge can offer: the same list the
+        Models tab shows (the models folder, plus Ollama's
+        store when that setting is on), found fresh per request
+        so a pulled or imported model appears without a
+        restart."""
+        models, _skipped = scan_models(self.models_folder)
+        if get_show_ollama_models():
+            discovered, _warnings = discover_ollama_models()
+            seen = {str(m["path"]) for m in models}
+            for model in discovered:
+                if str(model["path"]) not in seen:
+                    models.append(model)
+                    seen.add(str(model["path"]))
+        return models
+
+    def _bridge_busy(self):
+        """True while the window is mid-reply, mid-tool-loop, or
+        mid-load: a bridge generation then waits its turn
+        (the bridge refuses it with a clear error)."""
+        return (self.chat_worker is not None
+                or self.load_worker is not None)
+
+    def _bridge_generating(self):
+        """True while another program's reply is being written
+        through the bridge: the window's own load, unload, and
+        send hold off, so the model is never yanked out from
+        under it."""
+        return (self._bridge is not None
+                and self._bridge.generating)
+
+    def _sync_bridge(self):
+        """Start or stop the bridge so it matches its setting.
+        A bridge that cannot start (its port is taken) says so
+        on the status line and stays off; Fyrn itself is
+        unaffected."""
+        want = get_bridge_enabled()
+        if want and self._bridge is None:
+            service = BridgeService(
+                self.controller, self._bridge_models,
+                is_busy_fn=self._bridge_busy,
+                max_tokens_fn=get_reply_length,
+                on_activity=self._note_activity,
+                version=__version__)
+            if service.start():
+                self._bridge = service
+                self._show_status(
+                    "Bridge on: other programs on this PC can "
+                    "use Fyrn on port %d." % service.port)
+                self.log.action("bridge started on port %d"
+                                % service.port)
+            else:
+                self._show_status_persistent(
+                    "The bridge could not start: %s"
+                    % service.start_error)
+                self.log.error("bridge failed to start: %s",
+                               service.start_error)
+        elif not want and self._bridge is not None:
+            self._bridge.stop()
+            self._bridge = None
+            self.log.action("bridge stopped")
+
+    # ------------------------------------------------------------ idle unload
+
+    def _idle_unload_check(self, now=None):
+        """Unload the model when it has sat idle past the
+        setting (v0.9). Runs on a timer; tests call it directly
+        with a chosen clock. Idle means: no reply streaming, no
+        load running, no bridge generation, and no activity
+        (send, load, finished reply, bridge request) inside
+        the wait. The status line says the model unloaded
+        itself, so the empty Chat tab never surprises."""
+        minutes = get_idle_unload_minutes()
+        if minutes <= 0:
+            return
+        if not self.controller.is_loaded:
+            return
+        if (self.chat_worker is not None
+                or self.load_worker is not None
+                or self._bridge_generating()):
+            return
+        if now is None:
+            now = time.monotonic()
+        if now - self._last_activity < minutes * 60:
+            return
+        name = self.controller.current_name or "model"
+        self._unload_now()
+        self._show_status_persistent(
+            "%s unloaded itself to free RAM (idle for %d "
+            "minutes)." % (name, minutes))
+        self.log.action("idle auto-unload: %s" % name)
+
+    def _unload_now(self):
+        """Unload the loaded model and refresh everything that
+        showed it. The caller adds its own status line."""
+        self.controller.unload()
+        self.load_time_s = None
+        self._refresh_stats()
+        self._update_tools_status()
+        self._update_buttons()
+        # Rebuild the cards so the hero tile and Loaded pill go away.
+        self._refresh_model_list()
+        # Back to the true hint: nothing is loaded, so chat needs a
+        # model first.
+        self.transcript.setPlaceholderText(
+            "Load a model first, then chat here.")
+
     def unload_model(self):
         if not self.controller.is_loaded:
             return
@@ -4450,20 +4771,15 @@ class MainWindow(QMainWindow):
             # Unload during a reply read as a broken button).
             self._show_status("Wait for the reply to finish first.")
             return
+        if self._bridge_generating():
+            self._show_status(
+                "Another program is using the model through "
+                "the bridge. Wait for it to finish.")
+            return
         name = self.controller.current_name or "model"
-        self.controller.unload()
-        self.load_time_s = None
-        self._refresh_stats()
-        self._update_tools_status()
-        self._update_buttons()
-        # Rebuild the cards so the hero tile and Loaded pill go away.
-        self._refresh_model_list()
+        self._unload_now()
         self._show_status("%s unloaded." % name)
         self.log.action("unload: %s" % name)
-        # Back to the true hint: nothing is loaded, so chat needs a
-        # model first.
-        self.transcript.setPlaceholderText(
-            "Load a model first, then chat here.")
 
     def _on_remove_requested(self, path):
         self._select_card(path)
@@ -5063,6 +5379,11 @@ class MainWindow(QMainWindow):
     def send_message(self):
         if self.chat_worker is not None:
             return
+        if self._bridge_generating():
+            self._show_status(
+                "Another program is using the model through "
+                "the bridge. Wait for it to finish.")
+            return
         if not self.controller.is_loaded:
             self._show_status(
                 "Load a model from the Models tab first.")
@@ -5070,6 +5391,7 @@ class MainWindow(QMainWindow):
         text = self.chat_input.text().strip()
         if not text:
             return
+        self._note_activity()
         self.chat_input.clear()
         self.transcript.append("You: %s" % text)
         # A picture goes with the message (a vision model only):
@@ -5121,7 +5443,8 @@ class MainWindow(QMainWindow):
             history=history,
             images=images,
             instructions=instructions,
-            executor=self._tool_executor() if use_tools else None)
+            executor=self._tool_executor() if use_tools else None,
+            max_tokens=get_reply_length())
         self.chat_worker.token.connect(self._on_chat_token)
         self.chat_worker.finished.connect(self._on_chat_finished)
         self.chat_worker.failed.connect(self._on_chat_failed)
@@ -5159,6 +5482,7 @@ class MainWindow(QMainWindow):
 
     def _on_chat_finished(self, stats):
         self._drop_chat_worker()
+        self._note_activity()
         self._reply_in_progress = False
         self._set_busy(False)
         self.stop_button.setEnabled(False)
@@ -5194,6 +5518,7 @@ class MainWindow(QMainWindow):
 
     def _on_chat_failed(self, message):
         self._drop_chat_worker()
+        self._note_activity()
         self._reply_in_progress = False
         self._set_busy(False)
         self.stop_button.setEnabled(False)
@@ -5421,6 +5746,9 @@ class MainWindow(QMainWindow):
         # The tool settings may have changed: the next tool turn
         # builds a fresh executor from the saved settings.
         self._executor = None
+        # The bridge toggle applies on save too: on starts it,
+        # off stops it, without a restart.
+        self._sync_bridge()
         if getattr(self, "_folder_message_shown", False):
             self._folder_message_shown = False
         else:
@@ -5696,6 +6024,12 @@ class MainWindow(QMainWindow):
                     "it finishes.")
             event.ignore()
             return
+        if self._bridge is not None:
+            # The bridge's port frees with the window; its
+            # threads are daemons besides, so this never blocks
+            # the close.
+            self._bridge.stop()
+            self._bridge = None
         if self.controller.is_loaded:
             self.controller.unload()
         super().closeEvent(event)

@@ -72,8 +72,11 @@ only change Fyrn's own code will still update in-app.
   like — whether Ollama's already-downloaded models are listed,
   a Reduce motion switch, Compact model list, High-contrast mode,
   the pull-complete chime mute, whether Fyrn checks for a
-  newer release when it starts, the tools folder, and an optional
-  Forge Browser folder. Everything else (threads,
+  newer release when it starts, the tools folder, an optional
+  Forge Browser folder, the reply length (how long one answer
+  may be, in tokens), the bridge for other programs, and idle
+  auto-unload (free the RAM on its own after 15, 30, or 60
+  unused minutes). Everything else (threads,
   context size) is set by the program itself to fit this PC.
 - **Chat tab:** load a model, type a message (Enter sends, Shift+Enter
   starts a new line), press Send. The reply streams in, and the
@@ -107,6 +110,14 @@ only change Fyrn's own code will still update in-app.
   only when you press Run. It can also ask for the current time
   and work out arithmetic. A model that cannot use tools just
   chats, exactly as before, and the Chat tab says so in one line.
+- **Bridge for other programs:** an optional setting lets other
+  programs on this PC (Code Forge, for one) run their models
+  through Fyrn instead of Ollama: Fyrn serves Ollama-shaped
+  calls on 127.0.0.1, port 11434, only while Fyrn is open.
+  Off by default. Fyrn still holds one model at a time, the
+  same RAM fit check applies, and your own chat always wins:
+  a program asking mid-reply is told to wait. The full
+  contract for client builders is in BRIDGE.md.
 - **Updates:** Fyrn quietly checks GitHub for a newer release when
   it starts, and says so only when one is out. Nothing downloads
   until you tap to update; the download is checked against the

@@ -963,5 +963,42 @@ class MoveToTrashTests(unittest.TestCase):
                           / "alpha.gguf").exists())
 
 
+class WorkingAllowanceTests(unittest.TestCase):
+    """The working allowance (v0.9) is the measured one: real
+    loads showed the engine's own buffers beyond file + KV run
+    to about 713 MB on the worst measured roster model, so the
+    allowance is 768 MB, not the old optimistic 64 MB."""
+
+    def test_allowance_is_the_measured_figure(self):
+        self.assertEqual(WORKING_BYTES, 768 * 1024 * 1024)
+
+    def test_a_model_near_the_line_flips_with_the_allowance(self):
+        # A model whose file + KV lands between the two
+        # allowances: the old 64 MB working figure called it a
+        # fit; the measured 768 MB figure honestly calls it
+        # tight.
+        from helpers import write_gguf_file
+        from fyrn.core import fit_status, model_headroom_bytes
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_gguf_file(
+                Path(tmp) / "kv.gguf",
+                {"general.architecture": "llama"},
+                numbers={"llama.block_count": 32,
+                         "llama.embedding_length": 2048,
+                         "llama.attention.head_count": 32,
+                         "llama.attention.head_count_kv": 8})
+            # KV here is 65,536 B/token: 128 MB at 2048 tokens.
+            headroom = model_headroom_bytes(path, 2048)
+        self.assertEqual(headroom,
+                         128 * 1024 * 1024 + WORKING_BYTES)
+        free = 4 * GB
+        size = int(2.5 * GB)
+        self.assertEqual(fit_status(size, free, headroom),
+                         "tight")
+        old_headroom = 128 * 1024 * 1024 + 64 * 1024 * 1024
+        self.assertEqual(fit_status(size, free, old_headroom),
+                         "fits")
+
+
 if __name__ == "__main__":
     unittest.main()

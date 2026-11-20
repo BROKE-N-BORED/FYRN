@@ -20,8 +20,22 @@ from .tools import TOOL_DEFINITIONS, parse_tool_calls
 # A reply never runs past this many tokens: a model that never
 # emits its stop token would otherwise run to context fill, which
 # is up to ~10 minutes on this PC. 1024 is a full answer from a
-# 2B model, and Stop still cuts it short.
+# 2B model, and Stop still cuts it short. This is the DEFAULT
+# cap; the reply-length setting (Settings) picks another one,
+# and every generate call takes it as max_tokens (v0.9).
 MAX_GENERATION_TOKENS = 1024
+
+
+def reply_cap(max_tokens):
+    """The token cap a generate call actually uses: the caller's
+    max_tokens when it is a positive int, the default cap
+    otherwise. One place decides, so the plain path, the tool
+    path, and the bridge can never disagree about what an unset
+    cap means."""
+    if isinstance(max_tokens, int) and not isinstance(
+            max_tokens, bool) and max_tokens > 0:
+        return max_tokens
+    return MAX_GENERATION_TOKENS
 
 # How many tool rounds one reply may take (model asks for tools,
 # gets the results, asks again) before it has to answer with what
@@ -171,7 +185,7 @@ class Runner:
 
     def generate(self, prompt, on_token=None, cancel_event=None,
                  history=None, images=None,
-                 instructions=None):
+                 instructions=None, max_tokens=None):
         """Stream a reply. Returns a stats dict.
 
         on_token is called with each piece of text as it arrives.
@@ -180,7 +194,9 @@ class Runner:
         model answers in context instead of forgetting every turn.
         images is a list of image file paths to send with the
         message; a model that cannot see raises RunnerError
-        instead of pretending to look at them.
+        instead of pretending to look at them. max_tokens caps
+        the reply length (the reply-length setting); None means
+        the default cap (MAX_GENERATION_TOKENS).
         Stats: tokens, elapsed_s, ttft_s (time to first token),
         tokens_per_sec.
         """
@@ -188,7 +204,8 @@ class Runner:
 
     def generate_tools(self, prompt, history=None, instructions=None,
                        images=None, execute_tool=None, on_token=None,
-                       on_event=None, cancel_event=None):
+                       on_event=None, cancel_event=None,
+                       max_tokens=None):
         """Reply with tools on offer (v0.8).
 
         The model may call tools mid-reply: each call is reported
@@ -197,8 +214,10 @@ class Runner:
         reported through on_event("result", {...}), and the result
         goes back to the model. After at most MAX_TOOL_ROUNDS
         rounds the final answer streams through on_token as usual.
-        Returns the same stats dict as generate(). Runners whose
-        model cannot do this raise ToolsUnsupportedError.
+        max_tokens caps each round and the final answer, the same
+        reply-length cap as generate(). Returns the same stats
+        dict as generate(). Runners whose model cannot do this
+        raise ToolsUnsupportedError.
         """
         raise ToolsUnsupportedError(
             "This model cannot use tools.")
@@ -240,6 +259,10 @@ class FakeRunner(Runner):
         self.last_history = None
         # The images the last generate() call received, same idea.
         self.last_images = None
+        # The reply cap the last generate call actually used
+        # (after reply_cap()): tests check the reply-length
+        # setting reached the runner.
+        self.last_max_tokens = None
 
     def load(self, path, progress_cb=None, cancel_event=None,
              display_name=None):
@@ -262,7 +285,7 @@ class FakeRunner(Runner):
 
     def generate(self, prompt, on_token=None, cancel_event=None,
                  history=None, images=None,
-                 instructions=None):
+                 instructions=None, max_tokens=None):
         if not self.is_loaded:
             raise RunnerError("No model is loaded.")
         if images and not self.supports_vision:
@@ -273,11 +296,14 @@ class FakeRunner(Runner):
         self.last_history = list(history or [])
         self.last_images = list(images or [])
         self.last_instructions = instructions
+        self.last_max_tokens = reply_cap(max_tokens)
         started = time.monotonic()
         if self.ttft_delay_s > 0:
             time.sleep(self.ttft_delay_s)
         ttft_s = time.monotonic() - started
-        words = self.reply_text.split(" ")
+        # The fake's words stand in for tokens: the cap cuts the
+        # reply short the way the real engine's cap does.
+        words = self.reply_text.split(" ")[:self.last_max_tokens]
         for index, word in enumerate(words):
             if cancel_event is not None and cancel_event.is_set():
                 raise GenerationCancelled("Reply stopped.")
@@ -296,7 +322,8 @@ class FakeRunner(Runner):
 
     def generate_tools(self, prompt, history=None, instructions=None,
                        images=None, execute_tool=None, on_token=None,
-                       on_event=None, cancel_event=None):
+                       on_event=None, cancel_event=None,
+                       max_tokens=None):
         if not self.is_loaded:
             raise RunnerError("No model is loaded.")
         if not self.supports_tools:
@@ -305,6 +332,7 @@ class FakeRunner(Runner):
         self.last_history = list(history or [])
         self.last_images = list(images or [])
         self.last_instructions = instructions
+        self.last_max_tokens = reply_cap(max_tokens)
         self.last_tool_messages = []
         started = time.monotonic()
         ttft_s = None
@@ -339,6 +367,9 @@ class FakeRunner(Runner):
         if self.ttft_delay_s > 0:
             time.sleep(self.ttft_delay_s)
         ttft_s = time.monotonic() - started
+        # The cap cuts the final answer short, words as tokens.
+        final_text = " ".join(
+            final_text.split(" ")[:self.last_max_tokens])
         if on_token is not None:
             on_token(final_text)
         elapsed_s = time.monotonic() - started
@@ -597,7 +628,7 @@ class LlamaRunner(Runner):
 
     def generate(self, prompt, on_token=None, cancel_event=None,
                  history=None, images=None,
-                 instructions=None):
+                 instructions=None, max_tokens=None):
         if not self.is_loaded or self._llm is None:
             raise RunnerError("No model is loaded.")
         if images and not self._vision:
@@ -636,7 +667,7 @@ class LlamaRunner(Runner):
             stream = self._llm.create_chat_completion(
                 messages=messages,
                 stream=True,
-                max_tokens=MAX_GENERATION_TOKENS,
+                max_tokens=reply_cap(max_tokens),
             )
             for chunk in stream:
                 if cancel_event is not None and cancel_event.is_set():
@@ -674,7 +705,8 @@ class LlamaRunner(Runner):
 
     def generate_tools(self, prompt, history=None, instructions=None,
                        images=None, execute_tool=None, on_token=None,
-                       on_event=None, cancel_event=None):
+                       on_event=None, cancel_event=None,
+                       max_tokens=None):
         """A reply with tools on offer (v0.8).
 
         Rounds of chat completion with the tool definitions: the
@@ -749,7 +781,7 @@ class LlamaRunner(Runner):
                     tools=TOOL_DEFINITIONS,
                     tool_choice="auto",
                     stream=False,
-                    max_tokens=MAX_GENERATION_TOKENS,
+                    max_tokens=reply_cap(max_tokens),
                 )
             except GenerationCancelled:
                 raise
@@ -784,7 +816,7 @@ class LlamaRunner(Runner):
                     response = self._llm.create_chat_completion(
                         messages=messages,
                         stream=False,
-                        max_tokens=MAX_GENERATION_TOKENS,
+                        max_tokens=reply_cap(max_tokens),
                     )
                     choices = response.get("choices") or []
                     message = (choices[0].get("message")

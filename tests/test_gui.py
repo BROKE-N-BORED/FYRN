@@ -947,8 +947,9 @@ class HoverDetailTests(GuiTestCase):
         tip = card.toolTip()
         self.assertIn("Full path: %s" % model["path"], tip)
         self.assertIn("Size: 2 KB", tip)
-        # 2 KB file + 512 MB headroom, rounded by format_size.
-        self.assertIn("Needs 512 MB of RAM, 8.0 GB free", tip)
+        # 2 KB file + the 1 GB fallback headroom (the file has
+        # no readable header), rounded by format_size.
+        self.assertIn("Needs 1.0 GB of RAM, 8.0 GB free", tip)
         self.assertIn("Fits: needs less than 3/4 of free RAM.", tip)
         card.deleteLater()
 
@@ -1758,20 +1759,23 @@ class WindowHeightTests(GuiTestCase):
         # band above the buttons; the v0.1.1 Reduce motion switch
         # filled it. Pin the tightness: the buttons end within a
         # layout margin of the window bottom, and the stretch
-        # between the last help line and the buttons is small.
+        # between the last help line and the end of the settings
+        # column is small. Since v0.9 the column scrolls, so the
+        # last gap is measured inside the scroll content.
         settings = SettingsWindow(self.models)
         self.windows.append(settings)
         settings.show()
         QTest.qWait(200)
         bottom = settings.save_button.geometry().bottom()
         self.assertLess(settings.height() - bottom, 30)
-        # The last help line is the Forge Browser folder's: the
-        # stretch between it and the buttons must stay small.
+        # The last help line is the idle-unload one: the stretch
+        # between it and the end of the column must stay small.
         helps = [label for label in settings.findChildren(QLabel)
                  if label.text().startswith(
-                     "The model's web tools go through")]
+                     "When a loaded model has sat idle")]
         self.assertEqual(len(helps), 1)
-        gap = (settings.save_button.geometry().top()
+        content = settings.settings_scroll.widget()
+        gap = (content.height()
                - helps[0].geometry().bottom())
         self.assertLess(gap, 30)
 
@@ -2437,10 +2441,11 @@ class KvCacheGuiTests(GuiTestCase):
         self.wait_scan(window)
         card = window.model_cards[str(self.models / "a.gguf")]
         tip = card.toolTip()
-        # Real headroom is ~64 MB (a tiny KV cache plus working
-        # memory), not the 512 MB fixed fallback.
-        self.assertIn("Needs 64", tip)
-        self.assertNotIn("512 MB", tip)
+        # Real headroom is ~768 MB (a tiny KV cache plus the
+        # measured working allowance), not the 1 GB fixed
+        # fallback.
+        self.assertIn("Needs 768", tip)
+        self.assertNotIn("1.0 GB", tip)
 
 
 class PullQueueTests(GuiTestCase):
@@ -4100,12 +4105,12 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_manual_check_current_reports_up_to_date(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("current", "0.8"), manual=True)
+            window, self._result("current", "0.9"), manual=True)
         texts = [text for title, text in self.watcher.seen
                  if title == "Check for updates"]
         self.assertEqual(len(texts), 1)
         self.assertIn("up to date", texts[0])
-        self.assertIn("0.8", texts[0])
+        self.assertIn("0.9", texts[0])
 
     def test_manual_check_unknown_reports_the_reason(self):
         window = self.make_window()
@@ -4123,12 +4128,12 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_manual_check_newer_asks_and_no_means_no_download(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("newer"), manual=True)
+            window, self._result("newer", "0.10"), manual=True)
         texts = [text for title, text in self.watcher.seen
                  if title == "Update available"]
         self.assertEqual(len(texts), 1)
-        self.assertIn("Fyrn 0.8 is out", texts[0])
-        self.assertIn("You have 0.8", texts[0])
+        self.assertIn("Fyrn 0.10 is out", texts[0])
+        self.assertIn("You have 0.9", texts[0])
         # The watcher clicks the default (No): nothing downloads.
         QTest.qWait(200)
         self.assertIsNone(window._update_download_worker)
@@ -4136,7 +4141,7 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_silent_check_current_is_silent(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("current", "0.8"), manual=False)
+            window, self._result("current", "0.9"), manual=False)
         self.assertEqual(self.watcher.seen, [])
 
     def test_silent_check_unknown_is_silent(self):
@@ -4151,7 +4156,7 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_silent_check_newer_still_asks(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("newer"), manual=False)
+            window, self._result("newer", "0.10"), manual=False)
         self.assertTrue(any(title == "Update available"
                             for title, _text in self.watcher.seen))
 
@@ -4160,7 +4165,7 @@ class UpdateCheckGuiTests(GuiTestCase):
 
         def slow_check(_version):
             time.sleep(1.0)
-            return self._result("current", "0.8")
+            return self._result("current", "0.9")
 
         with mock.patch("fyrn.updates.check_for_update",
                         side_effect=slow_check):

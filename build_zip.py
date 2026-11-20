@@ -73,6 +73,7 @@ PLAIN_FILES = [
     "ci/run_suite.sh",
     "requirements.txt",
     "README.md",
+    "BRIDGE.md",
     "CHANGELOG.md",
     "LICENSE",
     ".gitignore",
@@ -92,6 +93,7 @@ PLAIN_FILES = [
     "fyrn/updates.py",
     "fyrn/chats.py",
     "fyrn/tools.py",
+    "fyrn/bridge.py",
     "fyrn/gui.py",
     "tests/__init__.py",
     "tests/helpers.py",
@@ -109,6 +111,8 @@ PLAIN_FILES = [
     "tests/test_chats.py",
     "tests/test_tools.py",
     "tests/test_gui_tools.py",
+    "tests/test_bridge.py",
+    "tests/test_gui_v09.py",
 ]
 
 
