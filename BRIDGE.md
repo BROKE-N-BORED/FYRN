@@ -46,11 +46,15 @@ and only matters while the bridge is on:
 Sharing exists for the phone deck: a small chat page the
 bridge serves at GET /deck (see below), so the user can
 chat with the PC's models from a phone on the same WiFi.
-While sharing is on, Settings shows the deck's address,
-http://<the PC's network address>:11434/deck, and its
-Phone deck button shows the same address as a QR code.
-When the PC's network address cannot be found, Fyrn says
-so instead of showing an address that would not work.
+The Phone deck button on the Models tab turns the bridge
+and sharing on together (both are saved) and shows the
+deck's address, http://<the PC's network
+address>:11434/deck, as a QR code; Settings shows the
+same address while sharing is on. The deck window only
+shows a code when the bridge is actually running shared:
+if the bridge cannot start, it says why instead. When
+the PC's network address cannot be found, Fyrn says so
+instead of showing an address that would not work.
 
 ## The rules a client must live with
 

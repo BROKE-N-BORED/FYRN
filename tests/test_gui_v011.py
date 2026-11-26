@@ -87,13 +87,16 @@ class ShareSettingsWindowTests(GuiTestCase):
         settings = SettingsWindow(self.models)
         self.windows.append(settings)
         settings.show()
-        # Off by default: no address, the button disabled.
+        # Off by default: no address in the field. The button
+        # itself is always ready (v0.12): pressing it turns
+        # the bridge and sharing on for real, so it no longer
+        # waits on this checkbox or on Save.
         self.assertFalse(settings.share_check.isChecked())
         self.assertEqual(settings.deck_url_edit.text(), "")
         self.assertEqual(
             settings.deck_url_edit.placeholderText(),
             "Sharing is off")
-        self.assertFalse(settings.deck_button.isEnabled())
+        self.assertTrue(settings.deck_button.isEnabled())
         # Turning it on fills the address and enables the
         # button.
         settings.share_check.setChecked(True)

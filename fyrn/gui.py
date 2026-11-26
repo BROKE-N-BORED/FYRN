@@ -30,7 +30,8 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
                                QMainWindow, QMenu, QMessageBox,
                                QPlainTextEdit, QProgressBar,
                                QProgressDialog, QPushButton, QScrollArea,
-                               QSizePolicy, QSpacerItem, QSystemTrayIcon,
+                               QSizePolicy, QSpacerItem, QStackedWidget,
+                               QSystemTrayIcon,
                                QTabWidget, QTextEdit, QToolTip,
                                QVBoxLayout, QWidget)
 
@@ -384,15 +385,17 @@ HOW_TO_USE_SECTIONS = {
         "When the pull finishes, the model appears in the Models tab."
     ),
     "Settings": (
-        "Settings lives in the File menu. It has twelve settings: "
-        "the models folder, where pulled and imported models are "
-        "kept; whether Ollama's already-downloaded models are "
-        "listed; Reduce motion; Compact model list; High-contrast "
-        "mode; the pull-complete chime mute; whether Fyrn "
-        "checks for a newer release when it starts; the tools "
-        "folder; an optional Forge Browser folder; the reply "
-        "length; the bridge for other programs; and idle "
-        "auto-unload.\n\n"
+        "Settings lives in the File menu. Its settings sit on "
+        "four pages, listed on the left of the window: Models "
+        "and downloads (the models folder, whether Ollama's "
+        "already-downloaded models are listed, and the "
+        "pull-complete chime mute); Chat and tools (the reply "
+        "length, idle auto-unload, the tools folder, and an "
+        "optional Forge Browser folder); Bridge and phone (the "
+        "bridge for other programs, and sharing for the phone "
+        "deck); and Display and updates (Reduce motion, Compact "
+        "model list, High-contrast mode, and whether Fyrn "
+        "checks for a newer release when it starts).\n\n"
         "Press Browse to pick a different models folder, then Save. "
         "The Models tab switches to the new folder right away.\n\n"
         "Check Reduce motion if movement on screen bothers you: "
@@ -420,15 +423,16 @@ HOW_TO_USE_SECTIONS = {
         "on. Fyrn still holds one model at a time, and your own "
         "chat always wins: a program asking mid-reply is told "
         "to wait.\n\n"
-        "Share Fyrn on my home network opens the bridge to "
-        "your home WiFi as well, so you can chat with your "
-        "models from your phone. Turn the bridge and sharing "
-        "on, then press the Phone deck button in Settings: it "
-        "shows the address to open on the phone and a QR code "
-        "that opens it. The phone and this PC must be on the "
-        "same WiFi. While sharing is on, anyone on your home "
-        "WiFi can use the models, so turn it off when you do "
-        "not need it.\n\n"
+        "The phone deck lets you chat with your models from "
+        "your phone. Press the Phone deck button on the Models "
+        "tab: it turns the bridge and sharing on for you, "
+        "saves both, and shows the address to open on the "
+        "phone and a QR code that opens it. The phone and "
+        "this PC must be on the same WiFi. While sharing is "
+        "on, anyone on your home WiFi can use the models, so "
+        "turn it off when you do not need it: Stop sharing in "
+        "the Phone deck window, or the Share checkbox on the "
+        "Bridge and phone page of Settings.\n\n"
         "Unload an idle model frees the RAM on its own when a "
         "loaded model has sat unused for the time you pick. "
         "Sending a message, loading, and bridge requests all "
@@ -1948,13 +1952,16 @@ class PullWindow(QDialog):
 class SettingsWindow(QDialog):
     """Settings: its own resizable pop-up window (U1).
 
-    The models folder, Reduce motion, the Ollama listing, and
-    the display, sound, and update settings: compact list,
-    high-contrast mode, the pull-complete chime mute, and the
-    startup update check. The window is resizable and
-    maximizable; it opens at its content size, unless a saved
-    size of the user's own exists (that one is honoured
-    exactly).
+    The settings sit on four pages with a list on the left
+    to move between them (v0.12): Models and downloads,
+    Chat and tools, Bridge and phone, and Display and
+    updates. The pages replaced the one long scrolling
+    column the settings had grown into by v0.11: nothing
+    scrolls now, every page fits the screen whole, and
+    Save and Cancel stay pinned below the pages, always
+    reachable. The window is resizable and maximizable;
+    it opens at its content size, unless a saved size of
+    the user's own exists (that one is honoured exactly).
     """
 
     folder_changed = Signal(str)
@@ -1971,21 +1978,23 @@ class SettingsWindow(QDialog):
             get_settings(), "settings_window", self)
 
         outer = QVBoxLayout(self)
-        # The settings column scrolls (v0.9): with the reply
-        # length, bridge, and idle-unload settings added, the
-        # column outgrew a 768 px screen, and capping the
-        # dialog height squeezed its labels instead. The
-        # column scrolls when it has to; Save and Cancel stay
-        # pinned below the scroll area, always reachable.
-        self.settings_scroll = QScrollArea()
-        self.settings_scroll.setWidgetResizable(True)
-        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.settings_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.settings_content = QWidget()
-        layout = QVBoxLayout(self.settings_content)
-        self.settings_scroll.setWidget(self.settings_content)
-        outer.addWidget(self.settings_scroll)
+        # The page shell (v0.12): a side list of the page
+        # names and the stack of pages beside it. Each
+        # section below goes on its page by rebinding the
+        # local `layout` as the pages are built, so every
+        # control keeps the construction it has always had.
+        body = QHBoxLayout()
+        self.page_list = QListWidget()
+        self.page_list.setToolTip("Pick a group of settings")
+        self.pages = QStackedWidget()
+        self.page_list.currentRowChanged.connect(
+            self.pages.setCurrentIndex)
+        body.addWidget(self.page_list)
+        body.addWidget(self.pages, 1)
+        outer.addLayout(body)
+        self.page_widgets = []
+
+        layout = self._add_page("Models and downloads")
 
         label = QLabel("Models folder")
         layout.addWidget(label)
@@ -2007,16 +2016,6 @@ class SettingsWindow(QDialog):
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
 
-        self.motion_check = QCheckBox("Reduce motion")
-        self.motion_check.setChecked(get_reduce_motion())
-        layout.addWidget(self.motion_check)
-
-        motion_help = QLabel(
-            "Less movement on screen. Animations become instant "
-            "instead.")
-        motion_help.setWordWrap(True)
-        layout.addWidget(motion_help)
-
         self.ollama_check = QCheckBox(
             "Show models Ollama already downloaded")
         self.ollama_check.setChecked(get_show_ollama_models())
@@ -2029,26 +2028,6 @@ class SettingsWindow(QDialog):
         ollama_help.setWordWrap(True)
         layout.addWidget(ollama_help)
 
-        self.compact_check = QCheckBox("Compact model list")
-        self.compact_check.setChecked(get_compact_list())
-        layout.addWidget(self.compact_check)
-
-        compact_help = QLabel(
-            "Smaller cards, more models on screen at once. The "
-            "description and facts stay in each card's tooltip.")
-        compact_help.setWordWrap(True)
-        layout.addWidget(compact_help)
-
-        self.contrast_check = QCheckBox("High-contrast mode")
-        self.contrast_check.setChecked(get_high_contrast())
-        layout.addWidget(self.contrast_check)
-
-        contrast_help = QLabel(
-            "Black and white with yellow highlights. Every bit of "
-            "text is at least 7 to 1 against its background.")
-        contrast_help.setWordWrap(True)
-        layout.addWidget(contrast_help)
-
         self.chime_check = QCheckBox(
             "Mute the pull-complete chime")
         self.chime_check.setChecked(get_chime_muted())
@@ -2060,17 +2039,7 @@ class SettingsWindow(QDialog):
         chime_help.setWordWrap(True)
         layout.addWidget(chime_help)
 
-        self.update_check = QCheckBox(
-            "Check for updates when Fyrn starts")
-        self.update_check.setChecked(get_update_check())
-        layout.addWidget(self.update_check)
-
-        update_help = QLabel(
-            "Fyrn quietly asks GitHub whether a newer release is "
-            "out when it starts, and says so only when one is. "
-            "Nothing downloads without asking first.")
-        update_help.setWordWrap(True)
-        layout.addWidget(update_help)
+        layout = self._add_page("Chat and tools")
 
         tools_label = QLabel("Tools folder")
         layout.addWidget(tools_label)
@@ -2135,6 +2104,30 @@ class SettingsWindow(QDialog):
         reply_help.setWordWrap(True)
         layout.addWidget(reply_help)
 
+        idle_label = QLabel("Unload an idle model")
+        layout.addWidget(idle_label)
+
+        self.idle_combo = QComboBox()
+        for minutes in IDLE_UNLOAD_CHOICES:
+            self.idle_combo.addItem(
+                "Off" if minutes == 0 else "After %d minutes"
+                % minutes, minutes)
+        current_idle = get_idle_unload_minutes()
+        self.idle_combo.setCurrentIndex(
+            IDLE_UNLOAD_CHOICES.index(current_idle))
+        layout.addWidget(self.idle_combo)
+
+        idle_help = QLabel(
+            "When a loaded model has sat idle for this long, "
+            "with no reply running and no other program using "
+            "it, Fyrn unloads it on its own to give its RAM "
+            "back, and the status line says so. Chatting, "
+            "loading, and bridge use all restart the wait.")
+        idle_help.setWordWrap(True)
+        layout.addWidget(idle_help)
+
+        layout = self._add_page("Bridge and phone")
+
         self.bridge_check = QCheckBox(
             "Let other programs use Fyrn (bridge)")
         self.bridge_check.setChecked(get_bridge_enabled())
@@ -2142,8 +2135,8 @@ class SettingsWindow(QDialog):
 
         bridge_help = QLabel(
             "Off unless you turn it on. When it is on, programs "
-            "on this PC that speak to Ollama (like Code Forge "
-            "and STELLA) can use Fyrn's loaded models instead, "
+            "on this PC that speak to Ollama (like Code Forge) "
+            "can use Fyrn's loaded models instead, "
             "through this PC only (127.0.0.1, port 11434). One "
             "model still runs at a time, shared with the chat "
             "here. See BRIDGE.md in the program folder for the "
@@ -2181,27 +2174,49 @@ class SettingsWindow(QDialog):
             lambda _on: self._refresh_deck_url())
         self._refresh_deck_url()
 
-        idle_label = QLabel("Unload an idle model")
-        layout.addWidget(idle_label)
+        layout = self._add_page("Display and updates")
 
-        self.idle_combo = QComboBox()
-        for minutes in IDLE_UNLOAD_CHOICES:
-            self.idle_combo.addItem(
-                "Off" if minutes == 0 else "After %d minutes"
-                % minutes, minutes)
-        current_idle = get_idle_unload_minutes()
-        self.idle_combo.setCurrentIndex(
-            IDLE_UNLOAD_CHOICES.index(current_idle))
-        layout.addWidget(self.idle_combo)
+        self.motion_check = QCheckBox("Reduce motion")
+        self.motion_check.setChecked(get_reduce_motion())
+        layout.addWidget(self.motion_check)
 
-        idle_help = QLabel(
-            "When a loaded model has sat idle for this long, "
-            "with no reply running and no other program using "
-            "it, Fyrn unloads it on its own to give its RAM "
-            "back, and the status line says so. Chatting, "
-            "loading, and bridge use all restart the wait.")
-        idle_help.setWordWrap(True)
-        layout.addWidget(idle_help)
+        motion_help = QLabel(
+            "Less movement on screen. Animations become instant "
+            "instead.")
+        motion_help.setWordWrap(True)
+        layout.addWidget(motion_help)
+
+        self.compact_check = QCheckBox("Compact model list")
+        self.compact_check.setChecked(get_compact_list())
+        layout.addWidget(self.compact_check)
+
+        compact_help = QLabel(
+            "Smaller cards, more models on screen at once. The "
+            "description and facts stay in each card's tooltip.")
+        compact_help.setWordWrap(True)
+        layout.addWidget(compact_help)
+
+        self.contrast_check = QCheckBox("High-contrast mode")
+        self.contrast_check.setChecked(get_high_contrast())
+        layout.addWidget(self.contrast_check)
+
+        contrast_help = QLabel(
+            "Black and white with yellow highlights. Every bit of "
+            "text is at least 7 to 1 against its background.")
+        contrast_help.setWordWrap(True)
+        layout.addWidget(contrast_help)
+
+        self.update_check = QCheckBox(
+            "Check for updates when Fyrn starts")
+        self.update_check.setChecked(get_update_check())
+        layout.addWidget(self.update_check)
+
+        update_help = QLabel(
+            "Fyrn quietly asks GitHub whether a newer release is "
+            "out when it starts, and says so only when one is. "
+            "Nothing downloads without asking first.")
+        update_help.setWordWrap(True)
+        layout.addWidget(update_help)
 
         buttons = QHBoxLayout()
         self.save_button = QPushButton("Save")
@@ -2221,41 +2236,59 @@ class SettingsWindow(QDialog):
         # hardcoded 560x220 crushed it (labels clipped, Save and
         # Cancel 9 px slivers). A saved geometry is honoured
         # exactly instead: it is the user's own size, and the
-        # dialog stays freely resizable either way (no minimum
-        # pins it to its content). The height is capped to the
-        # screen, so a large system text size never makes a
-        # window taller than the display; when the cap bites,
-        # the settings column scrolls instead of squeezing.
+        # dialog stays freely resizable either way. The size is
+        # capped to the screen, so a large system text size
+        # never makes a window bigger than the display.
         #
         # The height comes from totalHeightForWidth at the real
-        # width, not from sizeHint: the help labels wrap, and
-        # sizeHint measures them at the layout's narrow width
-        # (301 px), which overestimates the height by ~140 px at
-        # the dialog's real width and leaves a dead band above
-        # the buttons (the L10 gap the hugs test guards).
-        self.setMinimumSize(480, 180)
+        # page width, not from sizeHint: the help labels wrap,
+        # and sizeHint measures them at the layout's narrow
+        # width, which overestimates the height and leaves a
+        # dead band above the buttons (the L10 gap the hugs
+        # test guards). The tallest page sets the height: every
+        # page then fits whole, with no scrolling anywhere.
+        self.page_list.setCurrentRow(0)
+        self.setMinimumSize(600, 300)
+        list_width = self.page_list.sizeHint().width() + 8
+        self.page_list.setFixedWidth(list_width)
         if not restored:
-            width = max(
-                self.width(),
-                self.settings_content.sizeHint().width())
-            height = layout.totalHeightForWidth(width)
-            if height <= 0:
-                height = self.sizeHint().height()
-            else:
-                # Add what the content height does not cover:
-                # the outer layout's margins and spacing, and
-                # the pinned button row.
-                margins = outer.contentsMargins()
-                height += (margins.top() + margins.bottom()
-                           + outer.spacing()
-                           + self.save_button.sizeHint()
-                           .height())
+            margins = outer.contentsMargins()
+            page_width = 460
+            width = (margins.left() + margins.right()
+                     + body.spacing() + list_width + page_width)
+            height = 0
+            for page in self.page_widgets:
+                height = max(
+                    height,
+                    page.layout().totalHeightForWidth(page_width))
+            height += (margins.top() + margins.bottom()
+                       + outer.spacing()
+                       + self.save_button.sizeHint().height())
             screen = QApplication.primaryScreen()
             if screen is not None:
-                max_height = (screen.availableGeometry().height()
-                              - 40)
-                height = min(height, max_height)
+                available = screen.availableGeometry()
+                width = min(width, available.width() - 40)
+                height = min(height, available.height() - 40)
             self.resize(width, height)
+
+    def _add_page(self, title):
+        """One settings page (v0.12): a widget in the stack,
+        an entry of the same name in the side list, and the
+        layout its controls are built into. The page is also
+        kept as an attribute (models_page, chat_page,
+        bridge_page, display_page) for anything that needs to
+        reach it directly."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.pages.addWidget(page)
+        self.page_list.addItem(title)
+        self.page_widgets.append(page)
+        attr = {"Models and downloads": "models_page",
+                "Chat and tools": "chat_page",
+                "Bridge and phone": "bridge_page",
+                "Display and updates": "display_page"}[title]
+        setattr(self, attr, page)
+        return layout
 
     def hideEvent(self, event):  # noqa: N802 - Qt naming
         # Save on hide: Save and Cancel hide the dialog without a
@@ -2294,7 +2327,9 @@ class SettingsWindow(QDialog):
         checkbox (v0.11): the real address while sharing is
         on, an honest note in the field's placeholder when it
         is off or the address cannot be found. The Phone deck
-        button only works while sharing is on."""
+        button itself is always ready (v0.12): pressing it
+        turns the bridge and sharing on for real, so it no
+        longer waits on this checkbox or on Save."""
         if self.share_check.isChecked():
             url = deck_url(DEFAULT_PORT)
             if url:
@@ -2307,11 +2342,29 @@ class SettingsWindow(QDialog):
         else:
             self.deck_url_edit.setText("")
             self.deck_url_edit.setPlaceholderText("Sharing is off")
-        self.deck_button.setEnabled(
-            self.share_check.isChecked())
 
     def _show_phone_deck(self):
-        dialog = PhoneDeckDialog(deck_url(DEFAULT_PORT), self)
+        """The Phone deck button (v0.12): in the app it runs
+        the main window's one-tap flow, which turns the
+        bridge and sharing on, saves both, and only shows a
+        code for a bridge that is actually up. The checkboxes
+        are then refreshed to the state that was saved, so
+        what this window shows is what is true. Standing
+        alone, with no main window behind it, there is no
+        bridge to vouch for, and the dialog says so instead
+        of showing a code that would not work."""
+        opener = getattr(self.parent(), "open_phone_deck", None)
+        if callable(opener):
+            opener()
+            self.bridge_check.setChecked(get_bridge_enabled())
+            self.share_check.setChecked(get_bridge_share())
+            self._refresh_deck_url()
+            return
+        dialog = PhoneDeckDialog(
+            None, self,
+            problem="Sharing is not running, so there is no "
+                    "address to show. The Phone deck button on "
+                    "the Models tab turns it on.")
         dialog.exec()
 
     def _save(self):
@@ -2372,48 +2425,111 @@ def qr_pixmap(text, pixel_size=280):
 
 
 class PhoneDeckDialog(QDialog):
-    """The phone deck's address, big and scannable (v0.11).
+    """The phone deck's window: its whole control in one
+    place (v0.11, honest state v0.12).
 
-    Opened from Settings while sharing is on: the deck URL in
-    large selectable text, and a QR code encoding exactly
-    that URL, so the phone's camera does the typing. When the
-    PC's network address could not be found there is no code
-    to show, and the dialog says so instead of inventing an
-    address.
+    The window only ever shows what is true right now:
+
+    - Sharing verified up: the deck URL in large selectable
+      text and a QR code encoding exactly that URL, so the
+      phone's camera does the typing, plus a Stop sharing
+      button when the caller offers one.
+    - The bridge could not start (problem given): the plain
+      reason, a Try again button, and no code. A code for a
+      bridge that is not up is a dead end on the phone, and
+      v0.11's first real-PC run ended at exactly that dead
+      end, so this state exists.
+    - No address could be found: the dialog says so instead
+      of inventing one.
     """
 
-    def __init__(self, url, parent=None):
+    def __init__(self, url=None, parent=None,
+                 on_stop_sharing=None, problem=None):
         super().__init__(parent)
         self.setWindowTitle("Phone deck")
         self.deck_url = url
+        self.retry_requested = False
+        self._on_stop_sharing = on_stop_sharing
         layout = QVBoxLayout(self)
-        help_label = QLabel(
-            "On your phone, open this address in the browser, "
-            "or point the camera at the code. The phone and "
-            "this PC must be on the same WiFi, with the bridge "
-            "and sharing on.")
-        help_label.setWordWrap(True)
-        layout.addWidget(help_label)
-        self.url_label = QLabel(
-            url or "This PC's network address was not found, "
-                   "so there is no address to show.")
+        self.help_label = QLabel()
+        self.help_label.setWordWrap(True)
+        layout.addWidget(self.help_label)
+        self.url_label = QLabel()
+        self.url_label.setWordWrap(True)
         self.url_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        font = self.url_label.font()
-        font.setPointSize(max(14, font.pointSize() + 4))
-        font.setBold(True)
-        self.url_label.setFont(font)
         layout.addWidget(self.url_label)
-        if url:
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        self.close_button = QPushButton("Close")
+        self.close_button.setToolTip("Close this window")
+        self.close_button.clicked.connect(self.accept)
+        if problem is not None:
+            self.help_label.setText(
+                "Fyrn could not start sharing, so your phone "
+                "cannot reach it yet.")
+            self.url_label.setText(problem)
+            self.retry_button = QPushButton("Try again")
+            self.retry_button.setToolTip(
+                "Try starting sharing again")
+            self.retry_button.clicked.connect(self._retry)
+            buttons.addWidget(self.retry_button)
+        elif url:
+            self.help_label.setText(
+                "On your phone, open this address in the "
+                "browser, or point the camera at the code. "
+                "The phone and this PC must be on the same "
+                "WiFi.")
+            self.url_label.setText(url)
+            font = self.url_label.font()
+            font.setPointSize(max(14, font.pointSize() + 4))
+            font.setBold(True)
+            self.url_label.setFont(font)
             self.qr_label = QLabel()
             self.qr_label.setPixmap(qr_pixmap(url))
             self.qr_label.setAlignment(
                 Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(self.qr_label)
-        close_button = QPushButton("Close")
-        close_button.setToolTip("Close this window")
-        close_button.clicked.connect(self.accept)
-        layout.addWidget(close_button)
+            layout.insertWidget(2, self.qr_label)
+            if on_stop_sharing is not None:
+                self.stop_button = QPushButton("Stop sharing")
+                self.stop_button.setToolTip(
+                    "Turn sharing off: your phone can no "
+                    "longer reach Fyrn")
+                self.stop_button.clicked.connect(
+                    self._stop_sharing)
+                buttons.addWidget(self.stop_button)
+        else:
+            self.url_label.setText(
+                "This PC's network address was not found, "
+                "so there is no address to show.")
+        buttons.addWidget(self.close_button)
+
+    def _retry(self):
+        """Ask the caller to try starting the bridge again:
+        the window's open flow loops on this flag."""
+        self.retry_requested = True
+        self.accept()
+
+    def _stop_sharing(self):
+        """Stop sharing through the caller's callback (it
+        writes the setting off and rebinds the bridge), then
+        show the new true state: no address, no code."""
+        if self._on_stop_sharing is not None:
+            self._on_stop_sharing()
+        self.help_label.setText(
+            "The bridge still serves programs on this PC. "
+            "Press the Phone deck button on the Models tab "
+            "whenever you want sharing back.")
+        self.url_label.setText(
+            "Sharing is off. Your phone can no longer reach "
+            "Fyrn.")
+        font = self.url_label.font()
+        font.setBold(False)
+        self.url_label.setFont(font)
+        if hasattr(self, "qr_label"):
+            self.qr_label.hide()
+        self.stop_button.hide()
 
 
 class HowToUseWindow(QDialog):
@@ -3364,6 +3480,12 @@ class MainWindow(QMainWindow):
         # _sync_bridge starts and stops it as the setting says;
         # None means it is not running.
         self._bridge = None
+        # Why the bridge last failed to start, in plain words
+        # (v0.12): the phone deck dialog reads it to say why
+        # sharing could not start, instead of showing a code
+        # for a bridge that is not up. Empty when the last
+        # start worked, or none was tried.
+        self._bridge_start_error = ""
         # Idle auto-unload (v0.9): when the loaded model was
         # last active (a send, a load, a finished reply, a
         # bridge request), on a monotonic clock. A timer checks
@@ -3594,6 +3716,7 @@ class MainWindow(QMainWindow):
             ("Refresh list", "F5", self._refresh_model_list),
             ("Focus search", "Ctrl+F", self._focus_search),
             ("Settings", "Ctrl+,", self.show_settings),
+            ("Phone deck", "", self.open_phone_deck),
             ("How to Use", "F1", self.show_how_to_use),
             ("Debug report", "", self.make_debug_report),
             ("Clear chat", "", self._clear_chat),
@@ -3738,6 +3861,12 @@ class MainWindow(QMainWindow):
         self.remove_button.setToolTip(
             "Move the selected model to the trash (Delete)")
         self.remove_button.clicked.connect(self.remove_selected_model)
+        self.phone_deck_button = QPushButton("Phone deck")
+        self.phone_deck_button.setToolTip(
+            "Chat with your models from your phone: turns "
+            "sharing on and shows the code to scan")
+        self.phone_deck_button.clicked.connect(
+            self.open_phone_deck)
         self.load_cancel_button = QPushButton("Cancel load")
         self.load_cancel_button.setToolTip(
             "Stop loading this model")
@@ -3753,6 +3882,7 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.import_button)
         buttons.addWidget(self.pull_button)
         buttons.addWidget(self.remove_button)
+        buttons.addWidget(self.phone_deck_button)
         buttons.addWidget(self.load_cancel_button)
         buttons.addWidget(self.import_cancel_button)
         buttons.addStretch(1)
@@ -4890,6 +5020,7 @@ class MainWindow(QMainWindow):
                 version=__version__)
             if service.start():
                 self._bridge = service
+                self._bridge_start_error = ""
                 if getattr(service, "shared", False):
                     url = deck_url(service.port)
                     if url:
@@ -4908,6 +5039,7 @@ class MainWindow(QMainWindow):
                 self.log.action("bridge started on port %d"
                                 % service.port)
             else:
+                self._bridge_start_error = service.start_error
                 self._show_status_persistent(
                     "The bridge could not start: %s"
                     % service.start_error)
@@ -4916,7 +5048,64 @@ class MainWindow(QMainWindow):
         elif not want and self._bridge is not None:
             self._bridge.stop()
             self._bridge = None
+            self._bridge_start_error = ""
             self.log.action("bridge stopped")
+
+    # ------------------------------------------------------------ phone deck
+
+    def _enable_phone_deck(self):
+        """Turn the bridge and home-network sharing on, for
+        real (v0.12): both are written with their own setters,
+        so the state is saved and survives a restart, and the
+        bridge is synced to match. Returns the running shared
+        service, or None when it could not start (the reason
+        is then in _bridge_start_error). One tap does the
+        whole job the v0.11 Settings ritual spread over two
+        toggles and a Save."""
+        if not get_bridge_enabled():
+            set_bridge_enabled(True)
+        if not get_bridge_share():
+            set_bridge_share(True)
+        self._sync_bridge()
+        service = self._bridge
+        if (service is not None
+                and getattr(service, "running", False)
+                and getattr(service, "shared", False)):
+            return service
+        return None
+
+    def _stop_phone_deck_sharing(self):
+        """Stop sharing, from the deck dialog: the setting is
+        written off and the bridge rebinds to this PC only.
+        The bridge itself keeps its own toggle state, so
+        programs on this PC keep their bridge."""
+        set_bridge_share(False)
+        self._sync_bridge()
+        self.log.action("phone deck sharing turned off")
+
+    def open_phone_deck(self):
+        """The Phone deck button (v0.12): one tap does
+        everything. The bridge and sharing are turned on and
+        saved, the bridge is started shared, and the dialog
+        opens on the true state: the address and its code
+        only when the bridge is verified up and shared, and
+        a plain-words reason with another try when it is
+        not. No Settings trip, no Save button."""
+        while True:
+            service = self._enable_phone_deck()
+            if service is not None:
+                dialog = PhoneDeckDialog(
+                    deck_url(service.port), self,
+                    on_stop_sharing=(
+                        self._stop_phone_deck_sharing))
+            else:
+                problem = (self._bridge_start_error
+                           or "The bridge could not start.")
+                dialog = PhoneDeckDialog(
+                    None, self, problem=problem)
+            dialog.exec()
+            if not dialog.retry_requested:
+                break
 
     # ------------------------------------------------------------ idle unload
 

@@ -1,5 +1,47 @@
 # Changelog
 
+## Fyrn v0.12 (2026-11-26)
+
+A repair release for two defects v0.11 shipped with,
+both found the first night on a real PC. No reinstall
+needed: this release changes Fyrn's own code only (the
+engine is unchanged), so the in-app update check will
+offer it — or download and install as usual. install.sh
+is byte-identical to v0.11.
+
+- **The phone deck is one tap now.** In v0.11, reaching
+  the deck meant opening Settings, ticking the bridge,
+  ticking sharing, and pressing Save — and closing
+  Settings any other way silently threw the ticks away,
+  so the phone met a connection-refused page while Fyrn
+  looked set up. That is not how it was supposed to
+  work. The Models tab now has a Phone deck button: one
+  press turns the bridge and sharing on, saves both (so
+  they survive a restart), starts the bridge shared,
+  and opens the deck window. The same button lives in
+  Settings, on the Bridge and phone page.
+- **The deck window only shows what is true.** It shows
+  the address and QR code only when the bridge is
+  verified running and shared. If the bridge cannot
+  start (its port is taken, most likely), the window
+  says why in plain words and offers Try again — no
+  code for a bridge that is not up. A Stop sharing
+  button in the window turns sharing off again; the
+  bridge keeps serving programs on this PC.
+- **Settings is pages, not one long scroll.** The
+  settings had grown into a single scrolling column
+  that ran off the screen. They now sit on four pages
+  with a list on the left: Models and downloads, Chat
+  and tools, Bridge and phone, and Display and updates.
+  Nothing scrolls, every page fits the screen whole,
+  and every setting keeps its place, its meaning, and
+  its saved value.
+- The bridge's Settings description no longer names
+  STELLA as a program that uses the bridge. It never
+  was one; the words were wrong and are corrected.
+- The bridge itself is unchanged: same endpoints, same
+  rules, same contract in BRIDGE.md.
+
 ## Fyrn v0.11 (2026-11-25)
 
 The phone deck: your PC becomes the hub for your models,

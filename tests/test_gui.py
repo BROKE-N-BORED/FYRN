@@ -1760,22 +1760,24 @@ class WindowHeightTests(GuiTestCase):
         # band above the buttons; the v0.1.1 Reduce motion switch
         # filled it. Pin the tightness: the buttons end within a
         # layout margin of the window bottom, and the stretch
-        # between the last help line and the end of the settings
-        # column is small. Since v0.9 the column scrolls, so the
-        # last gap is measured inside the scroll content.
+        # between the last help line and the end of its page is
+        # small. Since v0.12 the settings sit on pages: the
+        # idle-unload help is the last line of the Chat and
+        # tools page, and the gap is measured inside that page.
         settings = SettingsWindow(self.models)
         self.windows.append(settings)
         settings.show()
+        settings.page_list.setCurrentRow(1)
         QTest.qWait(200)
         bottom = settings.save_button.geometry().bottom()
         self.assertLess(settings.height() - bottom, 30)
         # The last help line is the idle-unload one: the stretch
-        # between it and the end of the column must stay small.
+        # between it and the end of the page must stay small.
         helps = [label for label in settings.findChildren(QLabel)
                  if label.text().startswith(
                      "When a loaded model has sat idle")]
         self.assertEqual(len(helps), 1)
-        content = settings.settings_scroll.widget()
+        content = settings.chat_page
         gap = (content.height()
                - helps[0].geometry().bottom())
         self.assertLess(gap, 30)
