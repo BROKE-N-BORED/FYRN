@@ -152,6 +152,11 @@ class Runner:
 
     def __init__(self):
         self.model_path = None
+        # The context size the loaded model was loaded with, in
+        # tokens (None while nothing is loaded). The bridge
+        # compares a request's num_ctx against it and reports it
+        # (/api/show), so every runner records it at load.
+        self.context_tokens = None
 
     @property
     def is_loaded(self):
@@ -164,8 +169,12 @@ class Runner:
         return os.path.basename(str(self.model_path))
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None):
+             display_name=None, n_ctx=None):
         """Load a model file. Returns {"load_time_s": float}.
+
+        n_ctx is an optional context size in tokens (the
+        bridge's num_ctx); None means the runner picks the size
+        for this machine, as it always has.
 
         progress_cb(pct, msg) reports real progress only: pct is
         0-100 when the runner can measure its own progress, or -1
@@ -182,6 +191,25 @@ class Runner:
     def unload(self):
         """Unload the model and free its RAM."""
         self.model_path = None
+        self.context_tokens = None
+
+    def generate_turn(self, messages, tools=None, images=None,
+                      cancel_event=None, max_tokens=None):
+        """ONE chat turn with the client's tools on offer (the
+        bridge's pass-through, v0.10).
+
+        messages is the whole conversation in engine shape
+        (system, user, assistant — including assistant turns
+        carrying tool_calls — and tool results as role "tool"
+        entries). tools is the CLIENT's tool definitions, passed
+        to the model untouched: the runner never executes a tool
+        here. Returns {"content": str, "tool_calls": [{"id",
+        "name", "arguments"}], "stats": {...}}: either the model
+        answered in text, or it asked for tools and the calls are
+        the client's to run. A model whose template cannot take
+        tools answers in text, the way Ollama behaves.
+        """
+        raise NotImplementedError
 
     def generate(self, prompt, on_token=None, cancel_event=None,
                  history=None, images=None,
@@ -263,9 +291,15 @@ class FakeRunner(Runner):
         # (after reply_cap()): tests check the reply-length
         # setting reached the runner.
         self.last_max_tokens = None
+        # The n_ctx the last load was asked for (None = the
+        # runner's own pick), and what the last generate_turn
+        # call saw, for the bridge tests.
+        self.last_load_n_ctx = None
+        self.last_turn_messages = None
+        self.last_turn_tools = None
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None):
+             display_name=None, n_ctx=None):
         started = time.monotonic()
         name = display_name or os.path.basename(str(path))
         steps = 10
@@ -278,6 +312,9 @@ class FakeRunner(Runner):
             if step < steps and self.load_delay_s > 0:
                 time.sleep(self.load_delay_s / steps)
         self.model_path = str(path)
+        self.last_load_n_ctx = n_ctx
+        self.context_tokens = n_ctx if (
+            isinstance(n_ctx, int) and n_ctx > 0) else 2048
         return {"load_time_s": time.monotonic() - started}
 
     def unload(self):
@@ -379,6 +416,55 @@ class FakeRunner(Runner):
                 "ttft_s": ttft_s,
                 "tokens_per_sec": compute_tokens_per_sec(tokens,
                                                          elapsed_s)}
+
+    def generate_turn(self, messages, tools=None, images=None,
+                      cancel_event=None, max_tokens=None):
+        """One pass-through turn (v0.10), scripted like
+        generate_tools but WITHOUT executing anything: a leading
+        ("call", ...) step in tool_script is handed back as the
+        turn's tool_calls, for the caller to run. Once the
+        conversation carries a tool result, the fake answers in
+        text, the way a real model finishes the turn."""
+        if not self.is_loaded:
+            raise RunnerError("No model is loaded.")
+        if images and not self.supports_vision:
+            raise RunnerError(
+                "This model cannot see images. Load a vision "
+                "model (one with its projector file next to it) "
+                "to ask about a picture.")
+        self.last_turn_messages = list(messages or [])
+        self.last_turn_tools = tools
+        self.last_images = list(images or [])
+        self.last_max_tokens = reply_cap(max_tokens)
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled("Reply stopped.")
+        started = time.monotonic()
+        content = ""
+        calls = []
+        has_tool_result = any(
+            isinstance(m, dict) and m.get("role") == "tool"
+            for m in self.last_turn_messages)
+        scripted_call = next(
+            (step for step in self.tool_script
+             if step[0] == "call"), None)
+        if (tools and self.supports_tools and scripted_call
+                is not None and not has_tool_result):
+            _kind, name, arguments = scripted_call
+            calls = [{"id": "fake-call-1", "name": name,
+                      "arguments": arguments}]
+        else:
+            content = " ".join(
+                self.reply_text.split(" ")[:self.last_max_tokens])
+        elapsed_s = time.monotonic() - started
+        tokens = max(1, len(content.split())) if content else 1
+        return {"content": content,
+                "tool_calls": calls,
+                "stats": {"tokens": tokens,
+                          "elapsed_s": elapsed_s,
+                          "ttft_s": elapsed_s,
+                          "tokens_per_sec":
+                              compute_tokens_per_sec(tokens,
+                                                     elapsed_s)}}
 
 
 # Image types the attach dialog offers: PNG and JPEG are what
@@ -498,7 +584,7 @@ class LlamaRunner(Runner):
         return read_ram_bytes()[1]
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None):
+             display_name=None, n_ctx=None):
         # The name the user sees: an Ollama model's name, or the
         # file name. Progress and errors use it, never the blob
         # filename (task 11).
@@ -538,7 +624,14 @@ class LlamaRunner(Runner):
         if cancel_event is not None and cancel_event.is_set():
             raise LoadCancelled("Load cancelled.")
         threads = auto_threads()
-        context = auto_context_tokens(self._free_ram())
+        # A caller-chosen context (the bridge's num_ctx) wins
+        # over the machine pick, clamped so a nonsense value can
+        # never reach the engine: at least 128 tokens.
+        if isinstance(n_ctx, int) and not isinstance(
+                n_ctx, bool) and n_ctx > 0:
+            context = max(128, n_ctx)
+        else:
+            context = auto_context_tokens(self._free_ram())
         # The architecture, read once: the vision check below and
         # the unsupported-design error both need it (task 8).
         from .core import (VISION_ARCHITECTURES, find_projector,
@@ -608,6 +701,7 @@ class LlamaRunner(Runner):
         if progress_cb is not None:
             progress_cb(100, "Loaded")
         self.model_path = str(path)
+        self.context_tokens = context
         self._vision = chat_handler is not None
         self._tools = _template_supports_tools(self._llm)
         self.projector_path = (str(projector)
@@ -861,3 +955,126 @@ class LlamaRunner(Runner):
                     "name": call["name"],
                     "content": result,
                 })
+
+    def generate_turn(self, messages, tools=None, images=None,
+                      cancel_event=None, max_tokens=None):
+        """ONE chat turn with the CLIENT's tools on offer (the
+        bridge's pass-through, v0.10).
+
+        The same completion machinery generate_tools uses —
+        native tool_calls first, the text forms parsed from the
+        reply when the model wrote them as text — but the loop
+        stops after one round: the calls are returned to the
+        caller unexecuted, and the caller runs them and comes
+        back with the results as role "tool" messages. Nothing
+        here touches a file, a command, or Fyrn's own tool
+        definitions.
+
+        A model whose template cannot take tools gets one plain
+        completion instead and answers in text, the way Ollama
+        behaves with such a model. The conversation is the
+        client's to manage: unlike generate(), nothing is
+        trimmed here, so a tool call and its result can never be
+        split apart by a trim.
+        """
+        if not self.is_loaded or self._llm is None:
+            raise RunnerError("No model is loaded.")
+        if images and not self._vision:
+            raise RunnerError(
+                "This model cannot see images. Load a vision "
+                "model (one with its projector file next to it) "
+                "to ask about a picture.")
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled("Reply stopped.")
+        started = time.monotonic()
+        engine_messages = [dict(m) for m in (messages or [])
+                           if isinstance(m, dict)]
+        if images:
+            parts = []
+            attached = False
+            for index in range(len(engine_messages) - 1, -1, -1):
+                if engine_messages[index].get("role") == "user":
+                    text = engine_messages[index].get(
+                        "content") or ""
+                    parts = [{"type": "text", "text": text}]
+                    engine_messages[index] = {
+                        "role": "user", "content": parts}
+                    attached = True
+                    break
+            if not attached:
+                parts = [{"type": "text", "text": ""}]
+                engine_messages.append(
+                    {"role": "user", "content": parts})
+            for image_path in images:
+                try:
+                    url = _image_data_url(image_path)
+                except OSError as exc:
+                    raise RunnerError(
+                        "That picture could not be read (%s)."
+                        % exc)
+                parts.append({"type": "image_url",
+                              "image_url": {"url": url}})
+
+        def complete(with_tools):
+            kwargs = {"messages": engine_messages,
+                      "stream": False,
+                      "max_tokens": reply_cap(max_tokens)}
+            if with_tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+            response = self._llm.create_chat_completion(**kwargs)
+            choices = response.get("choices") or []
+            return (choices[0].get("message")
+                    if choices else None) or {}
+
+        try:
+            message = complete(bool(tools))
+        except GenerationCancelled:
+            raise
+        except Exception as exc:
+            if tools and _looks_like_tool_problem(exc):
+                # The template cannot take the tool surface:
+                # one plain completion, answered as text.
+                try:
+                    message = complete(False)
+                except Exception as exc2:
+                    raise RunnerError(
+                        "The model stopped with an error (%s)."
+                        % exc2)
+            else:
+                raise RunnerError(
+                    "The model stopped with an error (%s)." % exc)
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled("Reply stopped.")
+        calls = _native_tool_calls(message)
+        content = message.get("content") or ""
+        if not calls and content:
+            text_calls, has_calls = parse_tool_calls(content)
+            if has_calls:
+                calls = [{"id": "", "name": call["name"],
+                          "arguments": call["arguments"],
+                          "args_error": None}
+                         for call in text_calls]
+                # The calls were the reply: in Ollama's shape
+                # they ride as tool_calls, not as text.
+                content = ""
+        elapsed_s = time.monotonic() - started
+        counted = content
+        if calls:
+            counted += json.dumps(
+                [c.get("arguments") or {} for c in calls])
+        try:
+            tokens = len(self._llm.tokenize(
+                counted.encode("utf-8")))
+        except Exception:
+            tokens = max(1, len(counted) // 4)
+        return {"content": content,
+                "tool_calls": [{"id": c["id"], "name": c["name"],
+                                "arguments": c["arguments"]}
+                               for c in calls],
+                "stats": {"tokens": tokens,
+                          "elapsed_s": elapsed_s,
+                          "ttft_s": elapsed_s,
+                          "tokens_per_sec":
+                              compute_tokens_per_sec(tokens,
+                                                     elapsed_s)}}

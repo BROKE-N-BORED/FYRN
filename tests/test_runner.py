@@ -531,7 +531,7 @@ class DisplayNameTests(unittest.TestCase):
                 self.seen_name = None
 
             def load(self, path, progress_cb=None,
-                     cancel_event=None, display_name=None):
+                     cancel_event=None, display_name=None, n_ctx=None):
                 self.seen_name = display_name
                 return super().load(path, progress_cb,
                                     cancel_event, display_name)

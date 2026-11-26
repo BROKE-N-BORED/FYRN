@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
 
 from . import __version__
 from . import core
-from .bridge import BridgeService
+from .bridge import BridgeService, iso_seconds_from_now
 from .chats import ChatStore, auto_title, history_from_messages
 from .core import (HEADROOM_BYTES, ImportCancelled, ModelController,
                    ModelNotFoundError, ModelTooBigError, ensure_home,
@@ -4678,6 +4678,20 @@ class MainWindow(QMainWindow):
         return (self.chat_worker is not None
                 or self.load_worker is not None)
 
+    def _bridge_expires_at(self):
+        """When the loaded model would idle-unload, as an ISO
+        timestamp for the bridge's /api/ps (v0.10), or None
+        when idle auto-unload is off or nothing is loaded. The
+        projection assumes no further activity, which is what
+        the number means; any use restarts the wait and the
+        next /api/ps read projects the new moment."""
+        minutes = get_idle_unload_minutes()
+        if minutes <= 0 or not self.controller.is_loaded:
+            return None
+        remaining = (self._last_activity + minutes * 60
+                     - time.monotonic())
+        return iso_seconds_from_now(max(0.0, remaining))
+
     def _bridge_generating(self):
         """True while another program's reply is being written
         through the bridge: the window's own load, unload, and
@@ -4698,6 +4712,7 @@ class MainWindow(QMainWindow):
                 is_busy_fn=self._bridge_busy,
                 max_tokens_fn=get_reply_length,
                 on_activity=self._note_activity,
+                expires_at_fn=self._bridge_expires_at,
                 version=__version__)
             if service.start():
                 self._bridge = service

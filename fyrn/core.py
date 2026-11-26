@@ -984,8 +984,13 @@ class ModelController:
     def is_loaded(self):
         return self.current_path is not None
 
-    def check_before_load(self, path):
-        """RAM verdict for a model file, before loading it."""
+    def check_before_load(self, path, context_tokens=None):
+        """RAM verdict for a model file, before loading it.
+
+        context_tokens is the context the load will use when a
+        caller chose one (the bridge's num_ctx); the KV part of
+        the headroom is priced at that size, not the machine
+        pick."""
         path = Path(path)
         if not path.is_file():
             raise ModelNotFoundError(
@@ -1005,13 +1010,16 @@ class ModelController:
         # instead of a fixed guess. A vision model's projector
         # counts too: it loads alongside the model.
         from .runner import auto_context_tokens
-        headroom = model_headroom_bytes(
-            path, auto_context_tokens(free))
+        if not (isinstance(context_tokens, int)
+                and not isinstance(context_tokens, bool)
+                and context_tokens > 0):
+            context_tokens = auto_context_tokens(free)
+        headroom = model_headroom_bytes(path, context_tokens)
         return ram_check(size + projector_size_bytes(path),
                          free, headroom)
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None):
+             display_name=None, n_ctx=None):
         """Load a model, auto-unloading the previous one.
 
         Raises ModelTooBigError when the RAM check refuses, without
@@ -1019,17 +1027,20 @@ class ModelController:
         load_time_s and warning ("" when the fit is clean).
         display_name is the name the UI shows for the model (an
         Ollama model's name, for example); the file name is used
-        when it is not given.
+        when it is not given. n_ctx asks the runner for that
+        context size (the bridge's num_ctx); None keeps the
+        runner's own pick.
         """
         path = Path(path)
-        verdict, message = self.check_before_load(path)
+        verdict, message = self.check_before_load(
+            path, context_tokens=n_ctx)
         if verdict == "refuse":
             raise ModelTooBigError(message)
         if self.is_loaded:
             self.unload()
         result = self.runner.load(
             path, progress_cb=progress_cb, cancel_event=cancel_event,
-            display_name=display_name)
+            display_name=display_name, n_ctx=n_ctx)
         self.current_path = path
         self.current_name = display_name or path.name
         self.load_warning = message if verdict == "warn" else ""

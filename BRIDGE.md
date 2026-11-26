@@ -41,15 +41,25 @@ Closing Fyrn closes the bridge.
   reverse: Fyrn will not load, unload, or send while a bridge
   generation is running.
 - **One bridge generation at a time.** A second generate or
-  chat request while one is running gets the same 409.
+  chat request while one is running gets the same 409. A
+  request with tools or images is still one generation.
 - **The RAM fit check applies.** A model that does not fit
   the PC's free RAM is refused with HTTP 500 and the same
   wording the GUI would show. There is no force option.
-- **No tools.** Tool calls are a GUI feature. The bridge
-  never offers tools to the model and ignores tool-related
-  fields in requests.
-- **No images yet.** Image fields in chat messages are not
-  carried to the model. Text only.
+- **Tools pass through; the bridge never runs them.** A chat
+  request may carry `tools` (the client's own definitions).
+  They are offered to the model as they are, and the model's
+  tool calls come back in the reply's `message.tool_calls`.
+  The bridge itself executes nothing: no file access, no
+  commands, no approval prompts. The client runs the calls,
+  appends the results as `role: "tool"` messages, and calls
+  again — each HTTP request is exactly one model turn.
+- **Images are carried, or refused out loud.** A message's
+  `images` (base64) go to the model when the loaded model
+  can see (a vision model with its projector). When it
+  cannot, the request is refused with HTTP 400 and a plain
+  "cannot see pictures" error — an image is never silently
+  dropped.
 - **Stopping works like Ollama.** If the client disconnects
   mid-stream, Fyrn stops generating.
 
@@ -83,12 +93,33 @@ Ollama.
 ### GET /api/version
 
 ```json
-{"version": "0.9"}
+{"version": "0.10"}
 ```
 
 The value is Fyrn's own version, not Ollama's. A client
 that needs to know it is talking to Fyrn can check that
 this is a Fyrn version number.
+
+### GET /api/ps
+
+The model Fyrn currently holds, or an empty list:
+
+```json
+{"models": [
+  {"name": "qwen3:0.6b",
+   "model": "qwen3:0.6b",
+   "size": 522640096,
+   "digest": "sha256:7f4030...",
+   "expires_at": "2026-11-19T15:42:00.000000Z"}
+]}
+```
+
+`digest` appears only for Ollama-store models. `expires_at`
+appears only when Fyrn's idle auto-unload setting is on: it
+is the moment the model would unload itself if nothing else
+uses it (any use restarts the wait, and a later read then
+projects the new moment). /api/ps is a status read: asking
+does not count as use and never keeps a model alive.
 
 ### GET /
 
@@ -111,9 +142,26 @@ Request:
 - `prompt` (required): the text to complete.
 - `stream`: defaults to true, as in Ollama.
 - `system`: optional instructions for this reply.
+- `images`: optional list of base64 pictures (PNG or JPEG)
+  to send with the prompt. The loaded model must be a
+  vision model; a model that cannot see gets the request
+  refused with HTTP 400 (see the rules above).
 - `options.num_predict`: optional reply-length cap for
   this request. Without it, Fyrn's own reply-length
   setting applies.
+- `options.num_ctx`: optional context size in tokens. If
+  it differs from the size the model is loaded with, the
+  model is reloaded at the requested size first (the RAM
+  fit check prices the KV cache at that size). The value
+  is clamped to at least 128 and, when the model's GGUF
+  header names its trained context, to that.
+- `keep_alive`: the value 0 (or "0"/"0s") unloads the
+  model after this reply completes. An otherwise empty
+  request (no prompt) with `keep_alive: 0` unloads the
+  named model at once and answers `done` — Ollama's unload
+  idiom. Any other value is accepted and ignored: Fyrn's
+  idle auto-unload setting governs how long a model stays
+  loaded.
 
 Streaming response: one JSON object per line. Text lines:
 
@@ -157,11 +205,102 @@ empty and which carries the same timing fields as
 generate. Non-streaming returns one object with the full
 `message`.
 
+#### Tools (pass-through)
+
+Add `tools` — your own tool definitions in Ollama's shape
+(`[{"type": "function", "function": {"name": ...,
+"description": ..., "parameters": {...}}}]`) — and the
+request becomes one tool turn:
+
+- The definitions are offered to the model untouched. If
+  the model asks for tools, the reply's message carries
+  them: `"tool_calls": [{"function": {"name": "calculate",
+  "arguments": {"expression": "17 * 24"}}}]` (arguments as
+  an object), with the message content usually empty.
+- **The bridge does not run the calls.** Your program runs
+  them, then calls /api/chat again with the conversation
+  extended: the assistant turn carrying its `tool_calls`,
+  then one `{"role": "tool", "content": "<result>"}` message
+  per result. Fyrn feeds both back to the model, and the
+  next reply is the model's answer built on the results —
+  or another round of calls.
+- A model whose chat template has no tool support answers
+  in plain text, as Ollama does with such a model: the
+  reply simply has no `tool_calls`. The bridge never
+  invents calls a model did not make.
+- Tool turns do not stream piece by piece. With
+  `"stream": true` a tool turn arrives as one line carrying
+  the message (content and any `tool_calls`), then the
+  closing `"done": true` line.
+- `tools` on /api/generate is ignored: tool turns are a
+  chat-endpoint shape, as in Ollama.
+
+#### Images
+
+Any message may carry `images`: a list of base64 pictures
+(PNG or JPEG). They are sent with the conversation to the
+model, which must be a vision model (its projector loaded);
+a model that cannot see gets the whole request refused
+with HTTP 400 and an error saying the model cannot see
+pictures. Unreadable base64, or bytes that are neither PNG
+nor JPEG, are also a 400. The pictures are decoded to a
+temporary file inside Fyrn's home folder for the one
+request and deleted when the reply finishes.
+
+#### keep_alive and num_ctx on chat
+
+Chat takes the same `keep_alive` and `options.num_ctx` as
+generate, with the same meanings. The empty unload request
+on this endpoint is a body with the model, an empty
+`messages` list, and `keep_alive: 0`.
+
+### POST /api/show
+
+What Fyrn knows about one model. Request:
+`{"model": "qwen3:0.6b"}` (`name` is accepted too). Fyrn
+fills only what it can read honestly:
+
+```json
+{"name": "qwen3:0.6b",
+ "model": "qwen3:0.6b",
+ "size": 522640096,
+ "digest": "sha256:7f4030...",
+ "details": {"format": "gguf", "family": "qwen3",
+             "families": ["qwen3"],
+             "parameter_size": "0.6B",
+             "quantization_level": "Q4_K_M"},
+ "model_info": {"general.architecture": "qwen3",
+                "qwen3.context_length": 262144},
+ "loaded_context_tokens": 2048}
+```
+
+- `details.format` is always `"gguf"`; `details.family`
+  (and `families`) is the architecture from the GGUF
+  header, empty when the header cannot be read.
+  `parameter_size` and `quantization_level` appear when
+  the header carries them.
+- `model_info` carries `general.architecture` and
+  `"<arch>.context_length"`: the context the model was
+  TRAINED for, from its header.
+- `loaded_context_tokens` appears only when this model is
+  the one currently loaded: the context size it is
+  actually running with (Fyrn's machine pick, or a
+  request's `num_ctx`). A client budgeting context should
+  read the effective window from here when the model is
+  loaded, and from `model_info`'s trained length as the
+  ceiling when it is not.
+- An unknown model is a 404; a missing model name is a
+  400. /api/show is a status read: asking does not count
+  as use.
+
 ## Status codes
 
 - 200: fine.
 - 400: the request is malformed (bad JSON, no model, no
-  prompt, no user message).
+  prompt, no user message, tools that are not a list of
+  definitions), or it carries a picture the loaded model
+  cannot see, or picture data that is not readable base64
+  PNG/JPEG.
 - 404: the named model is not one Fyrn can see, or the
   path is not a bridge endpoint.
 - 409: busy. The GUI is mid-reply or mid-tool-loop, or

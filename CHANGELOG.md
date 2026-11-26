@@ -1,5 +1,62 @@
 # Changelog
 
+## Fyrn v0.10 (2026-11-20)
+
+The bridge learns to pass tools through, carry pictures,
+report what is loaded, and take context instructions —
+the gaps the Code Forge thread flagged in the v0.9 bridge
+contract. No reinstall needed: this release changes Fyrn's
+own code only (the engine is unchanged), so the in-app
+update check will offer it — or download and install as
+usual. install.sh is byte-identical to v0.9.
+
+- **Tools pass through the bridge:** a /api/chat request
+  can now carry the client's own tool definitions. They
+  are offered to the model as they are, and the model's
+  tool calls come back in the reply's `message.tool_calls`,
+  in Ollama's shape. The bridge never runs a tool: running
+  them stays the client program's job, with its own files
+  and approvals — each request is one model turn, the
+  client appends the results as `role: "tool"` messages
+  and calls again, and Fyrn feeds the whole conversation
+  back. A model whose chat template has no tool support
+  answers in plain text, the way Ollama behaves with such
+  a model; the bridge never invents a call. Fyrn's own
+  in-chat tools are unchanged and are not involved.
+- **Pictures through the bridge:** chat messages (and
+  generate requests) can carry base64 `images` again —
+  this time for real. A vision model receives them through
+  the same projector path as the Chat tab's Attach button.
+  A model that cannot see is refused with a plain
+  "cannot see pictures" error instead of the picture being
+  silently dropped, and unreadable picture data is refused
+  the same way. Pictures are decoded to a temporary file
+  for the one request and deleted when the reply finishes.
+- **What is loaded, and putting it back:** GET /api/ps
+  reports the model Fyrn currently holds (name, size,
+  digest for Ollama-store models, and — when idle
+  auto-unload is on — the moment it would unload itself).
+  Asking never counts as use. `keep_alive: 0` on a chat or
+  generate request now works the way Ollama clients
+  expect: an empty request unloads the named model at
+  once, and a normal request unloads it after its reply
+  completes. Other keep_alive values are accepted, with
+  Fyrn's idle setting in charge.
+- **Context instructions:** `options.num_ctx` is honored:
+  a request can load (or reload) its model at a chosen
+  context size, with the RAM fit check pricing the KV
+  cache at that size; the value is clamped to the model's
+  trained context when its header names one. POST
+  /api/show reports what Fyrn can honestly read about a
+  model — GGUF family, trained context length, size,
+  digest — and, when that model is the loaded one, the
+  context size it is actually running with
+  (`loaded_context_tokens`), so a client can budget
+  against the real window.
+- The bridge's contract document (BRIDGE.md) describes
+  all of this exactly as implemented, for the programs
+  that build against it.
+
 ## Fyrn v0.9 (2026-11-19)
 
 The bridge for other programs, a reply-length setting,

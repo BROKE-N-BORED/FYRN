@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (QApplication, QLabel, QLineEdit,
 
 from helpers import ModalWatcher, file_bytes, make_fake_gguf
 from helpers import start_range_server, write_gguf_file
+from fyrn import __version__ as APP_VERSION
 from fyrn.core import (HEADROOM_BYTES, ImportCancelled, fit_status,
                        format_chat_export, read_ram_bytes)
 from fyrn.gui import (DARK_STYLESHEET, FIRST_PULL_SUGGESTION,
@@ -94,7 +95,7 @@ class IndeterminateRunner(FakeRunner):
     real backend: -1 with stage text, a pause, then 100."""
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None):
+             display_name=None, n_ctx=None):
         if progress_cb is not None:
             progress_cb(-1, "Loading into RAM...")
         if self.load_delay_s > 0:
@@ -1991,7 +1992,7 @@ class FailingRunner(FakeRunner):
         self.fail_next = False
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None):
+             display_name=None, n_ctx=None):
         if self.fail_next:
             raise RunnerError(
                 "The model could not be loaded (fake bad file).")
@@ -2305,7 +2306,7 @@ class BlockingRunner(FakeRunner):
     real backend's constructor: longer than the 5 s close wait."""
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None):
+             display_name=None, n_ctx=None):
         time.sleep(8)
         return super().load(path, progress_cb, cancel_event,
                             display_name)
@@ -2897,7 +2898,7 @@ class AttachTests(GuiTestCase):
     def test_vision_warning_in_load_status(self):
         class WarningRunner(FakeRunner):
             def load(self, path, progress_cb=None,
-                     cancel_event=None, display_name=None):
+                     cancel_event=None, display_name=None, n_ctx=None):
                 result = super().load(path, progress_cb,
                                       cancel_event, display_name)
                 result["vision_warning"] = (
@@ -3916,7 +3917,7 @@ class GatedRunner(FakeRunner):
         self.release = threading.Event()
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None):
+             display_name=None, n_ctx=None):
         self.started.set()
         self.release.wait(timeout=10)
         return super().load(path, progress_cb, cancel_event,
@@ -4105,12 +4106,13 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_manual_check_current_reports_up_to_date(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("current", "0.9"), manual=True)
+            window, self._result("current", APP_VERSION),
+            manual=True)
         texts = [text for title, text in self.watcher.seen
                  if title == "Check for updates"]
         self.assertEqual(len(texts), 1)
         self.assertIn("up to date", texts[0])
-        self.assertIn("0.9", texts[0])
+        self.assertIn(APP_VERSION, texts[0])
 
     def test_manual_check_unknown_reports_the_reason(self):
         window = self.make_window()
@@ -4128,12 +4130,12 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_manual_check_newer_asks_and_no_means_no_download(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("newer", "0.10"), manual=True)
+            window, self._result("newer", "99.0"), manual=True)
         texts = [text for title, text in self.watcher.seen
                  if title == "Update available"]
         self.assertEqual(len(texts), 1)
-        self.assertIn("Fyrn 0.10 is out", texts[0])
-        self.assertIn("You have 0.9", texts[0])
+        self.assertIn("Fyrn 99.0 is out", texts[0])
+        self.assertIn("You have %s" % APP_VERSION, texts[0])
         # The watcher clicks the default (No): nothing downloads.
         QTest.qWait(200)
         self.assertIsNone(window._update_download_worker)
@@ -4141,7 +4143,7 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_silent_check_current_is_silent(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("current", "0.9"), manual=False)
+            window, self._result("current", APP_VERSION), manual=False)
         self.assertEqual(self.watcher.seen, [])
 
     def test_silent_check_unknown_is_silent(self):
@@ -4156,7 +4158,7 @@ class UpdateCheckGuiTests(GuiTestCase):
     def test_silent_check_newer_still_asks(self):
         window = self.make_window()
         self._check_and_wait(
-            window, self._result("newer", "0.10"), manual=False)
+            window, self._result("newer", "99.0"), manual=False)
         self.assertTrue(any(title == "Update available"
                             for title, _text in self.watcher.seen))
 
@@ -4165,7 +4167,7 @@ class UpdateCheckGuiTests(GuiTestCase):
 
         def slow_check(_version):
             time.sleep(1.0)
-            return self._result("current", "0.9")
+            return self._result("current", APP_VERSION)
 
         with mock.patch("fyrn.updates.check_for_update",
                         side_effect=slow_check):
