@@ -28,6 +28,30 @@ program and toggle the setting off and on to retry.
 
 Closing Fyrn closes the bridge.
 
+## Sharing on the home network, and the phone deck
+
+A second Settings checkbox, "Share Fyrn on my home
+network", widens the bridge (v0.11). It is off by default
+and only matters while the bridge is on:
+
+- Bridge on, sharing off: as above, 127.0.0.1 only.
+- Bridge on, sharing on: the same server binds 0.0.0.0
+  instead, so anything on the home network can reach every
+  endpoint in this document. There is no access code and
+  no login: while sharing is on, anyone on the home WiFi
+  can use the models. Saving either toggle applies it at
+  once (a sharing change restarts the bridge on the new
+  address); no app restart is needed.
+
+Sharing exists for the phone deck: a small chat page the
+bridge serves at GET /deck (see below), so the user can
+chat with the PC's models from a phone on the same WiFi.
+While sharing is on, Settings shows the deck's address,
+http://<the PC's network address>:11434/deck, and its
+Phone deck button shows the same address as a QR code.
+When the PC's network address cannot be found, Fyrn says
+so instead of showing an address that would not work.
+
 ## The rules a client must live with
 
 - **One model at a time.** Fyrn holds a single loaded model.
@@ -125,6 +149,21 @@ does not count as use and never keeps a model alive.
 
 Answers `Fyrn bridge is running.` as plain text. Handy for
 a "is anything there?" probe.
+
+### GET /deck
+
+The phone deck: one self-contained HTML page (no external
+assets; it works on a network with no internet), served
+with Content-Type text/html whenever the bridge is on, on
+whichever address the bridge bound. It is a chat face for
+a phone: a model picker fed by /api/tags with the loaded
+model (from /api/ps) marked, streaming chat over
+/api/chat, a stop button, one photo per message (shrunk
+on the phone to at most 1024 px and sent as the message's
+`images`, exactly as the Images section describes), and a
+new-chat button. Deck requests are bridge requests: the
+busy rules above apply to them unchanged. The deck has no
+tools, no settings, and no file access.
 
 ### POST /api/generate
 

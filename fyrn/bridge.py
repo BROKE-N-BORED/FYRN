@@ -1,14 +1,18 @@
 """The bridge: Fyrn's engine, offered to other programs
-(v0.9, tools pass-through v0.10).
+(v0.9, tools pass-through v0.10, phone deck v0.11).
 
 An optional local adapter, off by default. When the Settings
 toggle is on, Fyrn serves a small HTTP API on 127.0.0.1 (this
-PC only, never the network) shaped like Ollama's, because the
-programs that will use it (Code Forge, STELLA) already speak
-that shape to Ollama. Fyrn itself is still its own thing: this
-module is an adapter on the side, translating Ollama-shaped
-requests into Fyrn's own runner calls. The full contract for
-the other programs' builders is BRIDGE.md at the repo root.
+PC only) shaped like Ollama's, because the programs that will
+use it (Code Forge, STELLA) already speak that shape to
+Ollama. A second Settings toggle (v0.11) shares the bridge on
+the home network instead, so the user's phone can reach it:
+the same server then binds 0.0.0.0 and also serves the phone
+deck, a small chat page at /deck. Fyrn itself is still its
+own thing: this module is an adapter on the side, translating
+Ollama-shaped requests into Fyrn's own runner calls. The full
+contract for the other programs' builders is BRIDGE.md at the
+repo root.
 
 The rules are Fyrn's rules, unchanged:
 
@@ -34,6 +38,7 @@ busy check) arrives as callbacks from the window.
 import base64
 import json
 import queue as _queue
+import socket
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -42,6 +47,7 @@ from pathlib import Path
 
 from .core import (ModelNotFoundError, ModelTooBigError,
                    get_home, read_gguf_facts)
+from .deck import DECK_HTML
 from .runner import GenerationCancelled, RunnerError, reply_cap
 
 # Ollama's port, on purpose: the client programs are already
@@ -100,6 +106,53 @@ def _digest_for(path):
     return None
 
 
+def detect_lan_ip():
+    """This PC's IPv4 address on the local network, or None
+    when no usable address can be found.
+
+    The UDP-connect trick: connecting a datagram socket sends
+    nothing, but the kernel picks the route a packet would
+    take, and the socket's own address is then this PC's
+    address on that network. Tried against two well-known
+    targets (either works; only the route matters), then the
+    hostname lookup as a fallback. A loopback or wildcard
+    answer is no answer: None, so the app can say honestly
+    that it could not find the address instead of printing
+    one that would not work."""
+    for target in ("8.8.8.8", "192.0.2.1"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect((target, 80))
+            ip = sock.getsockname()[0]
+        except OSError:
+            ip = None
+        finally:
+            sock.close()
+        if _usable_lan_ip(ip):
+            return ip
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return None
+    return ip if _usable_lan_ip(ip) else None
+
+
+def _usable_lan_ip(ip):
+    return (bool(ip) and ip != "0.0.0.0"
+            and not ip.startswith("127."))
+
+
+def deck_url(port, ip=None):
+    """The phone deck's address on the home network,
+    http://<lan-ip>:<port>/deck, or None when the PC's
+    network address cannot be found."""
+    if ip is None:
+        ip = detect_lan_ip()
+    if not ip:
+        return None
+    return "http://%s:%d/deck" % (ip, port)
+
+
 class BridgeService:
     """The bridge's brain: model list, model switching, and
     generation, with the HTTP layer as a thin shell over it.
@@ -114,12 +167,14 @@ class BridgeService:
     requests that use the engine (the idle auto-unload timer
     listens to it). expires_at_fn() returns the ISO moment the
     loaded model would idle-unload, or None when no projection
-    applies (/api/ps).
+    applies (/api/ps). share_fn() returns True when the bridge
+    may serve the home network as well as this PC (v0.11): it
+    is read at start(), and decides the bind address.
     """
 
     def __init__(self, controller, list_models_fn, is_busy_fn=None,
                  max_tokens_fn=None, on_activity=None,
-                 expires_at_fn=None,
+                 expires_at_fn=None, share_fn=None,
                  port=DEFAULT_PORT, version=""):
         self.controller = controller
         self._list_models = list_models_fn
@@ -127,8 +182,15 @@ class BridgeService:
         self._max_tokens_fn = max_tokens_fn
         self._on_activity = on_activity or (lambda: None)
         self._expires_at_fn = expires_at_fn
+        self._share_fn = share_fn
         self.port = port
         self.version = version
+        # The address the running server is bound to, and
+        # whether that includes the home network. Set by
+        # start(); the window reads `shared` to notice a
+        # sharing change it must rebind for.
+        self.host = "127.0.0.1"
+        self.shared = False
         self._server = None
         self._thread = None
         # Why the last start() failed, in plain words ("" when
@@ -146,17 +208,21 @@ class BridgeService:
         return self._server is not None
 
     def start(self):
-        """Start serving on 127.0.0.1:self.port. Returns True
-        when serving. When the port is taken (Ollama running,
-        or another Fyrn), returns False with start_error set,
-        in plain words: a failed bridge is a status line, never
-        a crash."""
+        """Start serving on self.port: on 127.0.0.1 (this PC
+        only), or on 0.0.0.0 when the share setting is on, so
+        the home network (the user's phone) can reach it too.
+        Returns True when serving. When the port is taken
+        (Ollama running, or another Fyrn), returns False with
+        start_error set, in plain words: a failed bridge is a
+        status line, never a crash."""
         if self._server is not None:
             return True
         handler = _make_handler(self)
+        self.shared = bool(self._share_fn and self._share_fn())
+        self.host = "0.0.0.0" if self.shared else "127.0.0.1"
         try:
             self._server = ThreadingHTTPServer(
-                ("127.0.0.1", self.port), handler)
+                (self.host, self.port), handler)
         except OSError:
             self._server = None
             self.start_error = (
@@ -841,6 +907,19 @@ def _make_handler(service):
         def _send_error(self, exc):
             self._send_json(exc.status, {"error": exc.message})
 
+        def _send_html(self, html):
+            body = html.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "text/html; charset=utf-8")
+                self.send_header("Content-Length",
+                                 str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
         def _read_payload(self):
             length = self.headers.get("Content-Length")
             if length is None:
@@ -871,6 +950,12 @@ def _make_handler(service):
                 self._send_json(200, service.ps())
             elif self.path == "/api/version":
                 self._send_json(200, service.version_info())
+            elif self.path == "/deck":
+                # The phone deck (v0.11): one self-contained
+                # page, served by the same server, so it is
+                # there exactly when the bridge is on, on
+                # whichever address the bridge bound.
+                self._send_html(DECK_HTML)
             elif self.path == "/":
                 body = b"Fyrn bridge is running"
                 try:

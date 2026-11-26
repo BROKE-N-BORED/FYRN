@@ -19,8 +19,9 @@ from PySide6.QtCore import (QEvent, QEasingCurve, QLockFile, QPoint,
                             QPropertyAnimation, QRect, QSettings,
                             QSignalBlocker, Qt, QThread, QTimer, Signal)
 from shiboken6 import isValid
-from PySide6.QtGui import (QAction, QCursor, QGuiApplication, QIcon,
-                           QKeySequence, QPixmap, QShortcut)
+from PySide6.QtGui import (QAction, QColor, QCursor, QGuiApplication,
+                           QIcon, QImage, QKeySequence, QPixmap,
+                           QShortcut)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
                                QDialog, QFileDialog, QFrame,
                                QGraphicsOpacityEffect, QGridLayout,
@@ -35,7 +36,9 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
 
 from . import __version__
 from . import core
-from .bridge import BridgeService, iso_seconds_from_now
+from . import qrcodegen
+from .bridge import (DEFAULT_PORT, BridgeService, deck_url,
+                     iso_seconds_from_now)
 from .chats import ChatStore, auto_title, history_from_messages
 from .core import (HEADROOM_BYTES, ImportCancelled, ModelController,
                    ModelNotFoundError, ModelTooBigError, ensure_home,
@@ -247,6 +250,26 @@ def set_bridge_enabled(value):
     settings.sync()
 
 
+def get_bridge_share():
+    """Whether the bridge also serves the home network
+    (Settings window, v0.11): the phone deck setting. Off by
+    default, and it only matters while the bridge itself is
+    on: off means the bridge stays on 127.0.0.1, reachable
+    from this PC only; on means it binds the network too, so
+    a phone on the same WiFi can reach the deck and the API.
+    While it is on, anyone on the home network can use the
+    models, which the Settings note says out loud."""
+    settings = get_settings()
+    return bool(settings.value("bridge_share", False,
+                               type=bool))
+
+
+def set_bridge_share(value):
+    settings = get_settings()
+    settings.setValue("bridge_share", bool(value))
+    settings.sync()
+
+
 # Idle auto-unload choices (v0.9), in minutes; 0 is Off. A model
 # left loaded and untouched for this long unloads itself, so
 # its RAM goes back to the PC. Off by default: a loaded model
@@ -397,6 +420,15 @@ HOW_TO_USE_SECTIONS = {
         "on. Fyrn still holds one model at a time, and your own "
         "chat always wins: a program asking mid-reply is told "
         "to wait.\n\n"
+        "Share Fyrn on my home network opens the bridge to "
+        "your home WiFi as well, so you can chat with your "
+        "models from your phone. Turn the bridge and sharing "
+        "on, then press the Phone deck button in Settings: it "
+        "shows the address to open on the phone and a QR code "
+        "that opens it. The phone and this PC must be on the "
+        "same WiFi. While sharing is on, anyone on your home "
+        "WiFi can use the models, so turn it off when you do "
+        "not need it.\n\n"
         "Unload an idle model frees the RAM on its own when a "
         "loaded model has sat unused for the time you pick. "
         "Sending a message, loading, and bridge requests all "
@@ -2119,6 +2151,36 @@ class SettingsWindow(QDialog):
         bridge_help.setWordWrap(True)
         layout.addWidget(bridge_help)
 
+        self.share_check = QCheckBox(
+            "Share Fyrn on my home network (phone deck)")
+        self.share_check.setChecked(get_bridge_share())
+        layout.addWidget(self.share_check)
+
+        share_help = QLabel(
+            "Only matters with the bridge on. While sharing "
+            "is on, anyone on your home WiFi can use your "
+            "models: they can chat with them from a phone or "
+            "another PC on the network. Turn it off when you "
+            "do not need it.")
+        share_help.setWordWrap(True)
+        layout.addWidget(share_help)
+
+        deck_row = QHBoxLayout()
+        deck_label = QLabel("Phone deck address")
+        deck_row.addWidget(deck_label)
+        self.deck_url_edit = QLineEdit()
+        self.deck_url_edit.setReadOnly(True)
+        deck_row.addWidget(self.deck_url_edit)
+        self.deck_button = QPushButton("Phone deck")
+        self.deck_button.setToolTip(
+            "Show the phone deck address and its QR code")
+        self.deck_button.clicked.connect(self._show_phone_deck)
+        deck_row.addWidget(self.deck_button)
+        layout.addLayout(deck_row)
+        self.share_check.toggled.connect(
+            lambda _on: self._refresh_deck_url())
+        self._refresh_deck_url()
+
         idle_label = QLabel("Unload an idle model")
         layout.addWidget(idle_label)
 
@@ -2227,6 +2289,31 @@ class SettingsWindow(QDialog):
         if folder:
             self.forge_path_edit.setText(folder)
 
+    def _refresh_deck_url(self):
+        """Keep the phone deck address in step with the share
+        checkbox (v0.11): the real address while sharing is
+        on, an honest note in the field's placeholder when it
+        is off or the address cannot be found. The Phone deck
+        button only works while sharing is on."""
+        if self.share_check.isChecked():
+            url = deck_url(DEFAULT_PORT)
+            if url:
+                self.deck_url_edit.setText(url)
+                self.deck_url_edit.setPlaceholderText("")
+            else:
+                self.deck_url_edit.setText("")
+                self.deck_url_edit.setPlaceholderText(
+                    "This PC's network address was not found")
+        else:
+            self.deck_url_edit.setText("")
+            self.deck_url_edit.setPlaceholderText("Sharing is off")
+        self.deck_button.setEnabled(
+            self.share_check.isChecked())
+
+    def _show_phone_deck(self):
+        dialog = PhoneDeckDialog(deck_url(DEFAULT_PORT), self)
+        dialog.exec()
+
     def _save(self):
         folder = Path(self.folder_edit.text())
         try:
@@ -2248,6 +2335,7 @@ class SettingsWindow(QDialog):
         set_reply_length(
             self.reply_length_combo.currentData())
         set_bridge_enabled(self.bridge_check.isChecked())
+        set_bridge_share(self.share_check.isChecked())
         set_idle_unload_minutes(self.idle_combo.currentData())
         # Only a real folder change is announced (task 10): a
         # settings-only save used to claim the folder had moved.
@@ -2255,6 +2343,77 @@ class SettingsWindow(QDialog):
             self.folder_changed.emit(str(folder))
         self.settings_saved.emit()
         self.accept()
+
+
+def qr_pixmap(text, pixel_size=280):
+    """A QR code for text as a QPixmap (v0.11), drawn module
+    by module with a quiet zone, from the vendored qrcodegen:
+    no new dependency. The image is built at module size and
+    scaled by a whole number, so the squares stay crisp."""
+    qr = qrcodegen.QrCode.encode_text(
+        text, qrcodegen.QrCode.Ecc.MEDIUM)
+    size = qr.get_size()
+    border = 4
+    total = size + border * 2
+    image = QImage(total, total, QImage.Format.Format_RGB32)
+    image.fill(QColor(255, 255, 255))
+    black = QColor(0, 0, 0)
+    for y in range(size):
+        for x in range(size):
+            if qr.get_module(x, y):
+                image.setPixelColor(x + border, y + border,
+                                    black)
+    scale = max(1, pixel_size // total)
+    image = image.scaled(
+        total * scale, total * scale,
+        Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.FastTransformation)
+    return QPixmap.fromImage(image)
+
+
+class PhoneDeckDialog(QDialog):
+    """The phone deck's address, big and scannable (v0.11).
+
+    Opened from Settings while sharing is on: the deck URL in
+    large selectable text, and a QR code encoding exactly
+    that URL, so the phone's camera does the typing. When the
+    PC's network address could not be found there is no code
+    to show, and the dialog says so instead of inventing an
+    address.
+    """
+
+    def __init__(self, url, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Phone deck")
+        self.deck_url = url
+        layout = QVBoxLayout(self)
+        help_label = QLabel(
+            "On your phone, open this address in the browser, "
+            "or point the camera at the code. The phone and "
+            "this PC must be on the same WiFi, with the bridge "
+            "and sharing on.")
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+        self.url_label = QLabel(
+            url or "This PC's network address was not found, "
+                   "so there is no address to show.")
+        self.url_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        font = self.url_label.font()
+        font.setPointSize(max(14, font.pointSize() + 4))
+        font.setBold(True)
+        self.url_label.setFont(font)
+        layout.addWidget(self.url_label)
+        if url:
+            self.qr_label = QLabel()
+            self.qr_label.setPixmap(qr_pixmap(url))
+            self.qr_label.setAlignment(
+                Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(self.qr_label)
+        close_button = QPushButton("Close")
+        close_button.setToolTip("Close this window")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
 
 
 class HowToUseWindow(QDialog):
@@ -4706,6 +4865,20 @@ class MainWindow(QMainWindow):
         on the status line and stays off; Fyrn itself is
         unaffected."""
         want = get_bridge_enabled()
+        if (want and self._bridge is not None
+                and getattr(self._bridge, "shared",
+                            get_bridge_share())
+                != get_bridge_share()):
+            # Sharing changed under a running bridge (v0.11):
+            # the bind address is chosen at start, so restart
+            # the bridge on the address the new setting asks
+            # for. Saving the setting is enough; no app
+            # restart.
+            self._bridge.stop()
+            self._bridge = None
+            self.log.action(
+                "bridge restarting to change home-network "
+                "sharing")
         if want and self._bridge is None:
             service = BridgeService(
                 self.controller, self._bridge_models,
@@ -4713,12 +4886,25 @@ class MainWindow(QMainWindow):
                 max_tokens_fn=get_reply_length,
                 on_activity=self._note_activity,
                 expires_at_fn=self._bridge_expires_at,
+                share_fn=get_bridge_share,
                 version=__version__)
             if service.start():
                 self._bridge = service
-                self._show_status(
-                    "Bridge on: other programs on this PC can "
-                    "use Fyrn on port %d." % service.port)
+                if getattr(service, "shared", False):
+                    url = deck_url(service.port)
+                    if url:
+                        self._show_status(
+                            "Bridge on, shared on your home "
+                            "network. Phone deck: %s" % url)
+                    else:
+                        self._show_status(
+                            "Bridge on, shared on your home "
+                            "network.")
+                else:
+                    self._show_status(
+                        "Bridge on: other programs on this PC "
+                        "can use Fyrn on port %d."
+                        % service.port)
                 self.log.action("bridge started on port %d"
                                 % service.port)
             else:

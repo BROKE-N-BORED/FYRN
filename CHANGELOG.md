@@ -1,5 +1,49 @@
 # Changelog
 
+## Fyrn v0.11 (2026-11-25)
+
+The phone deck: your PC becomes the hub for your models,
+and your phone gets a chat face for them. No reinstall
+needed: this release changes Fyrn's own code only (the
+engine is unchanged), so the in-app update check will
+offer it — or download and install as usual. install.sh
+is byte-identical to v0.10.
+
+- **Share Fyrn on my home network:** a new Settings
+  checkbox under the bridge toggle, off by default. The
+  bridge alone still serves this PC only (127.0.0.1).
+  With sharing on as well, the bridge also serves your
+  home network, so a phone on the same WiFi can reach it.
+  Saving the setting applies it at once, no restart.
+  There is no access code: while sharing is on, anyone
+  on your home WiFi can use your models, and the
+  Settings note says exactly that. Turn it off when you
+  do not need it.
+- **The phone deck:** with the bridge on, Fyrn serves a
+  small chat page at /deck, made for a phone screen:
+  pick a model, chat with replies streaming in, attach
+  one photo (it is shrunk on the phone before it is
+  sent, and a model that cannot see pictures says so in
+  plain words), stop a reply, start a new chat. The page
+  is one file with nothing fetched from anywhere else,
+  so it works on a home network with no internet. It is
+  a chat face only: no tools, no settings, no file
+  access.
+- **The address, without typing:** while sharing is on,
+  Settings shows the deck's address on your network
+  (http://<your PC's address>:11434/deck), and the Phone
+  deck button beside it opens a window with the address
+  in large text and a QR code for it, so the phone's
+  camera does the typing. If Fyrn cannot find the PC's
+  network address, it says so instead of showing one
+  that would not work. The QR code is drawn by a small
+  vendored library (qrcodegen, MIT) that now ships with
+  Fyrn; nothing new is installed.
+- Everything from the bridge's earlier rules is
+  unchanged: off by default, one model at a time, your
+  own chat wins over any other program or the phone,
+  the RAM fit check in front of every load.
+
 ## Fyrn v0.10 (2026-11-20)
 
 The bridge learns to pass tools through, carry pictures,

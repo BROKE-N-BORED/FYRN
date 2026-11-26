@@ -922,5 +922,93 @@ class BridgeStartTests(unittest.TestCase):
             second.stop()
 
 
+class BridgeShareDeckTests(unittest.TestCase):
+    """v0.11: home-network sharing picks the bind address, and
+    the same server serves the phone deck at /deck."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.alpha = self.base / "alpha.gguf"
+        make_fake_gguf(self.alpha, 2048)
+        self.models = [
+            {"name": "alpha:latest", "path": self.alpha,
+             "size": 2048},
+        ]
+        self.controller = ModelController(
+            FakeRunner(), free_ram_fn=lambda: 16 * GB)
+        self.services = []
+        self.addCleanup(self._stop_all)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _stop_all(self):
+        for service in self.services:
+            service.stop()
+
+    def _start(self, share):
+        service = BridgeService(
+            self.controller, lambda: list(self.models),
+            share_fn=lambda: share, port=0, version="0.11")
+        self.assertTrue(service.start())
+        self.services.append(service)
+        return service
+
+    def _get(self, service, path):
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", service.port, timeout=30)
+        conn.request("GET", path)
+        response = conn.getresponse()
+        data = response.read()
+        headers = dict(response.getheaders())
+        conn.close()
+        return response.status, headers, data
+
+    def test_share_off_binds_this_pc_only(self):
+        service = self._start(share=False)
+        self.assertFalse(service.shared)
+        self.assertEqual(service.host, "127.0.0.1")
+        self.assertEqual(
+            service._server.server_address[0], "127.0.0.1")
+
+    def test_share_on_binds_the_network(self):
+        service = self._start(share=True)
+        self.assertTrue(service.shared)
+        self.assertEqual(service.host, "0.0.0.0")
+        self.assertEqual(
+            service._server.server_address[0], "0.0.0.0")
+
+    def test_no_share_setting_means_this_pc_only(self):
+        service = BridgeService(
+            self.controller, lambda: list(self.models),
+            port=0, version="0.11")
+        self.assertTrue(service.start())
+        self.services.append(service)
+        self.assertFalse(service.shared)
+        self.assertEqual(service.host, "127.0.0.1")
+
+    def test_deck_route_serves_the_page(self):
+        service = self._start(share=False)
+        status, headers, data = self._get(service, "/deck")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        self.assertIn(b"<title>Fyrn deck</title>", data)
+        self.assertIn(b'id="model"', data)
+        self.assertIn(b'id="chat"', data)
+        self.assertIn(b"/api/chat", data)
+        self.assertIn(b"/api/tags", data)
+
+    def test_deck_route_serves_when_shared_too(self):
+        service = self._start(share=True)
+        status, _headers, data = self._get(service, "/deck")
+        self.assertEqual(status, 200)
+        self.assertIn(b"<title>Fyrn deck</title>", data)
+
+    def test_api_still_answers_alongside_the_deck(self):
+        service = self._start(share=True)
+        status, _headers, data = self._get(service, "/api/tags")
+        self.assertEqual(status, 200)
+        self.assertIn(b"alpha:latest", data)
+
+
 if __name__ == "__main__":
     unittest.main()
