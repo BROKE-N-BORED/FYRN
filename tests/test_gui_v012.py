@@ -213,7 +213,7 @@ class SettingsPageTests(GuiTestCase):
         names = [settings.page_list.item(row).text()
                  for row in range(settings.page_list.count())]
         self.assertEqual(names, ["Models and downloads",
-                                 "Chat and tools",
+                                 "Chat and browsing",
                                  "Bridge and phone",
                                  "Display and updates"])
         self.assertEqual(settings.pages.count(), 4)
@@ -239,13 +239,15 @@ class SettingsPageTests(GuiTestCase):
             self.assertTrue(
                 self._on_page(widget, settings.models_page),
                 widget)
-        for widget in (settings.tools_folder_edit,
-                       settings.forge_path_edit,
+        for widget in (settings.forge_path_edit,
                        settings.reply_length_combo,
                        settings.idle_combo):
             self.assertTrue(
                 self._on_page(widget, settings.chat_page),
                 widget)
+        # The tools folder control is gone (v0.13): the
+        # built-in tools it served were removed.
+        self.assertFalse(hasattr(settings, "tools_folder_edit"))
         for widget in (settings.bridge_check,
                        settings.share_check,
                        settings.deck_url_edit,
@@ -276,7 +278,7 @@ class SettingsPageTests(GuiTestCase):
         settings = SettingsWindow(self.models)
         self.windows.append(settings)
         settings.show()
-        # Chat and tools page.
+        # Chat and browsing page.
         index = settings.reply_length_combo.findData(2048)
         settings.reply_length_combo.setCurrentIndex(index)
         # Bridge and phone page.

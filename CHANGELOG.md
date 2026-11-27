@@ -1,5 +1,93 @@
 # Changelog
 
+## Fyrn v0.13 (2026-11-26)
+
+A repair release for what the first real-PC run of the
+bonsai-2-uncensored model exposed: a reply that dissolved
+into gibberish, a chat that then refused every follow-up
+with a raw engine error, and a status line still showing
+the dead conversation's numbers under a different model.
+No reinstall needed: this release changes Fyrn's own code
+only (the engine is unchanged), so the in-app update check
+will offer it — or download and install as usual.
+install.sh is byte-identical to v0.12.
+
+- **The built-in tools are gone.** The calculator, the
+  clock, the file tools, and the command runner that
+  models could call (added in v0.8) are removed, not just
+  switched off: their instructions went along with every
+  message you sent to a model that could use them,
+  filling a large share of the model's memory and slowing
+  every reply down, whether any tool was ever used or
+  not. A plain chat now carries nothing extra at all. The
+  tools folder setting is gone with them, and the
+  Settings page that held it is called Chat and browsing
+  now. What stays is the one connection that was asked
+  for by name: web browsing through Forge Browser. It has
+  its own box on the Chat tab, Web browsing via Forge
+  Browser, and it is off in every chat — a new chat starts
+  with it off, a saved chat opens with it off — until you
+  turn it on in that chat. (The bridge's pass-through is
+  a different thing and is unchanged: a program using
+  Fyrn through the bridge can still offer the model its
+  own tools; Fyrn passes them along and never runs
+  them.)
+- **A model now runs with its own settings.** A model
+  downloaded through Ollama carries its maker's settings
+  with it — how strongly to discourage repetition, how
+  random to be, where to stop, and a system prompt.
+  Fyrn read none of them: bonsai-2-uncensored ran with no
+  repetition penalty at all, the one control that exists
+  to stop a small model sliding into gibberish over a
+  long reply. Fyrn now reads those settings from the
+  model's own record and passes them to the engine on
+  every reply, on the plain path and the browsing path
+  alike. Fyrn's own settings still win where they exist:
+  the reply length stays Fyrn's, and the context size
+  stays Fyrn's choice, never the model's.
+- **A long reply can no longer wedge a chat.** Before,
+  the conversation sent with each message was trimmed by
+  characters, and nothing counted it against the model's
+  memory in tokens — so one huge reply filled the memory
+  by itself, and every follow-up died with the engine's
+  raw error ("Requested tokens (2111) exceed context
+  window of 2048"), forever, until the chat was cleared
+  by hand. Now the prompt is counted in real tokens
+  before each reply: the oldest exchanges drop out of
+  what is sent (your saved chat keeps everything — the
+  trimming is per message, never a deletion), and the
+  reply is shortened to what fits. A chat that truly
+  cannot fit says so and stops, in plain words.
+- **Errors speak plainly.** The engine's token-count
+  error text never reaches the chat now. A chat that has
+  outgrown the model's memory says exactly that: "This
+  chat has grown too long for this model's memory. Start
+  a new chat, or clear this one, and ask again." Other
+  failures keep the plain sentence first, with the reason
+  attached.
+- **The reply numbers are honest, and they clear.** On a
+  browsing turn, the token count and speed used to cover
+  only the final answer's text while the time covered
+  every round — a long browsing turn showed a speed several
+  times slower than the engine's real rate, and a "first
+  token" time that was really the whole turn. The count
+  now covers every token the engine generated, the speed
+  is that count over the turn's time, and the first-token
+  time is stamped when the answer's first words actually
+  arrive. And the numbers now clear when a model loads,
+  unloads, or a reply fails, instead of sitting under the
+  next model as if they were its.
+- **Vision models from Ollama's store can see.** A
+  store model's projector file is named by hash, so the
+  search beside the model never found it, and the model
+  loaded text-only in silence. Discovery now reads the
+  projector from the model's own record, and the load
+  uses it: a vision model loaded from the store loads
+  with its eyes.
+- Fyrn also reads a model's full header now: on models
+  with large vocabularies, the old reader stopped partway
+  and never saw the settings stored after the word lists.
+
 ## Fyrn v0.12 (2026-11-26)
 
 A repair release for two defects v0.11 shipped with,

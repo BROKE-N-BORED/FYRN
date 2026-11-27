@@ -72,7 +72,7 @@ only change Fyrn's own code will still update in-app.
   like — whether Ollama's already-downloaded models are listed,
   a Reduce motion switch, Compact model list, High-contrast mode,
   the pull-complete chime mute, whether Fyrn checks for a
-  newer release when it starts, the tools folder, an optional
+  newer release when it starts, an optional
   Forge Browser folder, the reply length (how long one answer
   may be, in tokens), the bridge for other programs, and idle
   auto-unload (free the RAM on its own after 15, 30, or 60
@@ -97,19 +97,18 @@ only change Fyrn's own code will still update in-app.
   the model how to act in that chat ("You are…", "Always…"). It
   is saved with the chat and sent as its system prompt; a change
   applies from your next message; empty means none.
-- **Tools:** a model whose own chat template supports tools can
-  use them mid-chat, and every call shows in the transcript as it
-  happens. It can read and write text files and list folders,
-  but only inside the tools folder (Settings, or the Tools folder
-  button on the Chat tab) — anything outside is refused, and the
-  refusal shows. It can search and read the web through Forge
-  Browser (the browser app on this PC): the Browser view window
-  shows the search or page as it comes back, with a button that
-  opens the real Forge Browser on the same page. It can ask to
-  run a command: Fyrn shows the exact command first, and it runs
-  only when you press Run. It can also ask for the current time
-  and work out arithmetic. A model that cannot use tools just
-  chats, exactly as before, and the Chat tab says so in one line.
+- **Web browsing:** a model whose own chat template supports
+  it can search the web and read pages mid-chat, through Forge
+  Browser (the browser app on this PC), and every search and
+  read shows in the transcript as it happens. The Browser view
+  window shows the search or page as it comes back, with a
+  button that opens the real Forge Browser on the same page.
+  Browsing is off for every chat until you turn it on with the
+  Web browsing via Forge Browser box on the Chat tab, and a
+  model that cannot browse just chats, exactly as before; the
+  Chat tab says so in one line. That is Fyrn's one outside
+  connection: Fyrn has no built-in tools of its own (no
+  calculator, no file access, no commands).
 - **Bridge for other programs:** an optional setting lets other
   programs on this PC (Code Forge, for one) run their models
   through Fyrn instead of Ollama: Fyrn serves Ollama-shaped

@@ -118,6 +118,7 @@ PLAIN_FILES = [
     "tests/test_deck.py",
     "tests/test_gui_v011.py",
     "tests/test_gui_v012.py",
+    "tests/test_v013.py",
 ]
 
 

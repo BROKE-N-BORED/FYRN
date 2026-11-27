@@ -291,9 +291,14 @@ def ram_check(file_size_bytes, free_bytes, headroom_bytes=None):
 
 # ---------------------------------------------------------------- models
 
-# GGUF header reading: only the first 256 KB are read, so a
-# multi-GB model costs one small read. The metadata lives at the
-# very start of the file, so 256 KB is generous.
+# GGUF header reading: the tensor-info reader below works on
+# the first 256 KB only (the facts it needs sit at the very
+# start of the file). The KV reader (_read_gguf_kv) instead
+# streams the whole KV section from the file, skipping array
+# payloads by seeking: a model's tokenizer tables are megabytes
+# of array data sitting BEFORE later keys (the chat template,
+# the sampling defaults), and a fixed head window silently
+# lost every key past them (v0.13).
 _GGUF_MAGIC = b"GGUF"
 _GGUF_MAX_HEADER_BYTES = 256 * 1024
 _GGUF_MAX_KV = 10000
@@ -398,21 +403,135 @@ def _parse_gguf_header(data):
     return metadata, reader, tensor_count
 
 
+class _GgufStreamReader:
+    """A cursor over a GGUF file object, for the KV section.
+
+    Values are read; array payloads are SKIPPED by seeking, so
+    walking the whole section costs a few small reads per entry
+    however large the arrays are. Any short read raises
+    ValueError, so a truncated or corrupt file stops the parse
+    instead of crashing it.
+    """
+
+    def __init__(self, fh):
+        self.fh = fh
+
+    def read(self, size):
+        chunk = self.fh.read(size)
+        if len(chunk) != size:
+            raise ValueError("short read")
+        return chunk
+
+    def skip(self, size):
+        if size <= 0:
+            return
+        try:
+            self.fh.seek(size, os.SEEK_CUR)
+        except OSError:
+            # Not seekable: read and discard in chunks.
+            remaining = size
+            while remaining > 0:
+                chunk = self.fh.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise ValueError("short read")
+                remaining -= len(chunk)
+
+    def u32(self):
+        return struct.unpack("<I", self.read(4))[0]
+
+    def u64(self):
+        return struct.unpack("<Q", self.read(8))[0]
+
+    def string(self):
+        length = self.u64()
+        if length > _GGUF_MAX_STRING:
+            raise ValueError("string too long")
+        return self.read(length).decode("utf-8")
+
+    def skip_value(self, value_type):
+        """Skip one value of the given type without reading its
+        payload into memory."""
+        if value_type == 8:  # STRING
+            self.skip(self.u64())
+            return
+        if value_type == 9:  # ARRAY
+            elem_type = self.u32()
+            count = self.u64()
+            if elem_type == 8:
+                # An array of strings: walk the length prefixes,
+                # seek past each payload.
+                for _ in range(count):
+                    self.skip(self.u64())
+                return
+            fixed = _GGUF_FIXED.get(elem_type)
+            if fixed is None:
+                raise ValueError(
+                    "unknown value type %d" % elem_type)
+            self.skip(fixed[1] * count)
+            return
+        fixed = _GGUF_FIXED.get(value_type)
+        if fixed is None:
+            raise ValueError("unknown value type %d" % value_type)
+        self.skip(fixed[1])
+
+    def value(self, value_type):
+        """Read one scalar value; arrays are skipped and return
+        None, the same contract as the bytes reader."""
+        if value_type == 9:
+            self.skip_value(value_type)
+            return None
+        if value_type == 8:  # STRING
+            return self.string()
+        fixed = _GGUF_FIXED.get(value_type)
+        if fixed is None:
+            raise ValueError("unknown value type %d" % value_type)
+        code, size = fixed
+        return struct.unpack(code, self.read(size))[0]
+
+
 def _read_gguf_kv(path):
     """Read every scalar entry from a GGUF file's header.
 
     Returns a dict of key -> value for string and numeric entries
-    (arrays are skipped, not returned). Anything that is not a
-    readable GGUF file, or a header that cannot be parsed, returns
-    {} or a partial dict: a bad file never raises.
+    (arrays are skipped, not returned). The whole KV section is
+    walked, however far into the file it runs: an earlier reader
+    stopped at a fixed 256 KB window and an array-size cap, and
+    silently lost every key stored after the tokenizer tables
+    (the chat template among them) on models with large
+    vocabularies (v0.13). Anything that is not a readable GGUF
+    file, or a header that cannot be parsed, returns {} or a
+    partial dict: a bad file never raises.
     """
     try:
-        with open(path, "rb") as fh:
-            head = fh.read(_GGUF_MAX_HEADER_BYTES)
+        fh = open(path, "rb")
     except OSError:
         return {}
-    metadata, _reader, _count = _parse_gguf_header(head)
-    return metadata or {}
+    metadata = {}
+    with fh:
+        try:
+            if fh.read(4) != _GGUF_MAGIC:
+                return {}
+            reader = _GgufStreamReader(fh)
+            version = reader.u32()
+            if version == 3:
+                reader.u64()  # tensor count
+                kv_count = reader.u64()
+            elif version == 2:
+                reader.u32()  # tensor count
+                kv_count = reader.u32()
+            else:
+                return {}
+            if kv_count > _GGUF_MAX_KV:
+                return {}
+            for _ in range(kv_count):
+                key = reader.string()
+                value = reader.value(reader.u32())
+                if value is not None:
+                    metadata[key] = value
+        except (ValueError, struct.error, UnicodeDecodeError,
+                OSError):
+            pass  # partial metadata is still real metadata
+    return metadata
 
 
 # How much of a file read_gguf_number_array scans: the
@@ -984,13 +1103,17 @@ class ModelController:
     def is_loaded(self):
         return self.current_path is not None
 
-    def check_before_load(self, path, context_tokens=None):
+    def check_before_load(self, path, context_tokens=None,
+                          projector=None):
         """RAM verdict for a model file, before loading it.
 
         context_tokens is the context the load will use when a
         caller chose one (the bridge's num_ctx); the KV part of
         the headroom is priced at that size, not the machine
-        pick."""
+        pick. projector is the model's vision projector file
+        when discovery named one explicitly (an Ollama store
+        model's, v0.13); its size counts toward the load exactly
+        as a folder projector's does."""
         path = Path(path)
         if not path.is_file():
             raise ModelNotFoundError(
@@ -1015,11 +1138,18 @@ class ModelController:
                 and context_tokens > 0):
             context_tokens = auto_context_tokens(free)
         headroom = model_headroom_bytes(path, context_tokens)
-        return ram_check(size + projector_size_bytes(path),
-                         free, headroom)
+        if projector is not None:
+            try:
+                projector_bytes = Path(projector).stat().st_size
+            except OSError:
+                projector_bytes = 0
+        else:
+            projector_bytes = projector_size_bytes(path)
+        return ram_check(size + projector_bytes, free, headroom)
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None, n_ctx=None):
+             display_name=None, n_ctx=None, model_params=None,
+             model_system=None, projector=None):
         """Load a model, auto-unloading the previous one.
 
         Raises ModelTooBigError when the RAM check refuses, without
@@ -1029,18 +1159,31 @@ class ModelController:
         Ollama model's name, for example); the file name is used
         when it is not given. n_ctx asks the runner for that
         context size (the bridge's num_ctx); None keeps the
-        runner's own pick.
+        runner's own pick. model_params, model_system, and
+        projector are what discovery read from the model's own
+        Ollama manifest (v0.13); they go straight to the runner.
         """
         path = Path(path)
         verdict, message = self.check_before_load(
-            path, context_tokens=n_ctx)
+            path, context_tokens=n_ctx, projector=projector)
         if verdict == "refuse":
             raise ModelTooBigError(message)
         if self.is_loaded:
             self.unload()
+        # The manifest extras (v0.13) are passed only when
+        # discovery actually supplied one: a load with nothing
+        # extra calls the runner exactly as it always has, so a
+        # runner that predates them is never surprised.
+        extras = {}
+        if model_params is not None:
+            extras["model_params"] = model_params
+        if model_system is not None:
+            extras["model_system"] = model_system
+        if projector is not None:
+            extras["projector"] = projector
         result = self.runner.load(
             path, progress_cb=progress_cb, cancel_event=cancel_event,
-            display_name=display_name, n_ctx=n_ctx)
+            display_name=display_name, n_ctx=n_ctx, **extras)
         self.current_path = path
         self.current_name = display_name or path.name
         self.load_warning = message if verdict == "warn" else ""

@@ -15,7 +15,7 @@ import re
 import sys
 import time
 
-from .tools import TOOL_DEFINITIONS, parse_tool_calls
+from .tools import WEB_TOOL_DEFINITIONS, parse_tool_calls
 
 # A reply never runs past this many tokens: a model that never
 # emits its stop token would otherwise run to context fill, which
@@ -59,6 +59,47 @@ def trim_history(history, max_chars=MAX_HISTORY_CHARS):
         dropped = history.pop(0)
         total -= len(str(dropped.get("content", "")))
     return history
+
+
+# What the user is told when a chat outgrows the loaded model's
+# context window (v0.13). The engine's own error names token
+# counts ("Requested tokens (2111) exceed context window of
+# 2048"), which the user cannot act on; this sentence says what
+# happened and what to do. The runner raises it when a turn
+# cannot fit even after trimming, and every failure path maps
+# the engine's overflow text to it, so the raw engine string
+# never reaches the transcript.
+CHAT_TOO_LONG_MESSAGE = (
+    "This chat has grown too long for this model's memory. "
+    "Start a new chat, or clear this one, and ask again.")
+
+
+def _looks_like_context_overflow(text):
+    """Whether an error's text is the engine's context-window
+    overflow (its wording has varied across versions; the two
+    words together are the stable part)."""
+    text = str(text).lower()
+    return "context" in text and "exceed" in text
+
+
+def failure_message(exc):
+    """The plain-words failure for an engine error: a context
+    overflow becomes CHAT_TOO_LONG_MESSAGE; anything else keeps
+    the established shape, the plain sentence first and the
+    engine's reason attached."""
+    if _looks_like_context_overflow(exc):
+        return CHAT_TOO_LONG_MESSAGE
+    return "The model stopped with an error (%s)." % exc
+
+
+def plain_chat_failure(message):
+    """A failure string on its way to the transcript, mapped to
+    plain words: a context overflow hiding inside a longer
+    message becomes CHAT_TOO_LONG_MESSAGE. Anything else passes
+    through unchanged."""
+    if _looks_like_context_overflow(message):
+        return CHAT_TOO_LONG_MESSAGE
+    return message
 
 
 class RunnerError(Exception):
@@ -169,12 +210,20 @@ class Runner:
         return os.path.basename(str(self.model_path))
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None, n_ctx=None):
+             display_name=None, n_ctx=None, model_params=None,
+             model_system=None, projector=None):
         """Load a model file. Returns {"load_time_s": float}.
 
         n_ctx is an optional context size in tokens (the
         bridge's num_ctx); None means the runner picks the size
         for this machine, as it always has.
+
+        model_params, model_system, and projector carry what
+        discovery learned from the model's own Ollama manifest
+        (v0.13): its Modelfile sampling parameters, its system
+        prompt, and its vision projector file. All are optional;
+        a folder model passes none of them and behaves exactly
+        as it always has.
 
         progress_cb(pct, msg) reports real progress only: pct is
         0-100 when the runner can measure its own progress, or -1
@@ -297,9 +346,15 @@ class FakeRunner(Runner):
         self.last_load_n_ctx = None
         self.last_turn_messages = None
         self.last_turn_tools = None
+        # What the last load was handed from the model's own
+        # manifest (v0.13), for the discovery/runner tests.
+        self.last_model_params = None
+        self.last_model_system = None
+        self.last_projector = None
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None, n_ctx=None):
+             display_name=None, n_ctx=None, model_params=None,
+             model_system=None, projector=None):
         started = time.monotonic()
         name = display_name or os.path.basename(str(path))
         steps = 10
@@ -313,6 +368,9 @@ class FakeRunner(Runner):
                 time.sleep(self.load_delay_s / steps)
         self.model_path = str(path)
         self.last_load_n_ctx = n_ctx
+        self.last_model_params = model_params
+        self.last_model_system = model_system
+        self.last_projector = projector
         self.context_tokens = n_ctx if (
             isinstance(n_ctx, int) and n_ctx > 0) else 2048
         return {"load_time_s": time.monotonic() - started}
@@ -568,6 +626,12 @@ class LlamaRunner(Runner):
         self._vision = False
         self._tools = False
         self.projector_path = None
+        # The loaded model's own Modelfile parameters and system
+        # prompt, carried from its Ollama manifest by discovery
+        # (v0.13). Empty/None for a folder model: it generates on
+        # engine defaults, exactly as before.
+        self._model_params = {}
+        self._model_system = None
 
     @property
     def supports_vision(self):
@@ -584,7 +648,8 @@ class LlamaRunner(Runner):
         return read_ram_bytes()[1]
 
     def load(self, path, progress_cb=None, cancel_event=None,
-             display_name=None, n_ctx=None):
+             display_name=None, n_ctx=None, model_params=None,
+             model_system=None, projector=None):
         # The name the user sees: an Ollama model's name, or the
         # file name. Progress and errors use it, never the blob
         # filename (task 11).
@@ -643,7 +708,17 @@ class LlamaRunner(Runner):
         # handler (CPU only). A projector that cannot be used
         # never blocks the load: the model still loads, as text
         # only, and the warning says why it cannot see.
-        projector = find_projector(path)
+        # A store model names its projector explicitly (v0.13):
+        # in Ollama's store every blob is hash-named, so the
+        # folder search beside the model can never find it. The
+        # explicit file wins when it is really there; the folder
+        # search is the fallback, unchanged for folder models.
+        projector_file = None
+        if projector is not None and os.path.isfile(str(projector)):
+            projector_file = projector
+        if projector_file is None:
+            projector_file = find_projector(path)
+        projector = projector_file
         chat_handler = None
         vision_warning = ""
         if projector is not None:
@@ -706,6 +781,12 @@ class LlamaRunner(Runner):
         self._tools = _template_supports_tools(self._llm)
         self.projector_path = (str(projector)
                                if chat_handler is not None else None)
+        # The model's own parameters and system prompt ride
+        # with the load (v0.13): every generation below passes
+        # them to the engine.
+        self._model_params = dict(model_params or {})
+        self._model_system = (str(model_system)
+                              if model_system else None)
         result = {"load_time_s": time.monotonic() - started}
         if vision_warning:
             result["vision_warning"] = vision_warning
@@ -718,7 +799,215 @@ class LlamaRunner(Runner):
         self._vision = False
         self._tools = False
         self.projector_path = None
+        self._model_params = {}
+        self._model_system = None
         super().unload()
+
+    # -- the model's own settings, the token budget (v0.13) --
+
+    def _sampling_kwargs(self):
+        """The loaded model's own sampling parameters as engine
+        kwargs: only the ones its Modelfile actually specified
+        (an unspecified parameter keeps the engine default,
+        exactly as before). The reply cap is NOT among them:
+        max_tokens stays Fyrn's setting. The model's stop
+        sequences are passed as the call's stops; the engine's
+        own end-of-turn handling still applies on top of them."""
+        params = self._model_params or {}
+        kwargs = {}
+        for key in ("temperature", "top_p", "top_k",
+                    "presence_penalty", "frequency_penalty",
+                    "repeat_penalty"):
+            if key in params:
+                kwargs[key] = params[key]
+        if params.get("stop"):
+            kwargs["stop"] = list(params["stop"])
+        return kwargs
+
+    def _system_text(self, instructions):
+        """The system prompt for a turn: the chat's own
+        instructions when it has any (Fyrn's setting wins), else
+        the model's own system prompt from its manifest, else
+        None."""
+        if instructions and str(instructions).strip():
+            return str(instructions)
+        if self._model_system and self._model_system.strip():
+            return self._model_system
+        return None
+
+    def _tokenize(self, text):
+        """Tokenize text with the loaded model's tokenizer, for
+        counting. Special tokens in the text count as themselves
+        (the rendered prompt is full of them)."""
+        data = (text.encode("utf-8") if isinstance(text, str)
+                else text)
+        try:
+            return self._llm.tokenize(data, add_bos=False,
+                                      special=True)
+        except TypeError:
+            return self._llm.tokenize(data)
+
+    def _count_prompt_tokens(self, messages, tools=None,
+                             image_count=0):
+        """How many tokens the engine will spend on this prompt:
+        the chat template's own rendering of the messages,
+        tokenized. The tools block is rendered in when tools are
+        on offer (it is part of the prompt, and on a small window
+        it is half of it). Each attached picture adds a flat
+        allowance: the vision handler expands a picture into
+        tokens the text count cannot see. When the template
+        cannot be rendered (a stub engine, a broken template),
+        the count falls back to the message texts plus a
+        per-message framing allowance: an estimate, but one that
+        still grows with the history, which is all the budget
+        below needs to trim against."""
+        count = None
+        template = None
+        try:
+            metadata = getattr(self._llm, "metadata", None) or {}
+            template = metadata.get("tokenizer.chat_template")
+        except Exception:
+            template = None
+        if template:
+            try:
+                from llama_cpp.llama_chat_format import (
+                    Jinja2ChatFormatter)
+                eos = bos = ""
+                try:
+                    eos = self._llm.detokenize(
+                        [self._llm.token_eos()]).decode(
+                            "utf-8", "replace")
+                    bos = self._llm.detokenize(
+                        [self._llm.token_bos()]).decode(
+                            "utf-8", "replace")
+                except Exception:
+                    pass
+                formatter = Jinja2ChatFormatter(
+                    template=template, eos_token=eos,
+                    bos_token=bos)
+                plain = []
+                for message in messages:
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        content = "".join(
+                            str(part.get("text", ""))
+                            for part in content
+                            if isinstance(part, dict))
+                    entry = {"role": message.get("role"),
+                             "content": content}
+                    if message.get("tool_calls"):
+                        entry["tool_calls"] = message["tool_calls"]
+                    plain.append(entry)
+                rendered = formatter(
+                    messages=plain, tools=tools).prompt
+                count = len(self._tokenize(rendered))
+            except Exception:
+                count = None
+        if count is None:
+            total = 0
+            for message in messages:
+                content = message.get("content")
+                if isinstance(content, list):
+                    content = "".join(
+                        str(part.get("text", ""))
+                        for part in content
+                        if isinstance(part, dict))
+                total += len(self._tokenize(str(content or "")))
+                total += 8  # role markers and template framing
+            if tools:
+                total += len(self._tokenize(json.dumps(tools)))
+            count = total
+        if image_count:
+            # One picture's tokens through the vision handler,
+            # as a flat allowance: the guard only needs the
+            # right order of magnitude.
+            count += 512 * image_count
+        return count
+
+    # Room left at the top of the window after a fitted turn:
+    # the count above is the template's rendering, and a token
+    # or two of framing slop must never be the difference
+    # between a reply and an engine error.
+    _CONTEXT_MARGIN_TOKENS = 16
+
+    def _fit_messages(self, messages, cap, tools=None,
+                      image_count=0):
+        """Fit a turn to the loaded window, by tokens (v0.13).
+
+        messages is [system?] + history + [new user message].
+        While the rendered prompt plus the full reply cap would
+        overflow the window, the OLDEST history exchanges are
+        dropped (the system message and the newest exchange are
+        never dropped). What cannot be trimmed away is priced
+        into a smaller reply cap instead. Returns (messages,
+        effective_cap). Raises RunnerError with
+        CHAT_TOO_LONG_MESSAGE when even the newest exchange
+        alone leaves no room for a single reply token: the turn
+        does not run, and the user is told in plain words. The
+        trimming is per-turn only; the caller's history (and the
+        saved chat) keeps everything.
+
+        With no known window (a runner that never recorded one),
+        the messages and cap pass through untouched.
+        """
+        n_ctx = self.context_tokens
+        if not n_ctx:
+            return messages, cap
+        system = []
+        body = list(messages)
+        if body and body[0].get("role") == "system":
+            system = body[:1]
+            body = body[1:]
+        if not body:
+            return messages, cap
+        history, current = body[:-1], body[-1]
+        # The newest exchange starts at the last user message in
+        # the history; everything from there on is untouchable.
+        # Drops come off the front, so the protected tail is a
+        # length, not an index: the last protected_len messages.
+        newest_start = 0
+        for index, message in enumerate(history):
+            if message.get("role") == "user":
+                newest_start = index
+        protected_len = len(history) - newest_start
+
+        def prompt_tokens(hist):
+            return self._count_prompt_tokens(
+                system + hist + [current], tools=tools,
+                image_count=image_count)
+
+        count = prompt_tokens(history)
+        while count + cap > n_ctx and len(history) > protected_len:
+            # Drop the oldest exchange: its first message, and
+            # the replies that belonged to it (everything up to
+            # the next user message or the protected tail).
+            drop = 1
+            while (drop < len(history) - protected_len
+                   and history[drop].get("role") != "user"):
+                drop += 1
+            history = history[drop:]
+            count = prompt_tokens(history)
+        room = n_ctx - count - self._CONTEXT_MARGIN_TOKENS
+        if room < 1:
+            raise RunnerError(CHAT_TOO_LONG_MESSAGE)
+        return system + history + [current], min(cap, room)
+
+    def _response_tokens(self, response, message):
+        """The tokens one engine round generated: the engine's
+        own completion count when it reports one, else the
+        message it returned, tokenized (its text plus any tool
+        calls it made)."""
+        usage = (response or {}).get("usage") or {}
+        counted = usage.get("completion_tokens")
+        if isinstance(counted, int) and counted >= 0:
+            return counted
+        text = (message or {}).get("content") or ""
+        for call in _native_tool_calls(message or {}):
+            text += json.dumps(call.get("arguments") or {})
+        try:
+            return len(self._tokenize(text))
+        except Exception:
+            return max(1, len(text) // 4)
 
     def generate(self, prompt, on_token=None, cancel_event=None,
                  history=None, images=None,
@@ -737,12 +1026,13 @@ class LlamaRunner(Runner):
         # the model answers in context; the new message is last.
         # With pictures, the new message carries them as image
         # parts the engine's vision handler turns into sight.
-        # The chat's instructions, when it has any, lead as the
-        # system prompt (v0.8).
+        # The system prompt leads: the chat's instructions when
+        # it has any, else the model's own (v0.8, v0.13).
         messages = []
-        if instructions and str(instructions).strip():
+        system_text = self._system_text(instructions)
+        if system_text is not None:
             messages.append({"role": "system",
-                             "content": str(instructions)})
+                             "content": system_text})
         messages.extend(trim_history(history or []))
         if images:
             parts = [{"type": "text", "text": prompt}]
@@ -757,11 +1047,20 @@ class LlamaRunner(Runner):
             messages.append({"role": "user", "content": parts})
         else:
             messages.append({"role": "user", "content": prompt})
+        # The token budget (v0.13): the rendered prompt is
+        # counted in tokens, the oldest exchanges dropped, and
+        # the cap shrunk to what fits, so a long chat can no
+        # longer die of overflow. Raises the plain-words
+        # too-long error when nothing fits at all.
+        messages, cap = self._fit_messages(
+            messages, reply_cap(max_tokens),
+            image_count=len(images or []))
         try:
             stream = self._llm.create_chat_completion(
                 messages=messages,
                 stream=True,
-                max_tokens=reply_cap(max_tokens),
+                max_tokens=cap,
+                **self._sampling_kwargs(),
             )
             for chunk in stream:
                 if cancel_event is not None and cancel_event.is_set():
@@ -781,8 +1080,7 @@ class LlamaRunner(Runner):
         except GenerationCancelled:
             raise
         except Exception as exc:
-            raise RunnerError(
-                "The model stopped with an error (%s)." % exc)
+            raise RunnerError(failure_message(exc))
         elapsed_s = time.monotonic() - started
         if ttft_s is None:
             ttft_s = elapsed_s
@@ -823,9 +1121,10 @@ class LlamaRunner(Runner):
                 "This model cannot use tools.")
         started = time.monotonic()
         messages = []
-        if instructions and str(instructions).strip():
+        system_text = self._system_text(instructions)
+        if system_text is not None:
             messages.append({"role": "system",
-                             "content": str(instructions)})
+                             "content": system_text})
         messages.extend(trim_history(history or []))
         if images:
             parts = [{"type": "text", "text": prompt}]
@@ -841,24 +1140,51 @@ class LlamaRunner(Runner):
             messages.append({"role": "user", "content": parts})
         else:
             messages.append({"role": "user", "content": prompt})
+        # The token budget (v0.13), with the tools block priced
+        # into the rendered prompt: it is part of what the
+        # engine is sent, and on a small window it is half of
+        # it. Same rule as the plain path: trim oldest first,
+        # shrink the cap to what fits, never die of overflow.
+        messages, cap = self._fit_messages(
+            messages, reply_cap(max_tokens), tools=WEB_TOOL_DEFINITIONS,
+            image_count=len(images or []))
+        sampling = self._sampling_kwargs()
 
         def cancelled():
             return cancel_event is not None and cancel_event.is_set()
 
+        # Stats honesty (v0.13): the numbers describe the WHOLE
+        # turn. "tokens" counts every token the engine generated
+        # across all rounds (tool rounds included), "speed" is
+        # that total over the turn's whole elapsed time, and
+        # "first token" is stamped when the final answer's first
+        # piece is actually handed to the UI (tool rounds do not
+        # stream, so nothing can be stamped earlier). Before
+        # v0.13 the count covered only the final round's text
+        # while the time covered every round, so a long tool
+        # turn showed a speed several times slower than the
+        # engine's real decode rate.
+        generated_tokens = 0
+
         def finish(text):
             """Emit the final answer in pieces; build the stats."""
-            ttft_s = time.monotonic() - started
+            ttft_s = None
             if text and on_token is not None:
                 for piece in re.findall(r"\S+\s*|\s+", text):
                     if cancelled():
                         raise GenerationCancelled("Reply stopped.")
+                    if ttft_s is None:
+                        ttft_s = time.monotonic() - started
                     on_token(piece)
             elapsed_s = time.monotonic() - started
+            if ttft_s is None:
+                ttft_s = elapsed_s
             try:
                 tokens = len(self._llm.tokenize(
                     text.encode("utf-8")))
             except Exception:
                 tokens = max(1, len(text) // 4)
+            tokens += generated_tokens
             return {"tokens": tokens,
                     "elapsed_s": elapsed_s,
                     "ttft_s": ttft_s,
@@ -872,10 +1198,11 @@ class LlamaRunner(Runner):
             try:
                 response = self._llm.create_chat_completion(
                     messages=messages,
-                    tools=TOOL_DEFINITIONS,
+                    tools=WEB_TOOL_DEFINITIONS,
                     tool_choice="auto",
                     stream=False,
-                    max_tokens=reply_cap(max_tokens),
+                    max_tokens=cap,
+                    **sampling,
                 )
             except GenerationCancelled:
                 raise
@@ -883,8 +1210,7 @@ class LlamaRunner(Runner):
                 if rounds == 0 and _looks_like_tool_problem(exc):
                     raise ToolsUnsupportedError(
                         "This model cannot use tools.")
-                raise RunnerError(
-                    "The model stopped with an error (%s)." % exc)
+                raise RunnerError(failure_message(exc))
             choices = response.get("choices") or []
             message = (choices[0].get("message")
                        if choices else None) or {}
@@ -901,6 +1227,10 @@ class LlamaRunner(Runner):
                     parsed_text = True
             if not calls:
                 return finish(content)
+            # This round generated tokens too (v0.13): they count
+            # toward the turn's stats, not just the final answer.
+            generated_tokens += self._response_tokens(response,
+                                                      message)
             rounds += 1
             if rounds > MAX_TOOL_ROUNDS:
                 # The model kept asking: one last round with no
@@ -910,7 +1240,8 @@ class LlamaRunner(Runner):
                     response = self._llm.create_chat_completion(
                         messages=messages,
                         stream=False,
-                        max_tokens=reply_cap(max_tokens),
+                        max_tokens=cap,
+                        **sampling,
                     )
                     choices = response.get("choices") or []
                     message = (choices[0].get("message")

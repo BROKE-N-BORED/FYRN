@@ -15,7 +15,7 @@ served JavaScript before, while every Python-side test
 stayed green).
 
 The deck is a chat face only: pick a model, chat (streamed),
-attach one photo, stop a reply, start a new chat. No tools,
+attach one photo, stop a reply, start a new chat. No web browsing,
 no settings, no file access - those live at the PC.
 
 Style note: the CSS writes colours as rgb() and sizes with

@@ -1,28 +1,30 @@
-"""GUI tests for v0.8: saved chats, instructions per chat, the
-tool path in the window, the approval gate, and the browser view.
+"""GUI tests: saved chats, instructions per chat, the web
+browsing path in the window (off by default, on at the
+user's flip, calls in the transcript and the browser view),
+and the settings page. The built-in tools these tests also
+covered (file tools, the approval-gated command tool) were
+removed in v0.13; what remains is the Forge Browser
+connection.
 
-Uses the shared GuiTestCase (temp home, temp models folder, fake
-runners), so no real model, network, or browser is involved. The
-web test points the Forge Browser setting at a stub CLI folder
-the test creates.
+Uses the shared GuiTestCase (temp home, temp models folder,
+fake runners), so no real model, network, or browser is
+involved. The web tests point the Forge Browser setting at
+a stub CLI folder the test creates.
 """
 
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from PySide6.QtCore import QTimer, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
 
 from helpers import make_fake_gguf
 from test_gui import GuiTestCase, pump_until
 from test_tools import make_stub_forge_browser
 
 from fyrn.chats import ChatStore
-from fyrn.gui import (BrowserWindow, CommandApprovalDialog,
-                      get_forge_browser_path, get_tools_folder,
-                      set_forge_browser_path, set_tools_folder)
+from fyrn.gui import (BrowserWindow, get_forge_browser_path,
+                      set_forge_browser_path)
 from fyrn.runner import FakeRunner, ToolsUnsupportedError
 
 
@@ -163,59 +165,43 @@ class SavedChatGuiTests(GuiTestCase):
         self.assertEqual(record["messages"], [])
 
 
-class ToolChatGuiTests(GuiTestCase):
-    def setUp(self):
-        super().setUp()
-        self.tools_folder = self.base / "tools"
-        self.tools_folder.mkdir()
-        (self.tools_folder / "notes.txt").write_text(
-            "the launch code is 4419", encoding="utf-8")
-        set_tools_folder(str(self.tools_folder))
-
+class BrowsingChatGuiTests(GuiTestCase):
     def _window(self, runner):
         make_fake_gguf(self.models / "alpha.gguf", 2048)
         window = self.make_window(runner=runner)
         self.load_first_model(window)
         return window
 
-    def _answer_approval(self, approve):
-        self.watcher.enabled = False
-        timer = QTimer()
-        timer.setInterval(80)
+    def _stub_browser(self):
+        app_dir = make_stub_forge_browser(self.base / "installed")
+        set_forge_browser_path(str(app_dir))
+        return app_dir
 
-        def answer():
-            for widget in QApplication.topLevelWidgets():
-                if isinstance(widget, CommandApprovalDialog) \
-                        and widget.isVisible():
-                    timer.stop()
-                    button = (widget.run_button if approve
-                              else widget.cancel_button)
-                    button.click()
-
-        timer.timeout.connect(answer)
-        timer.start()
-        return timer
-
-    def test_tool_call_shows_in_transcript(self):
+    def test_web_call_shows_in_transcript(self):
+        self._stub_browser()
         runner = FakeRunner(
             supports_tools=True,
-            tool_script=[("call", "read_file",
-                          {"path": "notes.txt"}),
-                         ("text", "The launch code is 4419.")])
+            tool_script=[("call", "web_search",
+                          {"query": "stub query"}),
+                         ("text", "Found one result.")])
         window = self._window(runner)
-        self.assertIn("Tools are on",
-                      window.tools_status_label.text())
-        window.chat_input.setText("What is the launch code?")
+        # Browsing is off by default (v0.13): the user turns
+        # it on for the chat first.
+        window.browsing_check.setChecked(True)
+        self.assertIn("Web browsing is on for this chat",
+                      window.browsing_status_label.text())
+        window.chat_input.setText("Search the web for me")
         window.send_message()
         self.wait_chat(window)
         text = window.transcript.toPlainText()
-        self.assertIn("Tool: read_file - notes.txt", text)
-        self.assertIn("Result: read notes.txt", text)
-        self.assertIn("The launch code is 4419.", text)
-        # The answer's name prefix comes after the tool lines.
-        self.assertLess(text.index("Tool: read_file"),
-                        text.index("The launch code is 4419."))
-        # The tool lines are in the saved chat too.
+        self.assertIn("Web search - stub query", text)
+        self.assertIn(
+            'Result: searched for "stub query" (1 results)', text)
+        self.assertIn("Found one result.", text)
+        # The answer's name prefix comes after the call lines.
+        self.assertLess(text.index("Web search - stub query"),
+                        text.index("Found one result."))
+        # The call lines are in the saved chat too.
         record = ChatStore(home=self.home).load(
             window._current_chat_id)
         roles = [m["role"] for m in record["messages"]]
@@ -225,6 +211,7 @@ class ToolChatGuiTests(GuiTestCase):
     def test_instructions_reach_the_model(self):
         runner = FakeRunner(supports_tools=True)
         window = self._window(runner)
+        window.browsing_check.setChecked(True)
         window.instructions_edit.setPlainText(
             "You are a pirate. Answer like one.")
         window.chat_input.setText("Hello")
@@ -234,7 +221,7 @@ class ToolChatGuiTests(GuiTestCase):
                          "You are a pirate. Answer like one.")
 
     def test_instructions_reach_a_plain_model_too(self):
-        runner = FakeRunner()  # no tool support: the plain path
+        runner = FakeRunner()  # no browsing support: plain path
         window = self._window(runner)
         window.instructions_edit.setPlainText(
             "Always answer in French.")
@@ -244,57 +231,20 @@ class ToolChatGuiTests(GuiTestCase):
         self.assertEqual(runner.last_instructions,
                          "Always answer in French.")
 
-    def test_command_runs_only_after_a_yes(self):
-        runner = FakeRunner(
-            supports_tools=True,
-            tool_script=[("call", "run_command",
-                          {"command": "touch sentinel.txt"}),
-                         ("text", "Done.")])
-        window = self._window(runner)
-        timer = self._answer_approval(approve=True)
-        try:
-            window.chat_input.setText("Make the file")
-            window.send_message()
-            self.wait_chat(window)
-        finally:
-            timer.stop()
-            self.watcher.enabled = True
-        self.assertTrue(
-            (self.tools_folder / "sentinel.txt").exists())
-        self.assertIn("Tool: run_command - touch sentinel.txt",
-                      window.transcript.toPlainText())
-
-    def test_command_cancelled_never_runs(self):
-        runner = FakeRunner(
-            supports_tools=True,
-            tool_script=[("call", "run_command",
-                          {"command": "touch sentinel.txt"}),
-                         ("text", "Okay, not doing that.")])
-        window = self._window(runner)
-        timer = self._answer_approval(approve=False)
-        try:
-            window.chat_input.setText("Make the file")
-            window.send_message()
-            self.wait_chat(window)
-        finally:
-            timer.stop()
-            self.watcher.enabled = True
-        self.assertFalse(
-            (self.tools_folder / "sentinel.txt").exists())
-        self.assertIn("said no", window.transcript.toPlainText())
-
-    def test_stop_cancels_the_tool_loop(self):
+    def test_stop_cancels_the_browsing_loop(self):
+        self._stub_browser()
         runner = FakeRunner(
             supports_tools=True, token_delay_s=0.0,
-            tool_script=[("call", "calculate",
-                          {"expression": "1+1"}),
+            tool_script=[("call", "web_search",
+                          {"query": "stub query"}),
                          ("sleep", 2.0),
                          ("text", "late answer")])
         window = self._window(runner)
-        window.chat_input.setText("Add it up, slowly")
+        window.browsing_check.setChecked(True)
+        window.chat_input.setText("Search, slowly")
         window.send_message()
         self.assertTrue(pump_until(
-            lambda: "Tool: calculate" in
+            lambda: "Web search" in
             window.transcript.toPlainText()))
         window.stop_button.click()
         self.wait_chat(window)
@@ -304,14 +254,14 @@ class ToolChatGuiTests(GuiTestCase):
                          window.transcript.toPlainText())
 
     def test_web_tool_fills_the_browser_view(self):
-        app_dir = make_stub_forge_browser(self.base / "installed")
-        set_forge_browser_path(str(app_dir))
+        self._stub_browser()
         runner = FakeRunner(
             supports_tools=True,
             tool_script=[("call", "web_search",
                           {"query": "stub query"}),
                          ("text", "Found one result.")])
         window = self._window(runner)
+        window.browsing_check.setChecked(True)
         window.chat_input.setText("Search the web for me")
         window.send_message()
         self.wait_chat(window)
@@ -321,36 +271,37 @@ class ToolChatGuiTests(GuiTestCase):
         self.assertIn("Stub Result", content)
         self.assertIn("Search results for: stub query",
                       window.browser_window.status_label.text())
-        self.assertIn("Tool: web_search - stub query",
+        self.assertIn("Web search - stub query",
                       window.transcript.toPlainText())
 
-    def test_model_without_tools_chats_as_before(self):
+    def test_model_without_browsing_chats_as_before(self):
         runner = FakeRunner()  # supports_tools=False
         window = self._window(runner)
-        self.assertIn("cannot use tools",
-                      window.tools_status_label.text())
+        self.assertIn("cannot browse the web",
+                      window.browsing_status_label.text())
         window.chat_input.setText("Hello")
         window.send_message()
         self.wait_chat(window)
         text = window.transcript.toPlainText()
         self.assertIn("Hello from the fake model", text)
-        self.assertNotIn("Tool:", text)
+        self.assertNotIn("Web search", text)
 
-    def test_broken_tool_path_falls_back_to_a_plain_reply(self):
+    def test_broken_browsing_path_falls_back_to_a_plain_reply(self):
         class FallbackRunner(FakeRunner):
             def generate_tools(self, *args, **kwargs):
-                raise ToolsUnsupportedError("no tools after all")
+                raise ToolsUnsupportedError("no browsing after all")
 
         runner = FallbackRunner(supports_tools=True)
         window = self._window(runner)
+        window.browsing_check.setChecked(True)
         window.chat_input.setText("Hello")
         window.send_message()
         self.wait_chat(window)
         self.assertIn("Hello from the fake model",
                       window.transcript.toPlainText())
-        self.assertTrue(window._tools_broken)
-        self.assertIn("cannot use tools",
-                      window.tools_status_label.text())
+        self.assertTrue(window._browsing_broken)
+        self.assertIn("cannot browse the web",
+                      window.browsing_status_label.text())
 
 
 class BrowserWindowTests(GuiTestCase):
@@ -385,21 +336,22 @@ class BrowserWindowTests(GuiTestCase):
 
 
 class ToolSettingsGuiTests(GuiTestCase):
-    def test_settings_window_saves_the_tool_settings(self):
+    """The settings page (the class name predates v0.13): the
+    tools folder setting is gone with the built-in tools;
+    the Forge Browser folder remains and saves."""
+
+    def test_settings_window_saves_the_forge_browser_folder(self):
         from fyrn.gui import SettingsWindow
         settings = SettingsWindow(self.models)
         self.windows.append(settings)
         settings.show()
         QTest.qWait(50)
-        self.assertEqual(settings.tools_folder_edit.text(),
-                         get_tools_folder())
-        new_folder = str(self.base / "picked-tools")
-        settings.tools_folder_edit.setText(new_folder)
+        # No tools folder control exists any more (v0.13).
+        self.assertFalse(hasattr(settings, "tools_folder_edit"))
         app_dir = make_stub_forge_browser(self.base / "installed")
         settings.forge_path_edit.setText(str(app_dir))
         settings.save_button.click()
         QTest.qWait(50)
-        self.assertEqual(get_tools_folder(), new_folder)
         self.assertEqual(get_forge_browser_path(), str(app_dir))
 
 

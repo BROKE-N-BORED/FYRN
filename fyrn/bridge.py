@@ -603,14 +603,18 @@ class BridgeService:
                 return
         try:
             verdict, message = controller.check_before_load(
-                entry["path"], context_tokens=num_ctx)
+                entry["path"], context_tokens=num_ctx,
+                projector=entry.get("projector"))
         except ModelNotFoundError as exc:
             raise BridgeError(404, str(exc))
         if verdict == "refuse":
             raise BridgeError(500, message)
         try:
             controller.load(entry["path"], display_name=name,
-                            n_ctx=num_ctx)
+                            n_ctx=num_ctx,
+                            model_params=entry.get("params"),
+                            model_system=entry.get("system"),
+                            projector=entry.get("projector"))
         except (ModelTooBigError, RunnerError) as exc:
             raise BridgeError(500, str(exc))
 

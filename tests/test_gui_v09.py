@@ -155,6 +155,9 @@ class ReplyLengthWiringTests(GuiTestCase):
             tool_script=[("text", self.LONG_REPLY)])
         window = self.make_window(runner=runner)
         self.load_first_model(window)
+        # Browsing is off by default (v0.13): turn it on for
+        # this chat, as the user now does.
+        window.browsing_check.setChecked(True)
         window.chat_input.setPlainText("hello")
         window.send_button.click()
         self.wait_chat(window)

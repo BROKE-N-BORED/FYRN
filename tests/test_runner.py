@@ -844,35 +844,40 @@ class FakeRunnerToolTests(unittest.TestCase):
         return runner
 
     def test_multi_round_loop(self):
-        import tempfile
-        from fyrn.tools import ToolExecutor
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp)
-            (folder / "a.txt").write_text("alpha", encoding="utf-8")
-            executor = ToolExecutor(folder)
-            runner = self._loaded(
-                supports_tools=True,
-                tool_script=[
-                    ("call", "read_file", {"path": "a.txt"}),
-                    ("call", "calculate", {"expression": "6 * 7"}),
-                    ("text", "Done: alpha and 42."),
-                ])
-            events = []
-            pieces = []
-            stats = runner.generate_tools(
-                "read and add",
-                execute_tool=executor.execute,
-                on_token=pieces.append,
-                on_event=lambda kind, data: events.append(
-                    (kind, data["name"])))
-            self.assertEqual("".join(pieces), "Done: alpha and 42.")
-            self.assertEqual(events, [
-                ("call", "read_file"), ("result", "read_file"),
-                ("call", "calculate"), ("result", "calculate")])
-            self.assertEqual(
-                [m["content"] for m in runner.last_tool_messages],
-                ["alpha", "6 * 7 = 42"])
-            self.assertGreater(stats["tokens"], 0)
+        # The loop's subject is the runner: rounds of calls
+        # whose results feed the next round. The executor here
+        # is a stand-in keyed by call name (the real web
+        # executor has its own tests in test_tools.py).
+        canned = {"web_search": ("alpha", "alpha"),
+                  "web_read": ("6 * 7 = 42", "read")}
+
+        def fake_execute(name, arguments):
+            return canned[name]
+
+        runner = self._loaded(
+            supports_tools=True,
+            tool_script=[
+                ("call", "web_search", {"query": "alpha"}),
+                ("call", "web_read",
+                 {"url": "https://example.com"}),
+                ("text", "Done: alpha and 42."),
+            ])
+        events = []
+        pieces = []
+        stats = runner.generate_tools(
+            "search and read",
+            execute_tool=fake_execute,
+            on_token=pieces.append,
+            on_event=lambda kind, data: events.append(
+                (kind, data["name"])))
+        self.assertEqual("".join(pieces), "Done: alpha and 42.")
+        self.assertEqual(events, [
+            ("call", "web_search"), ("result", "web_search"),
+            ("call", "web_read"), ("result", "web_read")])
+        self.assertEqual(
+            [m["content"] for m in runner.last_tool_messages],
+            ["alpha", "6 * 7 = 42"])
+        self.assertGreater(stats["tokens"], 0)
 
     def test_instructions_reach_the_runner(self):
         runner = self._loaded(supports_tools=True)
@@ -901,24 +906,26 @@ class FakeRunnerToolTests(unittest.TestCase):
             timer.cancel()
 
     def test_tool_refusal_is_a_result_not_a_crash(self):
-        import tempfile
-        from fyrn.tools import ToolExecutor
-        with tempfile.TemporaryDirectory() as tmp:
-            executor = ToolExecutor(Path(tmp))
-            runner = self._loaded(
-                supports_tools=True,
-                tool_script=[
-                    ("call", "read_file", {"path": "../secret"}),
-                    ("text", "I could not read that.")])
-            pieces = []
-            runner.generate_tools(
-                "read it", execute_tool=executor.execute,
-                on_token=pieces.append)
-            self.assertEqual("".join(pieces),
-                             "I could not read that.")
-            self.assertTrue(
-                runner.last_tool_messages[0]["content"].startswith(
-                    "Refused:"))
+        # A web call that cannot run (no Forge Browser here)
+        # comes back as a result text and the loop carries
+        # on: the refusal is data for the model, not a crash.
+        from fyrn.tools import BrowserToolExecutor
+        with mock.patch("fyrn.tools.find_forge_browser_command",
+                        return_value=None):
+            executor = BrowserToolExecutor()
+        runner = self._loaded(
+            supports_tools=True,
+            tool_script=[
+                ("call", "web_search", {"query": "anything"}),
+                ("text", "I could not search.")])
+        pieces = []
+        runner.generate_tools(
+            "search it", execute_tool=executor.execute,
+            on_token=pieces.append)
+        self.assertEqual("".join(pieces), "I could not search.")
+        self.assertTrue(
+            runner.last_tool_messages[0]["content"].startswith(
+                "Forge Browser is not installed"))
 
     def test_no_tool_support_raises(self):
         from fyrn.runner import ToolsUnsupportedError
@@ -1147,16 +1154,21 @@ class ToolDetectionTests(unittest.TestCase):
 
 
 class RealToolCallTests(unittest.TestCase):
-    """v0.8: one REAL tool call end to end — the real LFM3 model
-    asks for the calculator and answers from its result. Opt-in
-    only (FYRN_REAL_ENGINE_TESTS=1), like the load test above:
-    a real load takes minutes and RAM the sandbox may not have.
-    """
+    """One REAL web call end to end: the real LFM3 model asks
+    for a web search (through a stub Forge Browser CLI the
+    test creates) and answers from its result. Opt-in only
+    (FYRN_REAL_ENGINE_TESTS=1), like the load test above: a
+    real load takes minutes and RAM the sandbox may not have.
+    (v0.8-v0.12 this drove the calculator; the built-in tools
+    were removed in v0.13 and the web connection is what
+    remains.)"""
 
-    def test_real_lfm3_tool_call(self):
+    def test_real_lfm3_web_search(self):
         if not _real_engine_available():
             self.skipTest("real-engine test not opted in")
-        from fyrn.tools import ToolExecutor
+        from test_tools import make_stub_forge_browser
+
+        from fyrn.tools import BrowserToolExecutor
         runner = LlamaRunner(free_ram_fn=lambda: 8 * GB)
         runner.load(_LFM3_BLOB, display_name="lfm3:1.7b")
         try:
@@ -1164,19 +1176,24 @@ class RealToolCallTests(unittest.TestCase):
                 runner.supports_tools,
                 "LFM3's template should carry tool support")
             with tempfile.TemporaryDirectory() as tmp:
-                executor = ToolExecutor(Path(tmp))
+                app_dir = make_stub_forge_browser(Path(tmp))
+                executor = BrowserToolExecutor(
+                    forge_override=str(app_dir))
                 pieces = []
                 events = []
                 runner.generate_tools(
-                    "Use the calculate tool to work out "
-                    "17 * 24, then tell me the result.",
+                    "Use the web_search tool to search for "
+                    "'stub query', then tell me the title of "
+                    "the first result you found.",
                     execute_tool=executor.execute,
                     on_token=pieces.append,
                     on_event=lambda k, d: events.append(k))
             self.assertIn("call", events)
-            self.assertIn("408", "".join(pieces))
+            self.assertIn("Stub Result", "".join(pieces))
         finally:
             runner.unload()
+
+
 class ReplyCapTests(unittest.TestCase):
     """The reply-length cap (v0.9): one helper decides what an
     unset or bad cap means, and the cap reaches the engine on

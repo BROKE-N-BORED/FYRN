@@ -53,10 +53,11 @@ from .discover import discover_ollama_models
 # pull actually runs.
 from .runner import (GenerationCancelled, LoadCancelled, LlamaRunner,
                      RunnerError, ToolsUnsupportedError,
-                     auto_context_tokens, trim_history, warm_engine)
+                     auto_context_tokens, plain_chat_failure,
+                     trim_history, warm_engine)
 from .theme import (DARK, HIGH_CONTRAST, THEMES, build_stylesheet,
                     fit_badges, rgba_string)
-from .tools import ToolExecutor
+from .tools import BrowserToolExecutor
 
 DEFAULT_WIDTH = 1100
 DEFAULT_HEIGHT = 700
@@ -172,26 +173,6 @@ def get_update_check():
 def set_update_check(value):
     settings = get_settings()
     settings.setValue("update_check", bool(value))
-    settings.sync()
-
-
-def default_tools_folder():
-    """Where the file tools work until the user picks a folder:
-    a visible folder in the home directory, created on use."""
-    return str(Path.home() / "Fyrn files")
-
-
-def get_tools_folder():
-    """The one folder the model's file tools may touch (Settings
-    window, or the button on the Chat tab)."""
-    settings = get_settings()
-    value = settings.value("tools_folder", "", type=str)
-    return value if value else default_tools_folder()
-
-
-def set_tools_folder(value):
-    settings = get_settings()
-    settings.setValue("tools_folder", str(value))
     settings.sync()
 
 
@@ -389,9 +370,9 @@ HOW_TO_USE_SECTIONS = {
         "four pages, listed on the left of the window: Models "
         "and downloads (the models folder, whether Ollama's "
         "already-downloaded models are listed, and the "
-        "pull-complete chime mute); Chat and tools (the reply "
-        "length, idle auto-unload, the tools folder, and an "
-        "optional Forge Browser folder); Bridge and phone (the "
+        "pull-complete chime mute); Chat and browsing (the "
+        "reply length, idle auto-unload, and an optional "
+        "Forge Browser folder); Bridge and phone (the "
         "bridge for other programs, and sharing for the phone "
         "deck); and Display and updates (Reduce motion, Compact "
         "model list, High-contrast mode, and whether Fyrn "
@@ -409,11 +390,10 @@ HOW_TO_USE_SECTIONS = {
         "Fyrn quietly asks GitHub whether a newer release is out "
         "when it starts, and says so only when one is. Turn it "
         "off to check by hand instead, from the Help menu.\n\n"
-        "The tools folder is the one folder a tool-using model "
-        "can read and write files in. The Forge Browser folder "
-        "is optional: Fyrn finds Forge Browser in its usual "
-        "install place on its own, and the setting only matters "
-        "when yours lives somewhere else.\n\n"
+        "The Forge Browser folder is optional: Fyrn finds "
+        "Forge Browser in its usual install place on its own, "
+        "and the setting only matters when yours lives "
+        "somewhere else.\n\n"
         "Reply length caps how long one answer may be, in "
         "tokens. The standard 1024 fits most chats; pick more "
         "when long answers keep getting cut off.\n\n"
@@ -472,33 +452,30 @@ HOW_TO_USE_SECTIONS = {
         "If no model is loaded, Send stays greyed out. Load a model "
         "from the Models tab first."
     ),
-    "Tools": (
-        "Some models can use tools while they answer: they can "
-        "look things up and do small jobs, then answer with what "
-        "they found. The line above the transcript says whether "
-        "the loaded model can. A model that cannot use tools just "
-        "chats, exactly as before.\n\n"
-        "Every tool call shows in the transcript as it happens: "
-        "the tool's name, what it did, and a short result line. "
-        "Nothing happens out of sight.\n\n"
-        "Files: the model can read and write text files and list "
-        "what is there, but only inside the tools folder (Settings, "
-        "or the Tools folder button on the Chat tab). Anything "
-        "outside that folder is refused, and the refusal shows.\n\n"
-        "The web: searches and page reads go through Forge "
-        "Browser, the browser app on this PC. The Browser view "
-        "button (and the window that opens when a web tool runs) "
-        "shows the search or the page as it comes back, and its "
-        "Open in Forge Browser button opens the real Forge "
-        "Browser on the same page. Without Forge Browser "
-        "installed, the web tools say so and the rest still work.\n\n"
-        "Commands: the model can ask to run a command. Fyrn shows "
-        "the exact command and the folder it runs in, and it runs "
-        "only when you press Run: Cancel is the button it lands "
-        "on. The output comes back into the chat. You never need "
-        "a terminal: the model runs commands, you approve them.\n\n"
-        "Time and calculator: the model can ask for the current "
-        "date and time, and work out arithmetic."
+    "Web browsing": (
+        "A model that supports it can search the web and read "
+        "pages while it answers, through Forge Browser, the "
+        "browser app on this PC. That is Fyrn's one outside "
+        "connection: Fyrn has no built-in tools of its own, no "
+        "calculator, no file access, no commands.\n\n"
+        "Browsing is off for every chat until you turn it on "
+        "with the Web browsing via Forge Browser box on the "
+        "Chat tab: a model that can browse never turns it on "
+        "by itself, and off is faster, because nothing extra "
+        "is sent with your messages. The line above the "
+        "transcript says whether browsing is on for this "
+        "chat, and whether the loaded model can browse at "
+        "all. A model that cannot browse just chats, exactly "
+        "as before.\n\n"
+        "Every search and page read shows in the transcript "
+        "as it happens, with a short result line. Nothing "
+        "happens out of sight. The Browser view button (and "
+        "the window that opens when a search or read runs) "
+        "shows the results or the page as they come back, "
+        "and its Open in Forge Browser button opens the real "
+        "Forge Browser on the same page. Without Forge "
+        "Browser installed, a search or read says so plainly "
+        "and the chat carries on without the web."
     ),
     "Stats": (
         "While a model runs, the Chat tab shows live numbers: RAM "
@@ -592,11 +569,18 @@ class LoadWorker(QThread):
     finished = Signal(dict)      # {"load_time_s": float, "warning": str}
     failed = Signal(str)         # plain-words message
 
-    def __init__(self, controller, path, display_name=None):
+    def __init__(self, controller, path, display_name=None,
+                 model_params=None, model_system=None,
+                 projector=None):
         super().__init__()
         self.controller = controller
         self.path = path
         self.display_name = display_name
+        # What discovery read from the model's own manifest
+        # (v0.13): its parameters, system prompt, and projector.
+        self.model_params = model_params
+        self.model_system = model_system
+        self.projector = projector
         self.cancel_event = threading.Event()
 
     def run(self):
@@ -605,7 +589,10 @@ class LoadWorker(QThread):
                 self.path,
                 progress_cb=lambda pct, msg: self.progress.emit(pct, msg),
                 cancel_event=self.cancel_event,
-                display_name=self.display_name)
+                display_name=self.display_name,
+                model_params=self.model_params,
+                model_system=self.model_system,
+                projector=self.projector)
         except LoadCancelled:
             self.failed.emit("Load cancelled.")
         except (ModelTooBigError, ModelNotFoundError) as exc:
@@ -624,12 +611,11 @@ class LoadWorker(QThread):
 class ChatWorker(QThread):
     """Stream one reply off the UI thread (U30).
 
-    With tools on offer (v0.8), the worker runs the runner's tool
-    loop instead: tool calls and results come back through
-    tool_event, and a run_command call blocks in
-    request_command_approval until the UI thread answers through
-    resolve_approval — the approval modal lives on the UI thread,
-    and the command never runs without a yes."""
+    With web browsing on for the chat (v0.8; the only tool
+    calls Fyrn has since v0.13), the worker runs the runner's
+    tool loop instead: the model's web calls and their results
+    come back through tool_event, and the browser view updates
+    through web_event."""
 
     token = Signal(str)
     finished = Signal(dict)  # generation stats
@@ -637,7 +623,6 @@ class ChatWorker(QThread):
     tool_event = Signal(str, dict)         # "call" / "result"
     web_event = Signal(str, dict)          # browser view updates
     tools_fallback = Signal()              # tool path failed; plain reply used
-    approval_requested = Signal(str, str)  # command, working dir
 
     def __init__(self, runner, prompt, history=None, images=None,
                  instructions=None, executor=None, max_tokens=None):
@@ -653,8 +638,6 @@ class ChatWorker(QThread):
         # runner's default cap.
         self.max_tokens = max_tokens
         self.cancel_event = threading.Event()
-        self._approval_event = threading.Event()
-        self._approval_answer = False
 
     def run(self):
         emit_token = lambda piece: self.token.emit(piece)
@@ -706,43 +689,20 @@ class ChatWorker(QThread):
             self.finished.emit(stats)
 
     def _execute_tool(self, name, arguments):
-        """Run one tool call for the runner's loop. The executor's
-        approval callback is swapped for this worker's bridge, so
-        a run_command call asks the UI thread and waits; its web
-        events are swapped for this worker's signal, so the
-        browser view updates on the UI thread too."""
+        """Run one web call for the runner's loop. The executor's
+        web events are swapped for this worker's signal, so the
+        browser view updates on the UI thread."""
         executor = self.executor
-        previous_approve = executor._approve_command
         previous_event = executor._on_event
-        executor._approve_command = self.request_command_approval
         executor._on_event = lambda kind, data: self.web_event.emit(
             kind, data)
         try:
             return executor.execute(name, arguments)
         finally:
-            executor._approve_command = previous_approve
             executor._on_event = previous_event
-
-    def request_command_approval(self, command, cwd):
-        """Called on the worker thread by the executor: ask the UI
-        thread and wait for the answer. A stop reads as a no."""
-        self._approval_answer = False
-        self._approval_event.clear()
-        self.approval_requested.emit(command, cwd)
-        while not self._approval_event.wait(0.05):
-            if self.cancel_event.is_set():
-                return False
-        return self._approval_answer
-
-    def resolve_approval(self, approved):
-        self._approval_answer = bool(approved)
-        self._approval_event.set()
 
     def cancel(self):
         self.cancel_event.set()
-        # A worker waiting on an approval wakes up and reads the
-        # cancel as a no.
-        self._approval_event.set()
 
 
 class PullWorker(QThread):
@@ -1954,7 +1914,7 @@ class SettingsWindow(QDialog):
 
     The settings sit on four pages with a list on the left
     to move between them (v0.12): Models and downloads,
-    Chat and tools, Bridge and phone, and Display and
+    Chat and browsing, Bridge and phone, and Display and
     updates. The pages replaced the one long scrolling
     column the settings had grown into by v0.11: nothing
     scrolls now, every page fits the screen whole, and
@@ -2039,28 +1999,7 @@ class SettingsWindow(QDialog):
         chime_help.setWordWrap(True)
         layout.addWidget(chime_help)
 
-        layout = self._add_page("Chat and tools")
-
-        tools_label = QLabel("Tools folder")
-        layout.addWidget(tools_label)
-
-        tools_row = QHBoxLayout()
-        self.tools_folder_edit = QLineEdit(get_tools_folder())
-        self.tools_folder_edit.setReadOnly(True)
-        tools_browse = QPushButton("Browse")
-        tools_browse.setToolTip(
-            "Pick the folder the model's file tools may use")
-        tools_browse.clicked.connect(self._browse_tools_folder)
-        tools_row.addWidget(self.tools_folder_edit)
-        tools_row.addWidget(tools_browse)
-        layout.addLayout(tools_row)
-
-        tools_help = QLabel(
-            "When a model that can use tools is loaded, it can "
-            "read and write text files, but only inside this "
-            "folder. Nothing outside it can be touched.")
-        tools_help.setWordWrap(True)
-        layout.addWidget(tools_help)
+        layout = self._add_page("Chat and browsing")
 
         forge_label = QLabel("Forge Browser folder (optional)")
         layout.addWidget(forge_label)
@@ -2078,7 +2017,7 @@ class SettingsWindow(QDialog):
         layout.addLayout(forge_row)
 
         forge_help = QLabel(
-            "The model's web tools go through Forge Browser. Fyrn "
+            "Web browsing goes through Forge Browser. Fyrn "
             "finds it in its usual install place on its own; set "
             "this only if yours lives somewhere else.")
         forge_help.setWordWrap(True)
@@ -2284,7 +2223,7 @@ class SettingsWindow(QDialog):
         self.page_list.addItem(title)
         self.page_widgets.append(page)
         attr = {"Models and downloads": "models_page",
-                "Chat and tools": "chat_page",
+                "Chat and browsing": "chat_page",
                 "Bridge and phone": "bridge_page",
                 "Display and updates": "display_page"}[title]
         setattr(self, attr, page)
@@ -2307,13 +2246,6 @@ class SettingsWindow(QDialog):
             self, "Pick a models folder", self.folder_edit.text())
         if folder:
             self.folder_edit.setText(folder)
-
-    def _browse_tools_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Pick the tools folder",
-            self.tools_folder_edit.text())
-        if folder:
-            self.tools_folder_edit.setText(folder)
 
     def _browse_forge_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -2383,7 +2315,6 @@ class SettingsWindow(QDialog):
         set_high_contrast(self.contrast_check.isChecked())
         set_chime_muted(self.chime_check.isChecked())
         set_update_check(self.update_check.isChecked())
-        set_tools_folder(self.tools_folder_edit.text())
         set_forge_browser_path(self.forge_path_edit.text().strip())
         set_reply_length(
             self.reply_length_combo.currentData())
@@ -2571,48 +2502,8 @@ class HowToUseWindow(QDialog):
             HOW_TO_USE_SECTIONS.get(title, ""))
 
 
-class CommandApprovalDialog(QDialog):
-    """The run_command gate (v0.8): the exact command the model
-    wants to run, and where it will run. Run is never the default
-    button — Cancel is — and nothing runs unless the user clicks
-    Run. The user approves commands here; they never open a
-    terminal."""
-
-    def __init__(self, command, cwd, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Run this command?")
-        self.setModal(True)
-        self.setMinimumWidth(480)
-        layout = QVBoxLayout(self)
-        intro = QLabel(
-            "The model wants to run this command. It runs only "
-            "if you press Run.")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-        self.command_view = QPlainTextEdit(command)
-        self.command_view.setReadOnly(True)
-        self.command_view.setMaximumHeight(110)
-        layout.addWidget(self.command_view)
-        where = QLabel(f"It will run in this folder: {cwd}")
-        where.setWordWrap(True)
-        layout.addWidget(where)
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        self.run_button = QPushButton("Run")
-        self.run_button.setToolTip("Run this command now")
-        self.run_button.clicked.connect(self.accept)
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.setToolTip("Do not run it")
-        self.cancel_button.clicked.connect(self.reject)
-        buttons.addWidget(self.run_button)
-        buttons.addWidget(self.cancel_button)
-        layout.addLayout(buttons)
-        self.cancel_button.setDefault(True)
-        self.cancel_button.setFocus()
-
-
 class BrowserWindow(QDialog):
-    """The browser view (v0.8): what the model's web tools are
+    """The browser view (v0.8): what the model's web browsing is
     doing, live — the current search or page, the text Forge
     Browser brought back, a screenshot when one comes back, and
     a button that opens the real Forge Browser on the same page.
@@ -3496,12 +3387,27 @@ class MainWindow(QMainWindow):
         self._idle_timer.timeout.connect(self._idle_unload_check)
         self._idle_timer.start()
         self._reply_name = "Model"
-        # Set when a model's tool path failed mid-turn and the
-        # turn fell back to a plain reply: tools stay off for the
-        # rest of this model's session.
-        self._tools_broken = False
+        # Set when a model's browsing path failed mid-turn and
+        # the turn fell back to a plain reply: browsing stays
+        # off for the rest of this model's session.
+        self._browsing_broken = False
+        # Web browsing is OFF for a chat until the user turns
+        # it on in that chat (v0.13): nothing else may set
+        # this, not the model's own ability, not a saved chat,
+        # not a model load. It starts off here, and
+        # _reset_chat_state turns it off again for every new
+        # or opened chat, so a chat the user has not touched
+        # in this session never offers the web calls to the
+        # engine. (Before v0.13, a tool-capable model turned
+        # a built-in tool set on by itself for every chat,
+        # and the tool instructions rode along with every
+        # message, slowing every reply whether any tool was
+        # used or not. The built-in tools are removed now;
+        # browsing through Forge Browser is what remains,
+        # and it is off unless the user turns it on.)
+        self._browsing_on = False
         # Whether the "Name: " prefix of the streaming reply has
-        # been written yet (tool lines can come before it in v0.8).
+        # been written yet (web call lines can come before it in v0.8).
         self._reply_prefix_done = False
         # Instructions save a moment after typing stops, not on
         # every keystroke.
@@ -3521,6 +3427,11 @@ class MainWindow(QMainWindow):
         self._select_path = None
         self._hero_card = None  # the loaded model's tile, if any
         self.model_cards = {}  # path string -> ModelCard
+        # The scan's model records by path string: a load looks
+        # its record up here for what discovery read from the
+        # model's own manifest (its parameters, system prompt,
+        # and projector, v0.13).
+        self._model_records = {}
         # Display order of the cards (path strings): the hero
         # first, then name order. Kept apart from the dict, which
         # holds no order, so a refresh can lay the same widgets
@@ -4030,21 +3941,28 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Instructions for this chat, and the tool controls: the
-        # instructions are saved with the chat and sent as its
-        # system prompt.
+        # Instructions for this chat, and the browsing switch:
+        # the instructions are saved with the chat and sent as
+        # its system prompt.
         tools_row = QHBoxLayout()
         tools_row.addWidget(QLabel("Instructions for this chat"))
         tools_row.addStretch(1)
-        self.tools_folder_button = QPushButton("Tools folder...")
-        self.tools_folder_button.setToolTip(
-            "Pick the folder the model's file tools may use")
-        self.tools_folder_button.clicked.connect(
-            self._pick_tools_folder)
-        tools_row.addWidget(self.tools_folder_button)
+        # The one switch for web browsing in this chat (v0.13):
+        # off unless the user turns it on here. A model that
+        # can browse never turns browsing on by itself.
+        self.browsing_check = QCheckBox(
+            "Web browsing via Forge Browser")
+        self.browsing_check.setToolTip(
+            "Let the model search the web and read pages in "
+            "this chat, through Forge Browser. Off unless you "
+            "turn it on, and off is faster, because nothing "
+            "extra is sent with your messages.")
+        self.browsing_check.toggled.connect(
+            self._on_browsing_toggled)
+        tools_row.addWidget(self.browsing_check)
         self.browser_view_button = QPushButton("Browser view")
         self.browser_view_button.setToolTip(
-            "See what the model's web tools are doing")
+            "See what the model's web browsing is doing")
         self.browser_view_button.clicked.connect(
             self.show_browser_window)
         tools_row.addWidget(self.browser_view_button)
@@ -4058,11 +3976,11 @@ class MainWindow(QMainWindow):
         self.instructions_edit.textChanged.connect(
             self._on_instructions_changed)
         right_layout.addWidget(self.instructions_edit)
-        self.tools_status_label = QLabel("")
-        self.tools_status_label.setWordWrap(True)
-        self.tools_status_label.setStyleSheet(
+        self.browsing_status_label = QLabel("")
+        self.browsing_status_label.setWordWrap(True)
+        self.browsing_status_label.setStyleSheet(
             "color: %s;" % current_tokens()["text_muted"])
-        right_layout.addWidget(self.tools_status_label)
+        right_layout.addWidget(self.browsing_status_label)
 
         self.transcript = QTextEdit()
         self.transcript.setReadOnly(True)
@@ -4135,7 +4053,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(right, 1)
         self.tabs.addTab(tab, "Chat")
         self._refresh_chat_list()
-        self._update_tools_status()
+        self._update_browsing_status()
 
 
     # ------------------------------------------------------------ status
@@ -4249,6 +4167,7 @@ class MainWindow(QMainWindow):
             # exiting; wait for it, or destroying the QThread
             # aborts the process. See PullWindow._drop_worker.
             worker.wait()
+        self._model_records = {str(m["path"]): m for m in models}
         loaded_path = (str(self.controller.current_path)
                        if self.controller.is_loaded else None)
         # The loaded model goes first as the hero tile; the rest
@@ -4285,8 +4204,19 @@ class MainWindow(QMainWindow):
             headroom = model_headroom_bytes(
                 model["path"], auto_context_tokens(free_bytes))
             model["headroom_bytes"] = headroom
-            load_size = (model["size"]
-                         + projector_size_bytes(model["path"]))
+            # A store model names its projector in its record
+            # (v0.13); a folder model's sits beside it, found by
+            # name as before.
+            if model.get("projector") is not None:
+                try:
+                    projector_bytes = Path(
+                        model["projector"]).stat().st_size
+                except OSError:
+                    projector_bytes = 0
+            else:
+                projector_bytes = projector_size_bytes(
+                    model["path"])
+            load_size = model["size"] + projector_bytes
             status = fit_status(load_size, free_bytes, headroom)
             is_loaded = str(model["path"]) == loaded_path
             key = str(model["path"])
@@ -4796,8 +4726,10 @@ class MainWindow(QMainWindow):
                 "That model is hidden by the search. Clear the "
                 "search to load it.")
             return
+        record = self._model_records.get(str(path)) or {}
         try:
-            verdict, message = self.controller.check_before_load(path)
+            verdict, message = self.controller.check_before_load(
+                path, projector=record.get("projector"))
         except ModelNotFoundError as exc:
             QMessageBox.warning(self, "Load model", str(exc))
             self._refresh_model_list()
@@ -4823,8 +4755,12 @@ class MainWindow(QMainWindow):
         # (task 11): an Ollama model's file name is a hash.
         self._show_status_persistent(
             "Loading %s..." % (display_name or path.name))
-        self.load_worker = LoadWorker(self.controller, path,
-                                      display_name=display_name)
+        self.load_worker = LoadWorker(
+            self.controller, path,
+            display_name=display_name,
+            model_params=record.get("params"),
+            model_system=record.get("system"),
+            projector=record.get("projector"))
         self.load_worker.progress.connect(self._on_load_progress)
         self.load_worker.finished.connect(self._on_load_finished)
         self.load_worker.failed.connect(self._on_load_failed)
@@ -4851,9 +4787,12 @@ class MainWindow(QMainWindow):
         self.load_time_s = result.get("load_time_s", 0.0)
         warning = result.get("warning", "")
         self._set_busy(False)
+        # A new model starts with no reply stats: the old model's
+        # numbers must never show under it (v0.13).
+        self._last_stats = None
         self._refresh_stats()
-        self._tools_broken = False
-        self._update_tools_status()
+        self._browsing_broken = False
+        self._update_browsing_status()
         self._update_buttons()
         # Rebuild the cards so the loaded model becomes the hero
         # tile with its Loaded pill; otherwise the list still shows
@@ -5142,8 +5081,10 @@ class MainWindow(QMainWindow):
         showed it. The caller adds its own status line."""
         self.controller.unload()
         self.load_time_s = None
+        # The unloaded model's reply stats go with it (v0.13).
+        self._last_stats = None
         self._refresh_stats()
-        self._update_tools_status()
+        self._update_browsing_status()
         self._update_buttons()
         # Rebuild the cards so the hero tile and Loaded pill go away.
         self._refresh_model_list()
@@ -5538,6 +5479,16 @@ class MainWindow(QMainWindow):
         self._chat_history = []
         self._current_reply = ""
         self._last_stats = None
+        # Every chat starts with browsing OFF (v0.13): a new
+        # chat, an opened saved chat (whatever its file may
+        # carry), the blank state after a delete. Only the
+        # user's own flip of the Web browsing box turns it on,
+        # in the chat that is open at the time.
+        self._browsing_on = False
+        if hasattr(self, "browsing_check"):
+            blocker = QSignalBlocker(self.browsing_check)
+            self.browsing_check.setChecked(False)
+            del blocker
         self.transcript.clear()
         blocker = QSignalBlocker(self.instructions_edit)
         self.instructions_edit.clear()
@@ -5626,49 +5577,54 @@ class MainWindow(QMainWindow):
         # applies from the next message.
         self._instructions_timer.start()
 
-    # ------------------------------------------------------------ tools
+    # ------------------------------------------------------- browsing
 
-    def _update_tools_status(self):
-        """The one plain line about tools for the loaded model:
-        on, with what; or off, because this model cannot."""
-        if not hasattr(self, "tools_status_label"):
+    def _on_browsing_toggled(self, checked):
+        """The user flipped the Web browsing box for this chat:
+        the only way browsing ever turns on (v0.13)."""
+        self._browsing_on = bool(checked)
+        self._update_browsing_status()
+
+    def _update_browsing_status(self):
+        """The one plain line about web browsing for this chat:
+        on at the user's word; off, as it is by default; or
+        off because this model cannot browse."""
+        if not hasattr(self, "browsing_status_label"):
             return
         if not self.controller.is_loaded:
-            self.tools_status_label.setText(
-                "Tools: load a model that can use tools to turn "
-                "them on for a chat.")
+            self.browsing_status_label.setText(
+                "Web browsing is off. It stays off until you "
+                "turn it on for a chat with the Web browsing "
+                "via Forge Browser box.")
         elif getattr(self.runner, "supports_tools", False) \
-                and not self._tools_broken:
-            self.tools_status_label.setText(
-                "Tools are on for this chat: files in the tools "
-                "folder, the web through Forge Browser, commands "
-                "(each one asks you first), the time, and a "
-                "calculator.")
+                and not self._browsing_broken \
+                and not self._browsing_on:
+            self.browsing_status_label.setText(
+                "Web browsing is off for this chat (it stays "
+                "off unless you turn it on). Plain chat is "
+                "faster: nothing extra is sent with your "
+                "messages.")
+        elif getattr(self.runner, "supports_tools", False) \
+                and not self._browsing_broken:
+            self.browsing_status_label.setText(
+                "Web browsing is on for this chat: the model "
+                "can search the web and read pages through "
+                "Forge Browser.")
         else:
-            self.tools_status_label.setText(
-                "This model cannot use tools, so this chat is "
-                "plain chat: no tools are offered to it.")
+            self.browsing_status_label.setText(
+                "This model cannot browse the web, so this chat "
+                "is plain chat: no web calls are offered to it.")
 
-    def _tool_executor(self):
+    def _browser_executor(self):
         if self._executor is None:
-            self._executor = ToolExecutor(
-                get_tools_folder(),
+            self._executor = BrowserToolExecutor(
                 forge_override=get_forge_browser_path() or None,
-                approve_command=None,
                 shots_dir=self._home / "browser-shots")
         return self._executor
 
-    def _pick_tools_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Pick the tools folder", get_tools_folder())
-        if folder:
-            set_tools_folder(folder)
-            self._executor = None
-            self._show_status("Tools folder is now %s." % folder)
-
     def show_browser_window(self):
         """Open the browser view (and return it): what the web
-        tools are doing, live."""
+        browsing is doing, live."""
         if self.browser_window is None:
             window = BrowserWindow(self)
             window.open_requested.connect(
@@ -5708,32 +5664,26 @@ class MainWindow(QMainWindow):
                              payload.get("markdown", ""),
                              payload.get("screenshot"))
 
-    def _tool_arg_summary(self, name, arguments):
-        """The short 'what it is doing' text for a tool call."""
+    def _web_arg_summary(self, name, arguments):
+        """The short 'what it is doing' text for a web call."""
         arguments = arguments or {}
-        if name in ("read_file", "write_file"):
-            return str(arguments.get("path", ""))
-        if name == "list_folder":
-            return str(arguments.get("path") or ".")
-        if name == "calculate":
-            return str(arguments.get("expression", ""))
         if name == "web_search":
             return str(arguments.get("query", ""))
         if name == "web_read":
             return str(arguments.get("url", ""))
-        if name == "run_command":
-            return str(arguments.get("command", ""))
         return ""
 
     def _on_tool_event(self, kind, data):
-        """A tool call or its result, live in the transcript
+        """A web call or its result, live in the transcript
         (v0.8): the user always sees what the model did."""
         data = data or {}
         name = data.get("name", "")
         if kind == "call":
-            detail = self._tool_arg_summary(
+            detail = self._web_arg_summary(
                 name, data.get("arguments"))
-            line = "Tool: %s" % name
+            label = {"web_search": "Web search",
+                     "web_read": "Web read"}.get(name, name)
+            line = label
             if detail:
                 line = "%s - %s" % (line, detail)
             self.transcript.append(line)
@@ -5748,21 +5698,12 @@ class MainWindow(QMainWindow):
             self._display_messages.append(
                 {"role": "tool", "name": name, "content": line})
 
-    def _on_approval_requested(self, command, cwd):
-        """The run_command gate, on the UI thread: the exact
-        command in a modal; only Run runs it."""
-        worker = self.chat_worker
-        dialog = CommandApprovalDialog(command, cwd, self)
-        approved = dialog.exec() == QDialog.DialogCode.Accepted
-        if worker is not None:
-            worker.resolve_approval(approved)
-
-    def _on_tools_fallback(self):
-        self._tools_broken = True
-        self._update_tools_status()
+    def _on_browsing_fallback(self):
+        self._browsing_broken = True
+        self._update_browsing_status()
         self._show_status(
-            "This model cannot use tools after all, so that reply "
-            "was written without them.")
+            "This model cannot browse the web after all, so "
+            "that reply was written without browsing.")
 
     # ------------------------------------------------------------ chat flow
 
@@ -5799,16 +5740,21 @@ class MainWindow(QMainWindow):
         # now, so a model switch mid-session never mislabels it).
         name = self.controller.current_name or "Model"
         self._reply_name = name
-        # Tools are offered when the loaded model can use them —
-        # and not on a picture turn: the vision path stays exactly
-        # the plain one.
-        use_tools = (
-            bool(getattr(self.runner, "supports_tools", False))
-            and not self._tools_broken
+        # Web browsing is offered only when the user has
+        # turned it on for this chat (the Web browsing box)
+        # AND the loaded model can browse — and not on a
+        # picture turn: the vision path stays exactly the
+        # plain one. A model's ability alone never turns it
+        # on (v0.13).
+        use_browsing = (
+            self._browsing_on
+            and bool(getattr(self.runner, "supports_tools", False))
+            and not self._browsing_broken
             and not images)
-        if use_tools:
-            # Tool lines may come first; the "Name: " prefix is
-            # written when the first words of the answer arrive.
+        if use_browsing:
+            # Web call lines may come first; the "Name: "
+            # prefix is written when the first words of the
+            # answer arrive.
             self._reply_prefix_done = False
         else:
             self.transcript.append("%s: " % name)
@@ -5833,7 +5779,7 @@ class MainWindow(QMainWindow):
             history=history,
             images=images,
             instructions=instructions,
-            executor=self._tool_executor() if use_tools else None,
+            executor=self._browser_executor() if use_browsing else None,
             max_tokens=get_reply_length())
         self.chat_worker.token.connect(self._on_chat_token)
         self.chat_worker.finished.connect(self._on_chat_finished)
@@ -5841,9 +5787,7 @@ class MainWindow(QMainWindow):
         self.chat_worker.tool_event.connect(self._on_tool_event)
         self.chat_worker.web_event.connect(self._on_browser_event)
         self.chat_worker.tools_fallback.connect(
-            self._on_tools_fallback)
-        self.chat_worker.approval_requested.connect(
-            self._on_approval_requested)
+            self._on_browsing_fallback)
         self.chat_worker.start()
         self._update_buttons()
         self.stop_button.setEnabled(True)
@@ -5913,6 +5857,14 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         self.stop_button.setEnabled(False)
         self._update_buttons()
+        # Plain words only (v0.13): a context overflow's raw
+        # engine text (token counts and all) never reaches the
+        # transcript; it becomes the too-long sentence.
+        message = plain_chat_failure(message)
+        # A failed turn leaves no reply stats behind (v0.13):
+        # the status line must not keep showing the last good
+        # reply's numbers as if they described this one.
+        self._last_stats = None
         # Clear the reply-in-progress line at once (v0.7), the
         # way the finished path does.
         self._refresh_stats()
